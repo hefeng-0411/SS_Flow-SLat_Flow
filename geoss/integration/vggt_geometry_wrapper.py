@@ -51,12 +51,13 @@ class VGGTGeometryWrapper(nn.Module):
             predictions, tokens, patch_start_idx, raw_last_shape = self._forward_vggt_once(model_images)
             out = self._normalize_predictions(predictions, model_images, output_size=images.shape[-2:])
             if tokens is not None:
-                dense = _tokens_to_spatial_features(tokens, model_images.shape[-2:], output_size=images.shape[-2:])
+                dense = _tokens_to_spatial_features(tokens, model_images.shape[-2:])
                 out["vggt_features"] = dense if dense is not None else tokens
                 out["vggt_feature_tokens"] = tokens
                 out["feature_shape_info"] = {
-                    "format": "spatial_from_patch_tokens" if dense is not None else "aggregator_patch_tokens",
+                    "format": "patch_grid_from_tokens" if dense is not None else "aggregator_patch_tokens",
                     "tokens": list(tokens.shape),
+                    "features": list(dense.shape) if dense is not None else None,
                     "patch_start_idx": int(patch_start_idx),
                     "raw_last_tokens": raw_last_shape,
                     "model_image_size": list(model_images.shape[-2:]),
@@ -261,7 +262,7 @@ def _resize_confidence(conf: torch.Tensor, B: int, N: int, output_size: tuple[in
     return resized[:, :, 0] if resized is not None else conf[:, :, 0]
 
 
-def _tokens_to_spatial_features(tokens: torch.Tensor, model_size: tuple[int, int], output_size: tuple[int, int]) -> Optional[torch.Tensor]:
+def _tokens_to_spatial_features(tokens: torch.Tensor, model_size: tuple[int, int]) -> Optional[torch.Tensor]:
     if tokens.ndim != 4:
         return None
     B, N, T, C = tokens.shape
@@ -273,10 +274,7 @@ def _tokens_to_spatial_features(tokens: torch.Tensor, model_size: tuple[int, int
             return None
     else:
         h = w = side
-    feat = tokens.permute(0, 1, 3, 2).reshape(B, N, C, h, w).contiguous()
-    if feat.shape[-2:] != output_size:
-        feat = _resize_b_n_c_h_w(feat, output_size)
-    return feat
+    return tokens.permute(0, 1, 3, 2).reshape(B, N, C, h, w).contiguous()
 
 
 def _first_present(mapping: Dict[str, Any], names: list[str]) -> Any:

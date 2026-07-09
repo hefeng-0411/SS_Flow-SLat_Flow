@@ -75,7 +75,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         checkpoint=args.vggt_checkpoint,
         pretrained_name=args.vggt_pretrained,
         mock=False,
-        cache_features=True,
+        cache_features=False,
     ).to(device)
     start_step = 0
     resume_state = None
