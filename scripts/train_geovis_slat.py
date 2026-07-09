@@ -24,6 +24,7 @@ from geoss.slat.losses.view_consistency_loss import view_consistency_loss
 from geoss.slat.losses.visibility_confidence_loss import visibility_confidence_loss
 from geoss.slat.models.geovis_slat_adapter import GeoVisSLATAdapter
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
+from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
 from geoss.utils.config import add_common_args, load_config
 from geoss.utils.run_mode import validate_real_mode
@@ -55,6 +56,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("trellis", "dataset"))
     ctx = init_distributed(args)
     device = ctx.device
+    batch_controller = AdaptiveBatchController.from_args(args)
+    args.batch_size = batch_controller.batch_size
     trellis_pipeline = _load_trellis_pipeline(args, device)
     model = GeoVisSLATAdapter(**cfg.get("model", {})).to(device)
     start_step = 0
@@ -89,25 +92,46 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "rank": ctx.rank,
             "world_size": ctx.world_size,
         }
-    for step in range(start_step + 1, end_step + 1):
-        if iterator is not None:
-            raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
-        else:
-            raise RuntimeError("real_train unexpectedly has no real dataloader iterator.")
-        batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
-        out = model(batch)
-        terms = compute_losses(out, batch)
-        loss = (
-            terms["slat_flow"]["loss"]
-            + 0.25 * terms["view"]["loss"]
-            + 0.25 * terms["appearance"]["loss"]
-            + 0.2 * terms["visibility_confidence"]["loss"]
-            + args.velocity_weight * terms["velocity"]["loss"]
-            + args.prior_weight * terms["prior"]["loss"]
-        )
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+    step = start_step
+    while step < end_step:
+        step += 1
+        try:
+            if iterator is not None:
+                raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
+            else:
+                raise RuntimeError("real_train unexpectedly has no real dataloader iterator.")
+            batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
+            out = model(batch)
+            terms = compute_losses(out, batch)
+            loss = (
+                terms["slat_flow"]["loss"]
+                + 0.25 * terms["view"]["loss"]
+                + 0.25 * terms["appearance"]["loss"]
+                + 0.2 * terms["visibility_confidence"]["loss"]
+                + args.velocity_weight * terms["velocity"]["loss"]
+                + args.prior_weight * terms["prior"]["loss"]
+            )
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            batch_adjustment = batch_controller.update_after_success(device)
+        except RuntimeError as exc:
+            if AdaptiveBatchController.is_cuda_oom(exc):
+                opt.zero_grad(set_to_none=True)
+                adjustment = batch_controller.update_after_oom(device)
+                args.batch_size = adjustment.new_batch_size
+                loader, sampler = build_real_loader(args, ctx)
+                iterator = iter(loader) if loader is not None else None
+                step -= 1
+                if ctx.is_main:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": step + 1, "event": "oom_retry", "adaptive_batch": adjustment.as_dict()}) + "\n")
+                continue
+            raise
+        if batch_adjustment.changed:
+            args.batch_size = batch_adjustment.new_batch_size
+            loader, sampler = build_real_loader(args, ctx)
+            iterator = iter(loader) if loader is not None else None
         last = summarize(out, terms, "real_dataset")
         last.update(run_modes)
         last["step"] = step
@@ -116,6 +140,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["world_size"] = ctx.world_size
         last["per_gpu_batch_size"] = args.batch_size
         last["global_batch_size"] = args.batch_size * ctx.world_size
+        last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
@@ -349,6 +374,7 @@ def main() -> None:
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
+    add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
@@ -431,6 +457,7 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),
+        **adaptive_config_defaults(cfg),
     }
     for name, value in mappings.items():
         if value is None or not hasattr(args, name):

@@ -12,6 +12,26 @@ trust_region: true
 render_eval: true
 real_train: true
 ablation_mode: full_joint_with_render_loss
+device: cuda
+adaptive_batch:
+  enabled: true
+  min_batch_size: 1
+  max_batch_size: 16
+  target_utilization: 0.92
+  low_utilization: 0.82
+  hard_utilization: 0.97
+  grow_patience_steps: 8
+  cooldown_steps: 3
+  grow_factor: 1.25
+  reduce_factor: 0.5
+early_stop: true
+early_stop_metric: loss
+early_stop_mode: min
+early_stop_patience: 50
+early_stop_min_delta: 0.0005
+early_stop_relative_delta: true
+early_stop_warmup_steps: 20
+early_stop_min_steps: 50
 dependencies:
   require_gsplat_for_real_eval: true
   require_pycolmap_for_pose_check: false

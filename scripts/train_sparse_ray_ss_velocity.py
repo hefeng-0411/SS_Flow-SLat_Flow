@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -19,6 +20,7 @@ from geoss.losses.prior_preservation_loss import prior_preservation_loss
 from geoss.losses.velocity_loss import velocity_regularization_loss
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
 from geoss.models.ss_velocity_adapter import SSVelocityAdapter
+from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
 from geoss.utils.config import add_common_args, load_config
 from geoss.utils.run_mode import validate_real_mode
@@ -77,6 +79,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("vggt", "trellis", "dataset"))
     ctx = init_distributed(args)
     device = ctx.device
+    batch_controller = AdaptiveBatchController.from_args(args)
+    args.batch_size = batch_controller.batch_size
     base, trellis_pipeline = _load_trellis_or_mock(args, cfg, allow_mock=False)
     base = base.to(device)
     if trellis_pipeline is not None:
@@ -138,45 +142,66 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "rank": ctx.rank,
             "world_size": ctx.world_size,
         }
-    for step in range(start_step + 1, end_step + 1):
-        if iterator is not None:
-            raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
-            data_batch = _move_batch(raw_batch, device)
-        else:
-            data_batch = None
-        if data_batch is not None and "ss_latent_grid" in data_batch:
-            x0 = data_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
-            B = x0.shape[0]
-        else:
-            raise KeyError("real_train requires ss_latent_grid from TRELLIS sparse-structure training data.")
-        noise = torch.randn_like(x0)
-        t = torch.rand(B, device=device)
-        t_view = t.view(B, 1, 1, 1, 1)
-        x_t = (1 - t_view) * x0 + (sigma_min + (1 - sigma_min) * t_view) * noise
-        target_v = (1 - sigma_min) * noise - x0
-        cond = _real_condition_or_fail(data_batch, device, cfg, trellis_pipeline)
-        if data_batch is not None and geoss_model is not None and vggt is not None:
-            geoss_context = _compute_geoss_context(data_batch, geoss_model, vggt)
-        else:
-            raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
-        t_model = t * 1000.0
-        with torch.no_grad():
-            v_base = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=False)
-            direct_base = base(x_t, t_model, cond)
-            identity_error = (v_base - direct_base).abs().max()
-        v_geo = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=True)
-        debug = unwrap_model(wrapper).last_debug
-        target_residual = (target_v - v_base).detach()
-        mse = F.mse_loss(debug["delta_v_geo"], target_residual)
-        delta_tokens = debug["delta_v_geo"].flatten(2).transpose(1, 2)
-        v_geo_tokens = v_geo.flatten(2).transpose(1, 2)
-        v_base_tokens = v_base.flatten(2).transpose(1, 2)
-        vel_reg = velocity_regularization_loss(delta_tokens, t)
-        prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, debug["token_confidence"])
-        loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+    step = start_step
+    while step < end_step:
+        step += 1
+        try:
+            if iterator is not None:
+                raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
+                data_batch = _move_batch(raw_batch, device)
+            else:
+                data_batch = None
+            if data_batch is not None and "ss_latent_grid" in data_batch:
+                x0 = data_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
+                B = x0.shape[0]
+            else:
+                raise KeyError("real_train requires ss_latent_grid from TRELLIS sparse-structure training data.")
+            noise = torch.randn_like(x0)
+            t = torch.rand(B, device=device)
+            t_view = t.view(B, 1, 1, 1, 1)
+            x_t = (1 - t_view) * x0 + (sigma_min + (1 - sigma_min) * t_view) * noise
+            target_v = (1 - sigma_min) * noise - x0
+            cond = _real_condition_or_fail(data_batch, device, cfg, trellis_pipeline)
+            if data_batch is not None and geoss_model is not None and vggt is not None:
+                geoss_context = _compute_geoss_context(data_batch, geoss_model, vggt)
+            else:
+                raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
+            t_model = t * 1000.0
+            with torch.no_grad():
+                v_base = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=False)
+                direct_base = base(x_t, t_model, cond)
+                identity_error = (v_base - direct_base).abs().max()
+            v_geo = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=True)
+            debug = unwrap_model(wrapper).last_debug
+            target_residual = (target_v - v_base).detach()
+            mse = F.mse_loss(debug["delta_v_geo"], target_residual)
+            delta_tokens = debug["delta_v_geo"].flatten(2).transpose(1, 2)
+            v_geo_tokens = v_geo.flatten(2).transpose(1, 2)
+            v_base_tokens = v_base.flatten(2).transpose(1, 2)
+            vel_reg = velocity_regularization_loss(delta_tokens, t)
+            prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, debug["token_confidence"])
+            loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            batch_adjustment = batch_controller.update_after_success(device)
+        except RuntimeError as exc:
+            if AdaptiveBatchController.is_cuda_oom(exc):
+                opt.zero_grad(set_to_none=True)
+                adjustment = batch_controller.update_after_oom(device)
+                args.batch_size = adjustment.new_batch_size
+                loader, sampler = _build_meshfleet_loader(args, ctx)
+                iterator = iter(loader) if loader is not None else None
+                step -= 1
+                if ctx.is_main:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": step + 1, "event": "oom_retry", "adaptive_batch": adjustment.as_dict()}) + "\n")
+                continue
+            raise
+        if batch_adjustment.changed:
+            args.batch_size = batch_adjustment.new_batch_size
+            loader, sampler = _build_meshfleet_loader(args, ctx)
+            iterator = iter(loader) if loader is not None else None
         last = {
             "step": step,
             "loss": float(loss.detach().cpu()),
@@ -195,6 +220,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "world_size": ctx.world_size,
             "per_gpu_batch_size": args.batch_size,
             "global_batch_size": args.batch_size * ctx.world_size,
+            "adaptive_batch": {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()},
         }
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
@@ -238,6 +264,7 @@ def main() -> None:
     parser.add_argument("--vggt_checkpoint", type=str, default=None)
     parser.add_argument("--vggt_pretrained", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
+    add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
@@ -245,11 +272,14 @@ def main() -> None:
         summary = run_training(cfg, args)
     else:
         summary = run_dry_run(cfg, args.device)
-    if getattr(args, "rank", 0) == 0:
+    rank = getattr(args, "rank", 0)
+    if rank == 0:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         (Path(args.output_dir) / "train_sparse_ray_ss_velocity_dry_run.json").write_text(json.dumps(summary, indent=2))
         print(json.dumps(summary, indent=2))
     cleanup_distributed()
+    if not args.dry_run and rank == 0:
+        _maybe_launch_stage2(summary, cfg)
 
 
 def _load_trellis_or_mock(args: argparse.Namespace, cfg: dict, allow_mock: bool = True) -> tuple[nn.Module, object | None]:
@@ -445,12 +475,34 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),
+        **adaptive_config_defaults(cfg),
     }
     for name, value in mappings.items():
         if value is None or not hasattr(args, name):
             continue
         if getattr(args, name) == parser.get_default(name):
             setattr(args, name, value)
+
+
+def _maybe_launch_stage2(summary: dict, cfg: dict) -> None:
+    workflow = cfg.get("workflow", {}) if isinstance(cfg.get("workflow"), dict) else {}
+    if not workflow.get("auto_stage2_on_convergence", False):
+        return
+    early = summary.get("early_stop", {}) if isinstance(summary, dict) else {}
+    reason = str(early.get("reason", ""))
+    if not early.get("should_stop") or "plateau" not in reason:
+        return
+    command = workflow.get("stage2_command")
+    if command:
+        subprocess.run(str(command), shell=True, check=True)
+        return
+    script = workflow.get("stage2_script", "scripts/train_geovis_slat.py")
+    config = workflow.get("stage2_config", "configs/real_train_slat_only.yaml")
+    cmd = [sys.executable, str(script), "--config", str(config)]
+    extra_args = workflow.get("stage2_extra_args", [])
+    if isinstance(extra_args, list):
+        cmd.extend(str(x) for x in extra_args)
+    subprocess.run(cmd, check=True)
 
 
 if __name__ == "__main__":
