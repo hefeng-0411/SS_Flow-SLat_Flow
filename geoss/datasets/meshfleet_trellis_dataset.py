@@ -127,15 +127,18 @@ class MeshFleetTrellisDataset(Dataset):
             "object_id": uid,
             "category": sample["category"],
             "dataset_name": "meshfleet_trellis",
-            "split": self.split,
+            "split": sample["split"],
             "mesh_path": str(sample["mesh_path"]) if sample.get("mesh_path") else None,
             "metadata": {
                 "aabb": transforms.get("aabb"),
                 "scale": transforms.get("scale"),
                 "offset": transforms.get("offset"),
+                "split": sample["split"],
                 "layout": sample["layout"],
                 "layout_root": str(sample["layout_root"]),
+                "split_root": str(sample["split_root"]),
                 "render_dir": str(render_dir),
+                "paths": {key: str(value) for key, value in sample["paths"].items() if value is not None},
                 "num_frames_total": len(frames),
                 "num_frames_available": len(available),
                 "num_frames_missing": missing_view_count,
@@ -171,54 +174,68 @@ class MeshFleetTrellisDataset(Dataset):
         return pack
 
     def _discover_samples(self) -> List[Dict]:
-        split_root = self._resolve_split_root()
-        dataset_roots = self._discover_dataset_roots(split_root)
+        split_roots = self._resolve_split_roots()
         samples: List[Dict] = []
-        for category, cat_root, layout_name in dataset_roots:
-            render_base = cat_root / ("renders_cond" if self.prefer_cond_render else "renders")
-            if not render_base.exists():
-                render_base = cat_root / "renders"
-            for render_dir in sorted([p for p in render_base.iterdir() if p.is_dir()] if render_base.exists() else []):
-                uid = render_dir.name
-                sample = {
-                    "uid": uid,
-                    "category": category,
-                    "layout": layout_name,
-                    "layout_root": cat_root,
-                    "render_dir": render_dir,
-                    "cond_render_dir": cat_root / "renders_cond" / uid,
-                    "voxel_path": _first_existing([cat_root / "voxels" / f"{uid}.ply"]),
-                    "ss_latent_path": _first_existing([
-                        cat_root / "ss_latents" / f"{uid}.npz",
-                        cat_root / "ss_latents" / self.ss_latent_model / f"{uid}.npz",
-                    ]),
-                    "slat_latent_path": _first_existing([
-                        cat_root / "latents" / f"{uid}.npz",
-                        cat_root / "latents" / self.slat_latent_model / f"{uid}.npz",
-                    ]),
-                    "feature_path": _first_existing([
-                        cat_root / "features" / f"{uid}.npz",
-                        cat_root / "features" / self.feature_model / f"{uid}.npz",
-                    ]),
-                    "mesh_path": _first_existing([cat_root / "mesh_normalized" / uid / "mesh.glb", render_dir / "mesh.ply"]),
-                }
-                samples.append(sample)
+        for split_name, split_root in split_roots:
+            dataset_roots = self._discover_dataset_roots(split_root)
+            for category, cat_root, layout_name in dataset_roots:
+                for uid in _discover_uids(cat_root):
+                    render_dir = _select_render_dir(cat_root, uid, prefer_cond_render=self.prefer_cond_render)
+                    if render_dir is None:
+                        continue
+                    paths = _meshfleet_uid_paths(
+                        cat_root,
+                        uid,
+                        self.ss_latent_model,
+                        self.slat_latent_model,
+                        self.feature_model,
+                    )
+                    sample = {
+                        "uid": uid,
+                        "split": split_name,
+                        "category": category,
+                        "layout": layout_name,
+                        "layout_root": cat_root,
+                        "split_root": split_root,
+                        "render_dir": render_dir,
+                        "cond_render_dir": paths["renders_cond"],
+                        "voxel_path": paths["voxels"],
+                        "ss_latent_path": paths["ss_latents"],
+                        "slat_latent_path": paths["latents"],
+                        "feature_path": paths["features"],
+                        "mesh_path": _first_existing([paths["mesh_normalized_mesh"], render_dir / "mesh.ply"]),
+                        "paths": paths,
+                    }
+                    samples.append(sample)
         return samples
 
-    def _resolve_split_root(self) -> Path:
-        """Resolve either `dataset_root + split` or a direct split root."""
-        if self.split in {"", ".", None}:  # type: ignore[comparison-overlap]
-            candidates = [self.root]
-        else:
-            candidates = [self.root / str(self.split), self.root]
-        for candidate in candidates:
-            if candidate.exists() and (_is_meshfleet_layout(candidate) or _has_category_layout(candidate)):
-                return candidate
-        existing = [str(c) for c in candidates if c.exists()]
+    def _resolve_split_roots(self) -> List[Tuple[str, Path]]:
+        """Resolve one or more split roots.
+
+        `split` may be a single split (`train`, `test`), a comma-separated
+        list (`train,test`), or `all`/`all/train,test` for both standard
+        MeshFleet_TRELLIS splits. Passing a direct split root still works.
+        """
+        split_names = _parse_split_spec(self.split)
+        roots: List[Tuple[str, Path]] = []
+        checked: List[Path] = []
+        for split_name in split_names:
+            candidates = [self.root] if split_name in {"", "."} else [self.root / split_name]
+            if len(split_names) == 1 and self.root not in candidates and not _has_standard_split_dirs(self.root):
+                candidates.append(self.root)
+            for candidate in candidates:
+                checked.append(candidate)
+                if candidate.exists() and (_is_meshfleet_layout(candidate) or _has_category_layout(candidate)):
+                    roots.append((split_name if candidate != self.root else _direct_split_name(split_name), candidate))
+                    break
+        if roots:
+            return roots
+        existing = [str(c) for c in checked if c.exists()]
         raise FileNotFoundError(
             "Could not find a MeshFleet_TRELLIS split layout. "
             f"root={self.root}, split={self.split}, existing_candidates={existing}. "
-            "Expected either root/split/{renders,latents,...} or root/split/<category>/{renders,latents,...}."
+            "Expected root/{train,test}/{renders,latents,...}, root/{train,test}/<category>/{renders,latents,...}, "
+            "or a direct split root containing those folders."
         )
 
     def _discover_dataset_roots(self, split_root: Path) -> List[Tuple[str, Path, str]]:
@@ -311,11 +328,84 @@ def _load_condition_image(cond_render_dir: Optional[Path], fallback_image_path: 
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
-def _first_existing(paths: List[Path]) -> Optional[Path]:
+def _first_existing(paths: List[Optional[Path]]) -> Optional[Path]:
     for path in paths:
-        if path.exists():
+        if path is not None and path.exists():
             return path
     return None
+
+
+def _parse_split_spec(split: str | None) -> List[str]:
+    if split is None:
+        return ["train"]
+    text = str(split).strip()
+    if text in {"", "."}:
+        return ["."]
+    lower = text.lower()
+    if lower == "all":
+        return ["train", "test"]
+    if lower.startswith("all/"):
+        text = text.split("/", 1)[1]
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    return parts or ["train"]
+
+
+def _direct_split_name(requested: str) -> str:
+    return "direct" if requested in {"", "."} else requested
+
+
+def _meshfleet_uid_paths(
+    root: Path,
+    uid: str,
+    ss_latent_model: str,
+    slat_latent_model: str,
+    feature_model: str,
+) -> Dict[str, Optional[Path]]:
+    return {
+        "features": _first_existing([
+            root / "features" / f"{uid}.npz",
+            root / "features" / feature_model / f"{uid}.npz",
+        ]),
+        "latents": _first_existing([
+            root / "latents" / f"{uid}.npz",
+            root / "latents" / slat_latent_model / f"{uid}.npz",
+        ]),
+        "mesh_normalized_dir": _first_existing([root / "mesh_normalized" / uid]),
+        "mesh_normalized_mesh": _first_existing([root / "mesh_normalized" / uid / "mesh.glb"]),
+        "renders": _first_existing([root / "renders" / uid]),
+        "renders_cond": _first_existing([root / "renders_cond" / uid]),
+        "renders_eval_70": _first_existing([root / "renders_eval_70" / uid]),
+        "renders_eval_90": _first_existing([root / "renders_eval_90" / uid]),
+        "ss_latents": _first_existing([
+            root / "ss_latents" / f"{uid}.npz",
+            root / "ss_latents" / ss_latent_model / f"{uid}.npz",
+        ]),
+        "voxels": _first_existing([root / "voxels" / f"{uid}.ply"]),
+    }
+
+
+def _discover_uids(root: Path) -> List[str]:
+    """Discover object IDs from all MeshFleet_TRELLIS per-object folders/files."""
+    uids = set()
+    for folder in ("renders", "renders_cond", "renders_eval_70", "renders_eval_90", "mesh_normalized"):
+        base = root / folder
+        if base.is_dir():
+            uids.update(path.name for path in base.iterdir() if path.is_dir())
+    for folder, suffix in (("features", ".npz"), ("latents", ".npz"), ("ss_latents", ".npz"), ("voxels", ".ply")):
+        base = root / folder
+        if not base.is_dir():
+            continue
+        for path in base.iterdir():
+            if path.is_file() and path.suffix.lower() == suffix:
+                uids.add(path.stem)
+            elif path.is_dir():
+                uids.update(child.stem for child in path.iterdir() if child.is_file() and child.suffix.lower() == suffix)
+    return sorted(uids)
+
+
+def _select_render_dir(root: Path, uid: str, *, prefer_cond_render: bool) -> Optional[Path]:
+    ordered = ["renders_cond", "renders"] if prefer_cond_render else ["renders", "renders_cond"]
+    return _first_existing([root / name / uid for name in ordered])
 
 
 def _available_render_frames(render_dir: Path, frames: List[Dict]) -> List[Tuple[Dict, Path]]:
@@ -369,6 +459,12 @@ def _has_category_layout(path: Path) -> bool:
     if not path.exists() or not path.is_dir():
         return False
     return any(_is_meshfleet_layout(child) for child in path.iterdir() if child.is_dir())
+
+
+def _has_standard_split_dirs(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    return any((path / split).is_dir() for split in ("train", "test"))
 
 
 def _meshfleet_voxels_to_canonical(points_xyz: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, object]]:

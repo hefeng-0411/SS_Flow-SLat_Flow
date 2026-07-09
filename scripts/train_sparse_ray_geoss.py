@@ -114,6 +114,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         batch = _move_batch(batch, device)
         with torch.no_grad():
             batch.update(vggt(batch["images"], use_cache=False))
+        batch = _without_sparse_structure_latents(batch)
         out = model(batch)
         ray = out["debug"]["ray"]
         occ_prob = torch.sigmoid(torch.nan_to_num(out["occ_evidence"] - out["free_evidence"], nan=0.0, posinf=30.0, neginf=-30.0))
@@ -271,11 +272,29 @@ def _move_batch(batch, device):
     return out
 
 
+def _without_sparse_structure_latents(batch: dict) -> dict:
+    """Stage 1 trains geometry context only, not TRELLIS sparse-structure velocity."""
+    blocked = {
+        "ss_latent_grid",
+        "ss_latent_tokens",
+        "ss_voxel_xyz",
+        "v_base",
+        "timestep",
+        "trellis_slat_feats",
+        "trellis_slat_indices",
+        "trellis_slat_base_velocity",
+        "trellis_patchtokens",
+        "trellis_feature_indices",
+    }
+    return {key: value for key, value in batch.items() if key not in blocked}
+
+
 @torch.no_grad()
 def _validation_step(model, vggt, batch, device):
     model.eval()
     val_batch = dict(batch)
     val_batch.update(vggt(val_batch["images"], use_cache=False))
+    val_batch = _without_sparse_structure_latents(val_batch)
     out = model(val_batch)
     occ_prob = torch.sigmoid(out["occ_evidence"] - out["free_evidence"])
     proj = projection_consistency_loss(out["anchor_xyz"], occ_prob, val_batch["masks"], val_batch["K"], val_batch["w2c"])

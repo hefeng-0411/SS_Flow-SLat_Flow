@@ -6,11 +6,13 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
 from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset
+from scripts.train_sparse_ray_geoss import _without_sparse_structure_latents
 
 
 ROOT = Path(r"D:\VsCode\MVG\Base\MeshFleet_TRELLIS")
@@ -77,8 +79,41 @@ def test_meshfleet_missing_view_is_skipped_without_shape_drift():
         assert sample["metadata"]["missing_frames_skipped"] == 1
 
 
-def _write_flat_sample(split_root: Path) -> None:
-    uid = "flat_uid"
+def test_meshfleet_all_split_discovers_train_and_test_without_direct_root_fallback():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_flat_sample(root / "train", uid="train_uid")
+        _write_flat_sample(root / "test", uid="test_uid")
+        dataset = MeshFleetTrellisDataset(root, split="all", num_views=1, image_size=16, occ_resolution=8)
+        assert len(dataset) == 2
+        assert [sample["split"] for sample in dataset.samples] == ["train", "test"]
+        assert [sample["uid"] for sample in dataset.samples] == ["train_uid", "test_uid"]
+
+        empty_train_root = root / "empty_train_root"
+        (empty_train_root / "train").mkdir(parents=True)
+        _write_flat_sample(empty_train_root / "test", uid="test_only_uid")
+        with pytest.raises(FileNotFoundError):
+            MeshFleetTrellisDataset(empty_train_root, split="train", num_views=1, image_size=16, occ_resolution=8)
+
+
+def test_stage1_batch_sanitizer_drops_sparse_structure_latents():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_flat_sample(root / "train")
+        dataset = MeshFleetTrellisDataset(root, split="train", num_views=1, image_size=16, occ_resolution=8)
+        batch = VehicleMultiViewDataset.collate_fn([dataset[0]])
+        assert "ss_latent_tokens" in batch
+        assert "trellis_slat_feats" in batch
+        clean = _without_sparse_structure_latents(batch)
+        assert "ss_latent_tokens" not in clean
+        assert "ss_latent_grid" not in clean
+        assert "trellis_slat_feats" not in clean
+        assert "trellis_slat_indices" not in clean
+        assert "images" in clean
+        assert "gt_occ" in clean
+
+
+def _write_flat_sample(split_root: Path, uid: str = "flat_uid") -> None:
     render_dir = split_root / "renders" / uid
     render_dir.mkdir(parents=True)
     image = Image.new("RGBA", (16, 16), (128, 96, 64, 255))
