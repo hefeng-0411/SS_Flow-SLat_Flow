@@ -1,0 +1,22 @@
+{
+  "dataset": {
+    "name": "meshfleet_trellis",
+    "root": "/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97",
+    "local_sample_root": "D:/VsCode/MVG/Base/MeshFleet_TRELLIS",
+    "train_split": "train",
+    "test_split": "test",
+    "category": null,
+    "layout": "flat_split_or_category_auto_detect",
+    "num_views": 8,
+    "image_size": 128,
+    "occ_resolution": 64,
+    "ss_latent_model": "ss_enc_conv3d_16l8_fp16",
+    "slat_latent_model": "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16",
+    "feature_model": "dinov2_vitl14_reg",
+    "coordinate": {
+      "renders": "Objaverse/Blender OpenGL c2w converted to OpenCV c2w",
+      "voxel_ply": "Trellis centered half cube when max_abs <= 0.5, converted by xyz * 2 to GeoSS [-1,1]",
+      "ss_latent_grid": "[8,16,16,16] dense TRELLIS sparse-structure latent grid"
+    }
+  }
+}

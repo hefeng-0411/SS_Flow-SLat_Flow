@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+OOM_PATTERNS = (
+    "out of memory",
+    "cuda oom",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "cuda error: out of memory",
+    "torch.cuda.outofmemoryerror",
+    "nccl error",
+    "processgroupnccl",
+)
+
+
+@dataclass
+class Stage:
+    name: str
+    script: str
+    config: str
+    output_dir: Path
+    steps: int
+    max_batch_size: int
+    resume_path: Optional[Path]
+    best_path: Optional[Path]
+    extra_args: List[str]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sequential multi-GPU MeshFleet training launcher with OOM batch probing.")
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--output_root", type=str, default="outputs/meshfleet_multigpu_sequence")
+    parser.add_argument("--gpus", type=str, default=None, help="CUDA_VISIBLE_DEVICES value, for example 0,1,2,3.")
+    parser.add_argument("--nproc_per_node", type=int, default=0)
+    parser.add_argument("--probe_steps", type=int, default=3)
+    parser.add_argument("--min_batch_size", type=int, default=1)
+    parser.add_argument("--no_auto_batch", action="store_true")
+    parser.add_argument("--batch_probe_strategy", choices=["binary", "halve"], default="binary")
+    parser.add_argument("--oom_retry_limit", type=int, default=8)
+    parser.add_argument("--restart_sleep_seconds", type=float, default=20.0)
+    parser.add_argument("--force_rerun_completed", action="store_true")
+    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--pin_memory", type=str, default="true")
+    parser.add_argument("--num_views", type=int, default=8)
+    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--latent_tokens", type=int, default=4096)
+    parser.add_argument("--active_tokens", type=int, default=4096)
+    parser.add_argument("--meshfleet_split", type=str, default="train")
+    parser.add_argument("--meshfleet_category", type=str, default=None)
+    parser.add_argument("--vggt_root", type=str, default=None)
+    parser.add_argument("--vggt_checkpoint", type=str, default=None)
+    parser.add_argument("--vggt_pretrained", type=str, default="facebook/VGGT-1B")
+    parser.add_argument("--trellis_root", type=str, default=None)
+    parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--stage1_steps", type=int, default=100000)
+    parser.add_argument("--stage2_steps", type=int, default=100000)
+    parser.add_argument("--slat_steps", type=int, default=100000)
+    parser.add_argument("--slat_joint_steps", type=int, default=30000)
+    parser.add_argument("--stage1_max_batch_size", type=int, default=6)
+    parser.add_argument("--stage2_max_batch_size", type=int, default=8)
+    parser.add_argument("--slat_max_batch_size", type=int, default=8)
+    parser.add_argument("--slat_joint_max_batch_size", type=int, default=6)
+    parser.add_argument("--stage1_lr", type=float, default=1e-4)
+    parser.add_argument("--stage2_lr", type=float, default=1e-4)
+    parser.add_argument("--slat_lr", type=float, default=1e-4)
+    parser.add_argument("--slat_joint_lr", type=float, default=5e-5)
+    parser.add_argument("--save_every", type=int, default=2000)
+    parser.add_argument("--fault_tolerant_save_every", type=int, default=1)
+    parser.add_argument("--visualize_every", type=int, default=1000)
+    parser.add_argument("--val_every", type=int, default=1000)
+    parser.add_argument("--disable_early_stop", action="store_true")
+    parser.add_argument("--early_stop_patience", type=int, default=6000)
+    parser.add_argument("--early_stop_min_steps", type=int, default=8000)
+    parser.add_argument("--early_stop_warmup_steps", type=int, default=3000)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
+    parser.add_argument("--early_stop_ema", type=float, default=0.95)
+    parser.add_argument("--max_train_hours_per_stage", type=float, default=0.0)
+    parser.add_argument("--start_at", choices=["stage1", "stage2", "slat", "slat_joint"], default="stage1")
+    parser.add_argument("--stop_after", choices=["stage1", "stage2", "slat", "slat_joint"], default="slat_joint")
+    parser.add_argument("--skip_slat_joint", action="store_true")
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parents[1]
+    output_root = Path(args.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    if args.gpus:
+        env["CUDA_VISIBLE_DEVICES"] = args.gpus
+    nproc = args.nproc_per_node if args.nproc_per_node > 0 else _visible_gpu_count(env)
+    if nproc < 1:
+        raise RuntimeError("No visible CUDA GPU was found. Set --gpus or CUDA_VISIBLE_DEVICES correctly.")
+
+    stages = _make_stages(args, root, output_root)
+    stages = _slice_stages(stages, args.start_at, args.stop_after)
+    if args.skip_slat_joint:
+        stages = [stage for stage in stages if stage.name != "slat_joint"]
+
+    selected = {}
+    for stage in stages:
+        if _stage_is_complete(stage) and not args.force_rerun_completed:
+            step = _checkpoint_step(_resolve_resume_path(stage))
+            selected[stage.name] = "already_complete"
+            print(f"\n==== {stage.name}: already complete at checkpoint step={step}; skipping ====", flush=True)
+            continue
+        print(f"\n==== {stage.name}: probing per-GPU batch size up to {stage.max_batch_size} on {nproc} GPUs ====", flush=True)
+        batch_size = stage.max_batch_size if args.no_auto_batch else _probe_batch(stage, args, env, nproc)
+        selected[stage.name] = batch_size
+        print(f"==== {stage.name}: selected per-GPU batch_size={batch_size}, global_batch_size={batch_size * nproc} ====", flush=True)
+        _run_full_stage(stage, args, env, nproc, batch_size)
+
+    summary = {"nproc_per_node": nproc, "selected_per_gpu_batch_size": selected}
+    (output_root / "multigpu_sequence_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2), flush=True)
+
+
+def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> list[Stage]:
+    stage1_out = output_root / "stage1_geoss"
+    stage2_out = output_root / "stage2_ss_velocity"
+    slat_out = output_root / "stage3_geovis_slat"
+    slat_joint_out = output_root / "stage4_geovis_slat_joint"
+
+    common_data = [
+        "--device", "cuda",
+        "--meshfleet_root", args.data_root,
+        "--meshfleet_split", args.meshfleet_split,
+        "--num_views", str(args.num_views),
+        "--image_size", str(args.image_size),
+        "--num_workers", str(args.num_workers),
+        "--pin_memory", args.pin_memory,
+    ]
+    if args.meshfleet_category:
+        common_data += ["--meshfleet_category", args.meshfleet_category]
+    early_stop_args = []
+    if not args.disable_early_stop:
+        early_stop_args = [
+            "--early_stop", "true",
+            "--early_stop_metric", "loss",
+            "--early_stop_mode", "min",
+            "--early_stop_patience", str(args.early_stop_patience),
+            "--early_stop_min_steps", str(args.early_stop_min_steps),
+            "--early_stop_warmup_steps", str(args.early_stop_warmup_steps),
+            "--early_stop_min_delta", str(args.early_stop_min_delta),
+            "--early_stop_relative_delta", "true",
+            "--early_stop_ema", str(args.early_stop_ema),
+            "--max_train_hours", str(args.max_train_hours_per_stage),
+            "--save_best", "true",
+        ]
+    vggt_args = []
+    if args.vggt_root:
+        vggt_args += ["--vggt_root", args.vggt_root]
+    if args.vggt_checkpoint:
+        vggt_args += ["--vggt_checkpoint", args.vggt_checkpoint]
+    elif args.vggt_pretrained:
+        vggt_args += ["--vggt_pretrained", args.vggt_pretrained]
+    trellis_args = []
+    if args.trellis_root:
+        trellis_args += ["--trellis_root", args.trellis_root]
+    if args.trellis_model_path:
+        trellis_args += ["--trellis_model_path", args.trellis_model_path]
+    stage1_geoss_checkpoint = stage1_out / "geoss_adapter_last.pt"
+    if not stage1_geoss_checkpoint.exists() and (stage1_out / "geoss_adapter_best.pt").exists():
+        stage1_geoss_checkpoint = stage1_out / "geoss_adapter_best.pt"
+
+    return [
+        Stage(
+            name="stage1",
+            script=str(root / "scripts" / "train_sparse_ray_geoss.py"),
+            config=str(root / "configs" / "sparse_ray_geoss.yaml"),
+            output_dir=stage1_out,
+            steps=args.stage1_steps,
+            max_batch_size=args.stage1_max_batch_size,
+            resume_path=stage1_out / "geoss_adapter_last.pt",
+            best_path=stage1_out / "geoss_adapter_best.pt",
+            extra_args=common_data
+            + early_stop_args
+            + vggt_args
+            + [
+                "--latent_tokens", str(args.latent_tokens),
+                "--lr", str(args.stage1_lr),
+                "--save_every", str(args.save_every),
+                "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
+                "--visualize_every", str(args.visualize_every),
+                "--val_every", str(args.val_every),
+            ],
+        ),
+        Stage(
+            name="stage2",
+            script=str(root / "scripts" / "train_sparse_ray_ss_velocity.py"),
+            config=str(root / "configs" / "sparse_ray_ss_velocity.yaml"),
+            output_dir=stage2_out,
+            steps=args.stage2_steps,
+            max_batch_size=args.stage2_max_batch_size,
+            resume_path=stage2_out / "ss_velocity_adapter_last.pt",
+            best_path=stage2_out / "ss_velocity_adapter_best.pt",
+            extra_args=common_data
+            + early_stop_args
+            + vggt_args
+            + trellis_args
+            + [
+                "--geoss_checkpoint", str(stage1_geoss_checkpoint),
+                "--lr", str(args.stage2_lr),
+                "--save_every", str(args.save_every),
+                "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
+            ],
+        ),
+        Stage(
+            name="slat",
+            script=str(root / "scripts" / "train_geovis_slat.py"),
+            config=str(root / "configs" / "geovis_slat.yaml"),
+            output_dir=slat_out,
+            steps=args.slat_steps,
+            max_batch_size=args.slat_max_batch_size,
+            resume_path=slat_out / "geovis_slat_adapter_last.pt",
+            best_path=slat_out / "geovis_slat_adapter_best.pt",
+            extra_args=common_data
+            + early_stop_args
+            + [
+                "--active_tokens", str(args.active_tokens),
+                "--lr", str(args.slat_lr),
+                "--save_every", str(args.save_every),
+                "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
+                "--visualize_every", str(args.visualize_every),
+            ],
+        ),
+        Stage(
+            name="slat_joint",
+            script=str(root / "scripts" / "train_geovis_slat_joint.py"),
+            config=str(root / "configs" / "geovis_slat_joint.yaml"),
+            output_dir=slat_joint_out,
+            steps=args.slat_joint_steps,
+            max_batch_size=args.slat_joint_max_batch_size,
+            resume_path=slat_joint_out / "geovis_slat_adapter_last.pt",
+            best_path=slat_joint_out / "geovis_slat_adapter_best.pt",
+            extra_args=common_data
+            + early_stop_args
+            + [
+                "--active_tokens", str(args.active_tokens),
+                "--lr", str(args.slat_joint_lr),
+                "--save_every", str(args.save_every),
+                "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
+                "--visualize_every", str(args.visualize_every),
+            ],
+        ),
+    ]
+
+
+def _slice_stages(stages: list[Stage], start_at: str, stop_after: str) -> list[Stage]:
+    names = [stage.name for stage in stages]
+    start = names.index(start_at)
+    stop = names.index(stop_after)
+    if stop < start:
+        raise ValueError("--stop_after must be the same as or later than --start_at.")
+    return stages[start : stop + 1]
+
+
+def _probe_batch(stage: Stage, args: argparse.Namespace, env: dict, nproc: int) -> int:
+    if args.batch_probe_strategy == "binary":
+        return _probe_batch_binary(stage, args, env, nproc)
+    return _probe_batch_halve(stage, args, env, nproc)
+
+
+def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc: int) -> int:
+    batch_size = max(stage.max_batch_size, args.min_batch_size)
+    last_error = ""
+    while batch_size >= args.min_batch_size:
+        probe_dir = stage.output_dir / f"_probe_bs{batch_size}"
+        command = _torchrun_command(stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False)
+        result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        text = result.stdout or ""
+        (probe_dir / "probe.log").parent.mkdir(parents=True, exist_ok=True)
+        (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
+        if result.returncode == 0:
+            return batch_size
+        last_error = text[-8000:]
+        if not _looks_like_oom(text):
+            raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
+        print(f"{stage.name}: per-GPU batch_size={batch_size} OOM, retrying with {batch_size // 2}", flush=True)
+        time.sleep(max(0.0, args.restart_sleep_seconds))
+        batch_size //= 2
+    raise RuntimeError(f"{stage.name} could not run even with per-GPU batch_size={args.min_batch_size}.\n{last_error}")
+
+
+def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc: int) -> int:
+    low = max(1, args.min_batch_size)
+    high = max(stage.max_batch_size, low)
+    best = 0
+    last_error = ""
+    tried = set()
+
+    while low <= high:
+        if high == stage.max_batch_size and high not in tried:
+            batch_size = high
+        else:
+            batch_size = (low + high) // 2
+        tried.add(batch_size)
+        probe_dir = stage.output_dir / f"_probe_bs{batch_size}"
+        command = _torchrun_command(stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False)
+        result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        text = result.stdout or ""
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
+        if result.returncode == 0:
+            best = batch_size
+            low = batch_size + 1
+            print(f"{stage.name}: probe OK at per-GPU batch_size={batch_size}", flush=True)
+        else:
+            last_error = text[-12000:]
+            if not _looks_like_oom(text):
+                raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
+            high = batch_size - 1
+            print(f"{stage.name}: probe OOM at per-GPU batch_size={batch_size}; next search range [{low}, {high}]", flush=True)
+            time.sleep(max(0.0, args.restart_sleep_seconds))
+    if best >= args.min_batch_size:
+        return best
+    raise RuntimeError(f"{stage.name} could not run even with per-GPU batch_size={args.min_batch_size}.\n{last_error}")
+
+
+def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: int, batch_size: int) -> None:
+    current = batch_size
+    oom_retries = 0
+    launcher_log = stage.output_dir / "launcher_stage.log"
+    while current >= args.min_batch_size:
+        if _stage_is_complete(stage):
+            print(f"{stage.name}: completed at checkpoint step={_checkpoint_step(_resolve_resume_path(stage))}", flush=True)
+            return
+        resume_path = _resolve_resume_path(stage)
+        resume = resume_path is not None
+        command = _torchrun_command(stage, nproc, current, stage.steps, stage.output_dir, resume=resume)
+        print(
+            f"{stage.name}: launching per-GPU batch_size={current}, global_batch_size={current * nproc}, "
+            f"resume={resume}, checkpoint={resume_path}, checkpoint_step={_checkpoint_step(resume_path)}",
+            flush=True,
+        )
+        returncode, tail = _run_command_logged(command, env, launcher_log)
+        if returncode == 0:
+            return
+        if _stage_is_complete(stage):
+            print(f"{stage.name}: subprocess failed after writing a completed checkpoint; treating stage as complete.", flush=True)
+            return
+        if _looks_like_oom(tail) and current > args.min_batch_size and oom_retries < args.oom_retry_limit:
+            next_batch = max(args.min_batch_size, current // 2)
+            print(
+                f"{stage.name}: OOM/fatal CUDA detected, lowering per-GPU batch_size from {current} to {next_batch}; "
+                f"will resume from checkpoint step={_checkpoint_step(_resolve_resume_path(stage))}",
+                flush=True,
+            )
+            current = next_batch
+            oom_retries += 1
+            time.sleep(max(0.0, args.restart_sleep_seconds))
+            continue
+        raise RuntimeError(
+            f"{stage.name} failed with per-GPU batch_size={current}, returncode={returncode}. "
+            f"Check {launcher_log}. Tail:\n{tail[-4000:]}"
+        )
+
+
+def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, output_dir: Path, *, resume: bool) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(nproc),
+        stage.script,
+        "--config",
+        stage.config,
+        "--output_dir",
+        str(output_dir),
+        "--steps",
+        str(steps),
+        "--batch_size",
+        str(batch_size),
+        "--steps_are_total",
+        "true",
+    ] + list(stage.extra_args)
+    resume_path = _resolve_resume_path(stage)
+    if resume and resume_path is not None:
+        command += ["--resume", str(resume_path)]
+    return command
+
+
+def _visible_gpu_count(env: dict) -> int:
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    if visible:
+        return len([item for item in visible.split(",") if item.strip()])
+    try:
+        import torch
+
+        return torch.cuda.device_count()
+    except Exception:
+        return 0
+
+
+def _looks_like_oom(text: str) -> bool:
+    lower = text.lower()
+    return any(pattern in lower for pattern in OOM_PATTERNS)
+
+
+def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[int, str]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    tail_lines: list[str] = []
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write("\n\n==== COMMAND ====\n")
+        log.write(" ".join(command) + "\n")
+        log.flush()
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            log.write(line)
+            log.flush()
+            tail_lines.append(line)
+            if len(tail_lines) > 300:
+                tail_lines.pop(0)
+        returncode = process.wait()
+        log.write(f"\n==== RETURN CODE: {returncode} ====\n")
+    return returncode, "".join(tail_lines)
+
+
+def _stage_is_complete(stage: Stage) -> bool:
+    resume_path = _resolve_resume_path(stage)
+    if resume_path is None:
+        return False
+    step = _checkpoint_step(resume_path)
+    if step is not None and step >= stage.steps:
+        return True
+    early_stop = _checkpoint_early_stop(resume_path)
+    return bool(early_stop and early_stop.get("should_stop"))
+
+
+def _resolve_resume_path(stage: Stage) -> Optional[Path]:
+    candidates = [path for path in [stage.resume_path, stage.best_path] if path is not None and path.exists()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: _checkpoint_step(path) or -1)
+
+
+def _checkpoint_step(path: Optional[Path]) -> Optional[int]:
+    state = _load_checkpoint_meta(path)
+    if not state:
+        return None
+    try:
+        return int(state.get("step", 0))
+    except Exception:
+        return None
+
+
+def _checkpoint_early_stop(path: Optional[Path]) -> Optional[dict]:
+    state = _load_checkpoint_meta(path)
+    early_stop = state.get("early_stop") if state else None
+    return early_stop if isinstance(early_stop, dict) else None
+
+
+def _load_checkpoint_meta(path: Optional[Path]) -> dict:
+    if path is None or not path.exists():
+        return {}
+    try:
+        import torch
+
+        state = torch.load(path, map_location="cpu")
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+if __name__ == "__main__":
+    main()

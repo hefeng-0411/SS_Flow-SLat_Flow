@@ -1,0 +1,13 @@
+use_real_vggt: true
+use_real_trellis: true
+use_decoder: true
+use_render_loss: true
+allow_mock: false
+allow_synthetic: false
+real_train: true
+ablation_mode: with_gsplat_render_loss
+dependencies: {require_gsplat_for_real_eval: true, require_pycolmap_for_pose_check: false, require_kornia_for_projection: true, require_pytorch3d_for_mesh_render: false, require_nvdiffrast_for_advanced_render: false, require_kaolin_for_voxel_ops: false}
+rendering: {renderer: gsplat, enable_render_loss: true, enable_mask_loss: true, enable_depth_loss: true, enable_lpips_loss: true, enable_dino_loss: true}
+geometry: {use_pycolmap_pose_check: true, use_kornia_projection: true, use_open3d_icp_refine: true, use_point_cloud_utils_metrics: true}
+anchors: {dynamic_anchor_backend: open3d, use_vggt_pointmap_anchors: true, use_fps_sampling: true, use_boundary_sampling: true, use_uncertainty_sampling: true}
+evaluation: {use_gsplat_render_metrics: true, use_geometry_metrics: true, use_gaussian_statistics: true, export_debug_assets: true}

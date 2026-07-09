@@ -1,0 +1,38 @@
+{
+  "geoss": {
+    "model": {
+      "num_anchors": 4096,
+      "anchor_dim": 256,
+      "evidence_dim": 128,
+      "geo_dim": 256,
+      "latent_dim": 8
+    },
+    "dry_run_batch": {
+      "batch_size": 1,
+      "num_views": 3,
+      "image_size": 64,
+      "latent_tokens": 512,
+      "latent_dim": 8
+    }
+  },
+  "velocity": {
+    "batch_size": 1,
+    "latent_dim": 8,
+    "resolution": 8,
+    "num_anchors": 4096,
+    "geo_dim": 256
+  },
+  "training": {
+    "stage": "joint_finetuning",
+    "freeze_trellis_backbone": true
+  },
+  "geoss_apply_to_uncond": false,
+  "ablation": {
+    "use_sparse_anchor_query": true,
+    "use_ray_free_space": true,
+    "use_confidence_gate": true,
+    "use_trust_region_clipping": true,
+    "use_timestep_alpha": true,
+    "use_velocity_level_control": true
+  }
+}

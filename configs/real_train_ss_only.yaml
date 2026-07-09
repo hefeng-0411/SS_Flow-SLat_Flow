@@ -1,0 +1,51 @@
+use_real_vggt: true
+use_real_trellis: true
+use_decoder: false
+use_render_loss: false
+allow_mock: false
+allow_synthetic: false
+alignment_enabled: true
+dynamic_anchor_enabled: true
+local_attention_enabled: true
+confidence_calibration: true
+trust_region: true
+render_eval: false
+real_train: true
+ablation_mode: ss_adapter_only
+dependencies:
+  require_gsplat_for_real_eval: false
+  require_pycolmap_for_pose_check: false
+  require_kornia_for_projection: true
+  require_pytorch3d_for_mesh_render: false
+  require_nvdiffrast_for_advanced_render: false
+  require_kaolin_for_voxel_ops: false
+rendering:
+  renderer: none
+  enable_render_loss: false
+  enable_mask_loss: false
+  enable_depth_loss: true
+  enable_lpips_loss: false
+  enable_dino_loss: false
+geometry:
+  use_pycolmap_pose_check: true
+  use_kornia_projection: true
+  use_open3d_icp_refine: true
+  use_point_cloud_utils_metrics: false
+anchors:
+  dynamic_anchor_backend: open3d
+  use_vggt_pointmap_anchors: true
+  use_fps_sampling: true
+  use_boundary_sampling: true
+  use_uncertainty_sampling: true
+evaluation:
+  use_gsplat_render_metrics: false
+  use_geometry_metrics: false
+  use_gaussian_statistics: false
+  export_debug_assets: true
+model:
+  alignment_enabled: true
+  dynamic_anchor_enabled: true
+  local_attention_enabled: true
+  num_anchors: 4096
+  geo_dim: 256
+  latent_dim: 8

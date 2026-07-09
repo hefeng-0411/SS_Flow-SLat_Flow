@@ -1,0 +1,43 @@
+{
+  "model": {
+    "resolution": 64,
+    "slat_dim": 8,
+    "evidence_dim": 128,
+    "hidden_dim": 128,
+    "feature_dim": 16,
+    "num_heads": 4,
+    "trust_region": 0.15,
+    "beta_mode": "cosine",
+    "beta_strength": 1.0,
+    "use_geovis_slat": true
+  },
+  "flow": {
+    "sigma_min": 1e-5
+  },
+  "dry_run_batch": {
+    "batch_size": 1,
+    "num_views": 3,
+    "image_size": 64,
+    "active_tokens": 512,
+    "slat_dim": 8
+  },
+  "training": {
+    "stage": "geovis_slat_adapter_pretraining",
+    "freeze_vggt": true,
+    "freeze_trellis_slat_flow": true,
+    "freeze_decoder": true,
+    "datasets": ["meshfleet_trellis", "objaverse_cars", "srn_cars"]
+  },
+  "ablation": {
+    "original_trellis_slat": false,
+    "slat_lora_only": false,
+    "image_feature_concat_condition": false,
+    "without_ss_confidence": false,
+    "without_visibility_evidence": false,
+    "without_depth_residual": false,
+    "without_view_weighting": false,
+    "without_prior_preservation": false,
+    "without_trust_region_clipping": false,
+    "full_geovis_slat_adapter": true
+  }
+}

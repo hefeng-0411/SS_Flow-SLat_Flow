@@ -1,0 +1,26 @@
+{
+  "model": {
+    "resolution": 64,
+    "slat_dim": 8,
+    "evidence_dim": 128,
+    "hidden_dim": 128,
+    "feature_dim": 16,
+    "num_heads": 4,
+    "trust_region": 0.12,
+    "beta_mode": "cosine",
+    "beta_strength": 0.75,
+    "use_geovis_slat": true
+  },
+  "flow": {
+    "sigma_min": 1e-5
+  },
+  "training": {
+    "stage": "ss_geoss_plus_geovis_slat_joint_adapter_finetune",
+    "joint_enabled": true,
+    "freeze_vggt": true,
+    "freeze_trellis_ss_flow": true,
+    "freeze_trellis_slat_flow": true,
+    "freeze_decoder": true,
+    "train_adapters_only": true
+  }
+}

@@ -1,0 +1,7 @@
+-r base.txt
+-r geometry.txt
+-r gsplat.txt
+-r sfm.txt
+-r visualization.txt
+-r dev.txt
+# See render.txt for pytorch3d/nvdiffrast/kaolin manual installs.

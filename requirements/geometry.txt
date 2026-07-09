@@ -1,0 +1,8 @@
+-r base.txt
+open3d
+trimesh[easy]
+plyfile
+point-cloud-utils
+pymeshlab
+PyMCubes
+pygltflib

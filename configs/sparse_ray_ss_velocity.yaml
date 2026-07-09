@@ -1,0 +1,19 @@
+{
+  "batch_size": 1,
+  "latent_dim": 8,
+  "resolution": 8,
+  "num_anchors": 4096,
+  "geo_dim": 256,
+  "training": {
+    "stage": "trellis_ss_velocity_adapter",
+    "freeze_vggt": true,
+    "freeze_trellis_ss_flow": true
+  },
+  "geoss_apply_to_uncond": false,
+  "ablation": {
+    "use_confidence_gate": true,
+    "use_trust_region_clipping": true,
+    "use_timestep_alpha": true,
+    "use_velocity_level_control": true
+  }
+}
