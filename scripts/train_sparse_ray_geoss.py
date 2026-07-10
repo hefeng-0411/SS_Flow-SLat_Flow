@@ -170,7 +170,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            return clean_batch, out, ray, occ_prob, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss
+            return clean_batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss
 
         retry = train_step_with_oom_retry(
             step_fn,
@@ -184,7 +184,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             log_oom=log_oom,
         )
         batch_adjustment = retry.adjustment
-        batch, out, ray, occ_prob, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss = retry.value
+        batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss = retry.value
         if batch_adjustment is not None and batch_adjustment.changed:
             rebuild_after_adjustment(batch_adjustment)
         last_summary = {
