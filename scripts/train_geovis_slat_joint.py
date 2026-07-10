@@ -9,7 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from geoss.utils.config import add_common_args, load_config
 from geoss.utils.distributed import cleanup_distributed
-from scripts.train_geovis_slat import run_dry_run, run_training
+from geoss.utils.adaptive_batch import add_adaptive_batch_args
+from scripts.train_geovis_slat import _apply_config_defaults, run_dry_run, run_training
 
 
 def main() -> None:
@@ -33,8 +34,12 @@ def main() -> None:
     parser.add_argument("--meshfleet_slat_latent_model", type=str, default="dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16")
     parser.add_argument("--srn_root", type=str, default=None)
     parser.add_argument("--objaverse_rendered_root", type=str, default=None)
+    parser.add_argument("--trellis_root", type=str, default=None)
+    parser.add_argument("--trellis_model_path", type=str, default=None)
+    add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
+    _apply_config_defaults(args, cfg, parser)
     summary = run_dry_run(cfg, args) if args.dry_run else run_training(cfg, args)
     summary["joint_mode"] = "adapter_only_joint_finetune_sanity"
     if getattr(args, "rank", 0) == 0:

@@ -224,6 +224,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=slat_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + trellis_args
             + [
                 "--active_tokens", str(args.active_tokens),
                 "--lr", str(args.slat_lr),
@@ -243,6 +244,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=slat_joint_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + trellis_args
             + [
                 "--active_tokens", str(args.active_tokens),
                 "--lr", str(args.slat_joint_lr),

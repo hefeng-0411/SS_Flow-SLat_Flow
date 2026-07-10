@@ -23,7 +23,7 @@ class GeoVisSLATAggregator(nn.Module):
         self.query_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.evidence_proj = nn.Linear(evidence_dim, hidden_dim)
         self.slat_proj = nn.Linear(slat_dim, hidden_dim)
-        self.geo_proj = nn.LazyLinear(hidden_dim)
+        self.geo_proj = nn.Linear(slat_dim, hidden_dim)
         self.appearance_branch = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)

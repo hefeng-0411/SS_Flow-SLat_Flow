@@ -34,8 +34,8 @@ class SSVelocityAdapter(nn.Module):
         self.knn_k = knn_k
         self.latent_proj = nn.Linear(latent_dim, hidden_dim)
         self.geo_proj = nn.Linear(geo_dim, hidden_dim)
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
-        self.rel_mlp = nn.Sequential(nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.cross_attn = None if local_attention else nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
+        self.rel_mlp = nn.Sequential(nn.Linear(4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)) if local_attention else None
         self.norm = nn.LayerNorm(hidden_dim)
         self.delta_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -80,6 +80,8 @@ class SSVelocityAdapter(nn.Module):
         if self.local_attention and voxel_xyz is not None and anchor_xyz is not None:
             attn_out, attn_weights, token_confidence, local_debug = self._local_anchor_attention(q, k, geo_conf, voxel_xyz, anchor_xyz, anchor_metadata)
         else:
+            if self.cross_attn is None:
+                raise ValueError("SSVelocityAdapter was constructed for local attention but voxel_xyz/anchor_xyz were not provided.")
             k_weighted = k * geo_conf
             attn_out, attn_weights = self.cross_attn(q, k_weighted, k_weighted, need_weights=True)
             weights = attn_weights.clamp_min(0.0)
@@ -124,6 +126,8 @@ class SSVelocityAdapter(nn.Module):
         anchor_metadata: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         B, L, H = q.shape
+        if self.rel_mlp is None:
+            raise RuntimeError("Local anchor attention requires rel_mlp, but this adapter was constructed with local_attention=False.")
         M = anchor_xyz.shape[1]
         k_nn = min(self.knn_k, M)
         dist = torch.cdist(voxel_xyz.to(anchor_xyz.dtype), anchor_xyz.to(anchor_xyz.dtype)).clamp_min(1e-6)

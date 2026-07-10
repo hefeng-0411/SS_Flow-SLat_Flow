@@ -168,8 +168,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
             t_model = t * 1000.0
             with torch.no_grad():
-                v_base = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=False)
-                direct_base = base(x_t, t_model, cond)
+                v_base = base(x_t, t_model, cond)
+                direct_base = v_base
                 identity_error = (v_base - direct_base).abs().max()
             v_geo = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=True)
             debug = unwrap_model(wrapper).last_debug
