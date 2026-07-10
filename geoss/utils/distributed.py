@@ -32,6 +32,15 @@ def init_distributed(args) -> DistributedContext:
     if distributed:
         backend = getattr(args, "dist_backend", None) or ("nccl" if torch.cuda.is_available() else "gloo")
         if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if local_rank < 0 or local_rank >= device_count:
+                visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+                raise RuntimeError(
+                    "Invalid distributed CUDA topology: "
+                    f"LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}, "
+                    f"torch.cuda.device_count()={device_count}, CUDA_VISIBLE_DEVICES={visible}. "
+                    "Relaunch with --nproc_per_node <= number of visible GPUs; the launcher now clamps this automatically."
+                )
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
         else:

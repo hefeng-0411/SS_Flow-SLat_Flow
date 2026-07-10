@@ -295,6 +295,7 @@ def build_real_loader(args: argparse.Namespace, ctx):
                 num_views=args.num_views,
                 image_size=args.image_size,
                 slat_latent_model=args.meshfleet_slat_latent_model,
+                require_slat_latents=True,
             )
         )
     if args.srn_root and Path(args.srn_root).exists():

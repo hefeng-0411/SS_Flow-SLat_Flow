@@ -63,6 +63,10 @@ class MeshFleetTrellisDataset(Dataset):
         feature_model: str = "dinov2_vitl14_reg",
         occ_resolution: int = 64,
         prefer_cond_render: bool = False,
+        require_ss_latents: bool = False,
+        require_slat_latents: bool = False,
+        require_features: bool = False,
+        require_voxels: bool = False,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -74,6 +78,10 @@ class MeshFleetTrellisDataset(Dataset):
         self.feature_model = feature_model
         self.occ_resolution = occ_resolution
         self.prefer_cond_render = prefer_cond_render
+        self.require_ss_latents = bool(require_ss_latents)
+        self.require_slat_latents = bool(require_slat_latents)
+        self.require_features = bool(require_features)
+        self.require_voxels = bool(require_voxels)
         self.samples = self._discover_samples()
 
     def __len__(self) -> int:
@@ -190,6 +198,14 @@ class MeshFleetTrellisDataset(Dataset):
                         self.slat_latent_model,
                         self.feature_model,
                     )
+                    if self.require_ss_latents and paths["ss_latents"] is None:
+                        continue
+                    if self.require_slat_latents and paths["latents"] is None:
+                        continue
+                    if self.require_features and paths["features"] is None:
+                        continue
+                    if self.require_voxels and paths["voxels"] is None:
+                        continue
                     sample = {
                         "uid": uid,
                         "split": split_name,

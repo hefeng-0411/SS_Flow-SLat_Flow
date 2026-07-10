@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -21,6 +22,22 @@ OOM_PATTERNS = (
     "torch.cuda.outofmemoryerror",
     "nccl error",
     "processgroupnccl",
+)
+
+
+DISTRIBUTED_ENV_KEYS = (
+    "RANK",
+    "LOCAL_RANK",
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "TORCHELASTIC_RUN_ID",
+    "TORCHELASTIC_RESTART_COUNT",
+    "TORCHELASTIC_MAX_RESTARTS",
 )
 
 
@@ -44,6 +61,7 @@ def main() -> None:
     parser.add_argument("--gpus", type=str, default=None, help="CUDA_VISIBLE_DEVICES value, for example 0,1,2,3.")
     parser.add_argument("--nproc_per_node", type=int, default=0)
     parser.add_argument("--probe_steps", type=int, default=3)
+    parser.add_argument("--probe_max_vram_util", type=float, default=0.96)
     parser.add_argument("--min_batch_size", type=int, default=1)
     parser.add_argument("--no_auto_batch", action="store_true")
     parser.add_argument("--batch_probe_strategy", choices=["binary", "halve"], default="binary")
@@ -76,7 +94,7 @@ def main() -> None:
     parser.add_argument("--slat_lr", type=float, default=1e-4)
     parser.add_argument("--slat_joint_lr", type=float, default=5e-5)
     parser.add_argument("--save_every", type=int, default=2000)
-    parser.add_argument("--fault_tolerant_save_every", type=int, default=1)
+    parser.add_argument("--fault_tolerant_save_every", type=int, default=25)
     parser.add_argument("--visualize_every", type=int, default=1000)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--disable_early_stop", action="store_true")
@@ -105,9 +123,19 @@ def main() -> None:
     env = os.environ.copy()
     if args.gpus:
         env["CUDA_VISIBLE_DEVICES"] = args.gpus
-    nproc = args.nproc_per_node if args.nproc_per_node > 0 else _visible_gpu_count(env)
+    env = _sanitize_torchrun_parent_env(env)
+    visible_count = _visible_gpu_count(env)
+    requested_nproc = args.nproc_per_node if args.nproc_per_node > 0 else visible_count
+    nproc = min(requested_nproc, visible_count)
     if nproc < 1:
         raise RuntimeError("No visible CUDA GPU was found. Set --gpus or CUDA_VISIBLE_DEVICES correctly.")
+    if requested_nproc != nproc:
+        print(
+            f"Requested nproc_per_node={requested_nproc} but CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')} "
+            f"exposes only {visible_count} GPU(s); clamping nproc_per_node to {nproc}.",
+            flush=True,
+        )
+    print(f"Launcher device topology: CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')}, nproc_per_node={nproc}", flush=True)
 
     stages = _make_stages(args, root, output_root)
     stages = _slice_stages(stages, args.start_at, args.stop_after)
@@ -350,6 +378,10 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
         (probe_dir / "probe.log").parent.mkdir(parents=True, exist_ok=True)
         (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
         if result.returncode == 0:
+            if _probe_too_hot(text, args):
+                print(f"{stage.name}: per-GPU batch_size={batch_size} exceeded probe VRAM headroom, retrying with {batch_size // 2}", flush=True)
+                batch_size //= 2
+                continue
             return batch_size
         last_error = text[-8000:]
         if not _looks_like_oom(text):
@@ -380,6 +412,11 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
         probe_dir.mkdir(parents=True, exist_ok=True)
         (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
         if result.returncode == 0:
+            if _probe_too_hot(text, args):
+                last_error = text[-12000:]
+                high = batch_size - 1
+                print(f"{stage.name}: probe too close to VRAM limit at per-GPU batch_size={batch_size}; next search range [{low}, {high}]", flush=True)
+                continue
             best = batch_size
             low = batch_size + 1
             print(f"{stage.name}: probe OK at per-GPU batch_size={batch_size}", flush=True)
@@ -472,9 +509,24 @@ def _visible_gpu_count(env: dict) -> int:
         return 0
 
 
+def _sanitize_torchrun_parent_env(env: dict) -> dict:
+    clean = dict(env)
+    for key in DISTRIBUTED_ENV_KEYS:
+        clean.pop(key, None)
+    return clean
+
+
 def _looks_like_oom(text: str) -> bool:
     lower = text.lower()
     return any(pattern in lower for pattern in OOM_PATTERNS)
+
+
+def _probe_too_hot(text: str, args: argparse.Namespace) -> bool:
+    ceiling = float(getattr(args, "probe_max_vram_util", 0.0) or 0.0)
+    if ceiling <= 0.0:
+        return False
+    values = [float(match) for match in re.findall(r'"vram_utilization"\s*:\s*([0-9.]+)', text)]
+    return bool(values and max(values) >= ceiling)
 
 
 def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[int, str]:
@@ -483,6 +535,7 @@ def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[
     with log_path.open("a", encoding="utf-8", errors="replace") as log:
         log.write("\n\n==== COMMAND ====\n")
         log.write(" ".join(command) + "\n")
+        log.write(f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n")
         log.flush()
         process = subprocess.Popen(
             command,

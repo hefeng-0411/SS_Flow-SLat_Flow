@@ -172,12 +172,20 @@ class FastPlateauDetector:
 class AsyncArtifactManager:
     """Single-process async checkpoint writer with atomic publish semantics."""
 
-    def __init__(self, max_workers: int = 1) -> None:
+    def __init__(self, max_workers: int = 1, max_pending: int = 2) -> None:
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="async_ckpt")
         self._lock = threading.Lock()
         self._futures: list[Future] = []
+        self._max_pending = max(1, int(max_pending))
 
     def submit_checkpoint(self, path: str | Path, **payload: Any) -> Future:
+        wait_for: Future | None = None
+        with self._lock:
+            self._futures = [item for item in self._futures if not item.done()]
+            if len(self._futures) >= self._max_pending:
+                wait_for = self._futures.pop(0)
+        if wait_for is not None:
+            wait_for.result()
         frozen = _freeze_payload_to_cpu(payload)
         future = self._pool.submit(write_checkpoint_atomic, Path(path), frozen)
         with self._lock:

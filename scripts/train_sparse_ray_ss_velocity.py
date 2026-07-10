@@ -169,7 +169,12 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 x0 = data_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
                 B = x0.shape[0]
             else:
-                raise KeyError("real_train requires ss_latent_grid from TRELLIS sparse-structure training data.")
+                object_ids = data_batch.get("object_id") if isinstance(data_batch, dict) else None
+                keys = sorted(data_batch.keys()) if isinstance(data_batch, dict) else []
+                raise KeyError(
+                    "real_train requires ss_latent_grid from MeshFleet_TRELLIS ss_latents. "
+                    f"batch_keys={keys}, object_id={object_ids}"
+                )
             noise = torch.randn_like(x0)
             t = torch.rand(B, device=device)
             t_view = t.view(B, 1, 1, 1, 1)
@@ -345,6 +350,7 @@ def _build_meshfleet_loader(args: argparse.Namespace, ctx):
         image_size=args.image_size,
         occ_resolution=args.meshfleet_occ_resolution,
         prefer_cond_render=args.meshfleet_prefer_cond_render,
+        require_ss_latents=True,
     )
     if len(dataset) == 0:
         raise FileNotFoundError(
