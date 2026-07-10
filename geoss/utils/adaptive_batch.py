@@ -65,6 +65,8 @@ class AdaptiveBatchController:
         self.reduce_factor = _clamp(float(reduce_factor), 0.1, 0.95)
         self._low_vram_steps = 0
         self._cooldown_remaining = 0
+        self._safe_batch_size = self.batch_size
+        self._unsafe_batch_size: int | None = None
         self._last_adjustment = BatchAdjustment(False, self.batch_size, self.batch_size, "init", None, None)
 
     @classmethod
@@ -109,11 +111,18 @@ class AdaptiveBatchController:
 
         if self._low_vram_steps >= self.grow_patience_steps:
             old = self.batch_size
-            proposed = max(old + 1, int(math.ceil(old * self.grow_factor)))
+            self._safe_batch_size = max(self._safe_batch_size, old)
+            high = self.unsafe_or_max()
+            if high > old + 1:
+                proposed = (old + high) // 2
+                reason = "binary_probe_low_vram"
+            else:
+                proposed = max(old + 1, int(math.ceil(old * self.grow_factor)))
+                reason = "grow_low_vram"
             self.batch_size = min(self.max_batch_size, proposed)
             self._low_vram_steps = 0
             self._cooldown_remaining = self.cooldown_steps
-            self._last_adjustment = BatchAdjustment(True, old, self.batch_size, "grow_low_vram", util, peak_gb)
+            self._last_adjustment = BatchAdjustment(True, old, self.batch_size, reason, util, peak_gb)
         else:
             self._last_adjustment = BatchAdjustment(False, self.batch_size, self.batch_size, "steady", util, peak_gb)
         _reset_peak_stats(device)
@@ -123,9 +132,14 @@ class AdaptiveBatchController:
         if not self.enabled:
             raise RuntimeError("OOM occurred and adaptive batch is disabled.")
         old = self.batch_size
+        self._unsafe_batch_size = old if self._unsafe_batch_size is None else min(self._unsafe_batch_size, old)
         if old <= self.min_batch_size:
             raise RuntimeError(f"OOM at adaptive_min_batch_size={self.min_batch_size}; reduce model/image settings.")
-        self.batch_size = max(self.min_batch_size, int(math.floor(old * self.reduce_factor)))
+        lower = max(self.min_batch_size, min(self._safe_batch_size, old - 1))
+        if lower < old - 1:
+            self.batch_size = max(self.min_batch_size, (lower + old - 1) // 2)
+        else:
+            self.batch_size = max(self.min_batch_size, int(math.floor(old * self.reduce_factor)))
         if self.batch_size == old:
             self.batch_size = old - 1
         self._cooldown_remaining = self.cooldown_steps
@@ -147,12 +161,18 @@ class AdaptiveBatchController:
             "hard_utilization": self.hard_utilization,
             "low_vram_steps": self._low_vram_steps,
             "cooldown_remaining": self._cooldown_remaining,
+            "safe_batch_size": self._safe_batch_size,
+            "unsafe_batch_size": self._unsafe_batch_size,
             "last_adjustment": self._last_adjustment.as_dict(),
         }
+
+    def unsafe_or_max(self) -> int:
+        return min(self.max_batch_size, self._unsafe_batch_size - 1 if self._unsafe_batch_size is not None else self.max_batch_size)
 
 
 def add_adaptive_batch_args(parser):
     parser.add_argument("--adaptive_batch", type=_str2bool, default=False)
+    parser.add_argument("--adaptive_oom_retries", type=int, default=8)
     parser.add_argument("--adaptive_min_batch_size", type=int, default=1)
     parser.add_argument("--adaptive_max_batch_size", type=int, default=16)
     parser.add_argument("--adaptive_target_utilization", type=float, default=0.92)

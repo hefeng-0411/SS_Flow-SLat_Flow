@@ -20,6 +20,7 @@ from geoss.losses.occupancy_loss import occupancy_bce_loss
 from geoss.losses.projection_loss import projection_consistency_loss
 from geoss.losses.ray_free_space_loss import ray_free_space_loss
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
+from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
 from geoss.utils.config import add_common_args, load_config
 from geoss.utils.run_mode import validate_real_mode
@@ -33,6 +34,7 @@ from geoss.utils.distributed import (
     unwrap_model,
 )
 from geoss.utils.early_stopping import EarlyStopper
+from geoss.utils.elastic_engine import slice_batch_to_size, train_step_with_oom_retry
 from geoss.utils.visualization import save_npz, save_projected_anchor_debug_png, save_ray_free_space_debug_png, write_point_cloud_ply
 
 
@@ -66,6 +68,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("vggt", "dataset"))
     ctx = init_distributed(args)
     device = ctx.device
+    batch_controller = AdaptiveBatchController.from_args(args)
+    args.batch_size = batch_controller.batch_size
     model_cfg = cfg.get("model", {})
     model = SparseRayGeoSSAdapter(**model_cfg).to(device)
     for p in model.velocity_adapter.parameters():
@@ -109,47 +113,80 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "rank": ctx.rank,
             "world_size": ctx.world_size,
         }
-    for step in range(start_step + 1, end_step + 1):
+    step = start_step
+    while step < end_step:
+        step += 1
         batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
         batch = _move_batch(batch, device)
-        with torch.no_grad():
-            batch.update(vggt(batch["images"], use_cache=False))
-        batch = _without_sparse_structure_latents(batch)
-        out = model(batch)
-        ray = out["debug"]["ray"]
-        occ_prob = torch.sigmoid(torch.nan_to_num(out["occ_evidence"] - out["free_evidence"], nan=0.0, posinf=30.0, neginf=-30.0))
-        occ_prob = torch.nan_to_num(occ_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        losses = {}
-        if "gt_occ" in batch:
-            losses.update(occupancy_bce_loss(out["occ_evidence"], out["free_evidence"], out["anchor_xyz"], batch["gt_occ"]))
-            geo_error = (occ_prob - (occ_prob > 0.5).float()).abs().clamp(0.0, 1.0)
-        else:
-            gt_occ = torch.zeros(batch["images"].shape[0], 32, 32, 32, device=device)
-            occ_terms = occupancy_bce_loss(out["occ_evidence"], out["free_evidence"], out["anchor_xyz"], gt_occ)
-            losses["occupancy_bce"] = occ_terms["occupancy_bce"] * 0.0
-            losses["occupancy_dice"] = occ_terms["occupancy_dice"] * 0.0
-            geo_error = occ_prob.detach().abs().clamp(0.0, 1.0)
-        ray_terms = ray_free_space_loss(
-            ray["free_score"],
-            ray["occ_score"],
-            ray["ray_valid"],
-            ray["depth_residual"],
-            signed_depth_residual=ray.get("signed_depth_residual"),
-            free_geometry=ray.get("evidence_debug", {}).get("free_geometry"),
+
+        def rebuild_after_adjustment(adjustment):
+            nonlocal batch, loader, sampler, iterator
+            args.batch_size = adjustment.new_batch_size
+            batch = slice_batch_to_size(batch, args.batch_size)
+            loader, sampler = _build_real_loader(args, ctx)
+            iterator = iter(loader) if loader is not None else None
+
+        def log_oom(record):
+            if ctx.is_main:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"step": step, **record}) + "\n")
+
+        def step_fn():
+            with torch.no_grad():
+                batch.update(vggt(batch["images"], use_cache=False))
+            clean_batch = _without_sparse_structure_latents(batch)
+            out = model(clean_batch)
+            ray = out["debug"]["ray"]
+            occ_prob = torch.sigmoid(torch.nan_to_num(out["occ_evidence"] - out["free_evidence"], nan=0.0, posinf=30.0, neginf=-30.0))
+            occ_prob = torch.nan_to_num(occ_prob, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+            losses = {}
+            if "gt_occ" in clean_batch:
+                losses.update(occupancy_bce_loss(out["occ_evidence"], out["free_evidence"], out["anchor_xyz"], clean_batch["gt_occ"]))
+                geo_error = (occ_prob - (occ_prob > 0.5).float()).abs().clamp(0.0, 1.0)
+            else:
+                gt_occ = torch.zeros(clean_batch["images"].shape[0], 32, 32, 32, device=device)
+                occ_terms = occupancy_bce_loss(out["occ_evidence"], out["free_evidence"], out["anchor_xyz"], gt_occ)
+                losses["occupancy_bce"] = occ_terms["occupancy_bce"] * 0.0
+                losses["occupancy_dice"] = occ_terms["occupancy_dice"] * 0.0
+                geo_error = occ_prob.detach().abs().clamp(0.0, 1.0)
+            ray_terms = ray_free_space_loss(
+                ray["free_score"],
+                ray["occ_score"],
+                ray["ray_valid"],
+                ray["depth_residual"],
+                signed_depth_residual=ray.get("signed_depth_residual"),
+                free_geometry=ray.get("evidence_debug", {}).get("free_geometry"),
+            )
+            proj_terms = projection_consistency_loss(out["anchor_xyz"], occ_prob, clean_batch["masks"], clean_batch["K"], clean_batch["w2c"])
+            conf_terms = confidence_calibration_loss(out["geo_confidence"], geo_error)
+            anchor_sparsity = occ_prob.mean() * args.anchor_sparsity_weight
+            loss = (
+                losses.get("loss", torch.zeros((), device=device))
+                + ray_terms["loss"]
+                + proj_terms["loss"]
+                + conf_terms["loss"]
+                + anchor_sparsity
+            )
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            return clean_batch, out, ray, occ_prob, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss
+
+        retry = train_step_with_oom_retry(
+            step_fn,
+            model=model,
+            optimizer=opt,
+            sampler=sampler,
+            device=device,
+            batch_controller=batch_controller,
+            rebuild_after_adjustment=rebuild_after_adjustment,
+            max_retries=getattr(args, "adaptive_oom_retries", 8),
+            log_oom=log_oom,
         )
-        proj_terms = projection_consistency_loss(out["anchor_xyz"], occ_prob, batch["masks"], batch["K"], batch["w2c"])
-        conf_terms = confidence_calibration_loss(out["geo_confidence"], geo_error)
-        anchor_sparsity = occ_prob.mean() * args.anchor_sparsity_weight
-        loss = (
-            losses.get("loss", torch.zeros((), device=device))
-            + ray_terms["loss"]
-            + proj_terms["loss"]
-            + conf_terms["loss"]
-            + anchor_sparsity
-        )
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
+        batch_adjustment = retry.adjustment
+        batch, out, ray, occ_prob, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss = retry.value
+        if batch_adjustment is not None and batch_adjustment.changed:
+            rebuild_after_adjustment(batch_adjustment)
         last_summary = {
             "step": step,
             "loss": float(loss.detach().cpu()),
@@ -175,6 +212,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "world_size": ctx.world_size,
             "per_gpu_batch_size": args.batch_size,
             "global_batch_size": args.batch_size * ctx.world_size,
+            "adaptive_batch": {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict() if batch_adjustment is not None else None},
         }
         if ctx.is_main and args.val_every > 0 and step % args.val_every == 0:
             last_summary["validation"] = _validation_step(unwrap_model(model), vggt, batch, device)
@@ -222,8 +260,10 @@ def main() -> None:
     parser.add_argument("--vggt_checkpoint", type=str, default=None)
     parser.add_argument("--vggt_pretrained", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
+    add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
+    _apply_config_defaults(args, cfg, parser)
     if not args.dry_run:
         summary = run_training(cfg, args)
     else:
@@ -335,6 +375,22 @@ def _save_geoss_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, e
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
     )
+
+
+def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse.ArgumentParser) -> None:
+    if not cfg:
+        return
+    mappings = {
+        "batch_size": cfg.get("batch_size"),
+        "lr": cfg.get("lr"),
+        "weight_decay": cfg.get("weight_decay"),
+        **adaptive_config_defaults(cfg),
+    }
+    for name, value in mappings.items():
+        if value is None or not hasattr(args, name):
+            continue
+        if getattr(args, name) == parser.get_default(name):
+            setattr(args, name, value)
 
 
 if __name__ == "__main__":

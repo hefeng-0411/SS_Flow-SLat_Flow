@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -32,7 +33,7 @@ class EarlyStopStatus:
 
 
 class EarlyStopper:
-    """EMA-smoothed patience early stopping with relative min-delta and optional wall-time cap."""
+    """Fast windowed plateau stopping for ruthless iteration velocity."""
 
     def __init__(
         self,
@@ -46,6 +47,7 @@ class EarlyStopper:
         warmup_steps: int = 2000,
         min_steps: int = 5000,
         ema: float = 0.9,
+        window: int = 8,
         max_train_hours: float = 0.0,
     ) -> None:
         if mode not in {"min", "max"}:
@@ -59,6 +61,7 @@ class EarlyStopper:
         self.warmup_steps = max(0, int(warmup_steps))
         self.min_steps = max(0, int(min_steps))
         self.ema = min(max(float(ema), 0.0), 0.999)
+        self.window = max(1, int(window))
         self.max_train_seconds = max(0.0, float(max_train_hours)) * 3600.0
         self.start_time = time.time()
         self.best_score: float | None = None
@@ -66,6 +69,7 @@ class EarlyStopper:
         self.bad_steps = 0
         self.smoothed: float | None = None
         self.seen_steps = 0
+        self.values: deque[float] = deque(maxlen=self.window)
 
     @classmethod
     def from_args(cls, args, default_metric: str = "loss") -> "EarlyStopper":
@@ -79,6 +83,7 @@ class EarlyStopper:
             warmup_steps=getattr(args, "early_stop_warmup_steps", 2000),
             min_steps=getattr(args, "early_stop_min_steps", 5000),
             ema=getattr(args, "early_stop_ema", 0.9),
+            window=getattr(args, "early_stop_window", 8),
             max_train_hours=getattr(args, "max_train_hours", 0.0),
         )
 
@@ -92,24 +97,33 @@ class EarlyStopper:
             return EarlyStopStatus(True, False, False, self.metric, None, self.smoothed, self.best_score, self.bad_steps, "metric_missing")
 
         self.seen_steps = max(self.seen_steps, step)
-        self.smoothed = raw if self.smoothed is None else self.ema * self.smoothed + (1.0 - self.ema) * raw
-        is_best = self._is_improvement(self.smoothed)
-        if is_best:
-            self.best_score = self.smoothed
-            self.best_step = step
-            self.bad_steps = 0
-        elif step >= self.warmup_steps and step >= self.min_steps:
-            self.bad_steps += 1
-
+        self.values.append(raw)
+        self.smoothed = sum(self.values) / len(self.values)
+        is_best = False
         should_stop = False
         reason = "running"
         if step < self.warmup_steps:
             reason = "warmup"
         elif step < self.min_steps:
             reason = "below_min_steps"
-        elif self.bad_steps >= self.patience:
-            should_stop = True
-            reason = f"plateau_patience_{self.patience}"
+        elif len(self.values) < self.window:
+            reason = "filling_window"
+        else:
+            is_best = self._is_improvement(self.smoothed)
+            if is_best:
+                self.best_score = self.smoothed
+                self.best_step = step
+                self.bad_steps = 0
+            else:
+                self.bad_steps += 1
+                if self.bad_steps >= self.patience:
+                    should_stop = True
+                    reason = f"fast_plateau_patience_{self.patience}"
+
+        if self.best_score is None and self.smoothed is not None:
+            self.best_score = self.smoothed
+            self.best_step = step
+            is_best = True
 
         if self.max_train_seconds > 0 and (time.time() - self.start_time) >= self.max_train_seconds:
             should_stop = True
@@ -134,6 +148,8 @@ class EarlyStopper:
             "bad_steps": self.bad_steps,
             "smoothed": self.smoothed,
             "seen_steps": self.seen_steps,
+            "values": list(self.values),
+            "window": self.window,
             "metric": self.metric,
             "mode": self.mode,
         }
@@ -150,6 +166,11 @@ class EarlyStopper:
         self.bad_steps = _as_int(state.get("bad_steps"), default=0)
         self.smoothed = _as_float(state.get("smoothed"))
         self.seen_steps = _as_int(state.get("seen_steps"), default=0)
+        self.values.clear()
+        for value in state.get("values", [])[-self.window :]:
+            parsed = _as_float(value)
+            if parsed is not None:
+                self.values.append(parsed)
 
 
 def add_early_stopping_args(parser):
@@ -162,6 +183,7 @@ def add_early_stopping_args(parser):
     parser.add_argument("--early_stop_warmup_steps", type=int, default=2000)
     parser.add_argument("--early_stop_min_steps", type=int, default=5000)
     parser.add_argument("--early_stop_ema", type=float, default=0.9)
+    parser.add_argument("--early_stop_window", type=int, default=8)
     parser.add_argument("--max_train_hours", type=float, default=0.0)
     parser.add_argument("--save_best", type=_str2bool, default=True)
     return parser

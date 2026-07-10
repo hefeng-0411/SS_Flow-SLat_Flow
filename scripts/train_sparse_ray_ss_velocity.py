@@ -34,6 +34,7 @@ from geoss.utils.distributed import (
     unwrap_model,
 )
 from geoss.utils.early_stopping import EarlyStopper
+from geoss.utils.elastic_engine import slice_batch_to_size, train_step_with_oom_retry
 
 
 class MockSSFlowModel(nn.Module):
@@ -145,12 +146,25 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     step = start_step
     while step < end_step:
         step += 1
-        try:
-            if iterator is not None:
-                raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
-                data_batch = _move_batch(raw_batch, device)
-            else:
-                data_batch = None
+        if iterator is not None:
+            raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
+            data_batch = _move_batch(raw_batch, device)
+        else:
+            data_batch = None
+
+        def rebuild_after_adjustment(adjustment):
+            nonlocal data_batch, loader, sampler, iterator
+            args.batch_size = adjustment.new_batch_size
+            data_batch = slice_batch_to_size(data_batch, args.batch_size)
+            loader, sampler = _build_meshfleet_loader(args, ctx)
+            iterator = iter(loader) if loader is not None else None
+
+        def log_oom(record):
+            if ctx.is_main:
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"step": step, **record}) + "\n")
+
+        def step_fn():
             if data_batch is not None and "ss_latent_grid" in data_batch:
                 x0 = data_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
                 B = x0.shape[0]
@@ -184,20 +198,21 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            batch_adjustment = batch_controller.update_after_success(device)
-        except RuntimeError as exc:
-            if AdaptiveBatchController.is_cuda_oom(exc):
-                opt.zero_grad(set_to_none=True)
-                adjustment = batch_controller.update_after_oom(device)
-                args.batch_size = adjustment.new_batch_size
-                loader, sampler = _build_meshfleet_loader(args, ctx)
-                iterator = iter(loader) if loader is not None else None
-                step -= 1
-                if ctx.is_main:
-                    with log_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps({"step": step + 1, "event": "oom_retry", "adaptive_batch": adjustment.as_dict()}) + "\n")
-                continue
-            raise
+            return loss, mse, target_residual, debug, vel_reg, prior, identity_error
+
+        retry = train_step_with_oom_retry(
+            step_fn,
+            model=adapter,
+            optimizer=opt,
+            sampler=sampler,
+            device=device,
+            batch_controller=batch_controller,
+            rebuild_after_adjustment=rebuild_after_adjustment,
+            max_retries=getattr(args, "adaptive_oom_retries", 8),
+            log_oom=log_oom,
+        )
+        batch_adjustment = retry.adjustment
+        loss, mse, target_residual, debug, vel_reg, prior, identity_error = retry.value
         if batch_adjustment.changed:
             args.batch_size = batch_adjustment.new_batch_size
             loader, sampler = _build_meshfleet_loader(args, ctx)

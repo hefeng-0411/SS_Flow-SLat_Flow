@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import atexit
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
+
+from geoss.utils.elastic_engine import AsyncArtifactManager, write_checkpoint_atomic
+
+
+_ASYNC_MANAGER: AsyncArtifactManager | None = None
 
 
 def load_state_dict_flexible(module: torch.nn.Module, path: str | Path, strict: bool = False) -> Dict[str, Any]:
@@ -14,8 +20,28 @@ def load_state_dict_flexible(module: torch.nn.Module, path: str | Path, strict: 
 
 
 def save_checkpoint(path: str | Path, **payload: Any) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    torch.save(payload, tmp_path)
-    tmp_path.replace(path)
+    if _sync_checkpoints_enabled():
+        write_checkpoint_atomic(Path(path), payload)
+        return
+    save_checkpoint_async(path, **payload)
+
+
+def save_checkpoint_async(path: str | Path, **payload: Any):
+    global _ASYNC_MANAGER
+    if _ASYNC_MANAGER is None:
+        _ASYNC_MANAGER = AsyncArtifactManager(max_workers=1)
+    return _ASYNC_MANAGER.submit_checkpoint(path, **payload)
+
+
+def wait_for_async_checkpoints() -> None:
+    if _ASYNC_MANAGER is not None:
+        _ASYNC_MANAGER.drain()
+
+
+def _sync_checkpoints_enabled() -> bool:
+    import os
+
+    return os.environ.get("GEOSS_SYNC_CHECKPOINTS", "").lower() in {"1", "true", "yes", "on"}
+
+
+atexit.register(wait_for_async_checkpoints)

@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -79,15 +80,23 @@ def main() -> None:
     parser.add_argument("--visualize_every", type=int, default=1000)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--disable_early_stop", action="store_true")
-    parser.add_argument("--early_stop_patience", type=int, default=6000)
-    parser.add_argument("--early_stop_min_steps", type=int, default=8000)
-    parser.add_argument("--early_stop_warmup_steps", type=int, default=3000)
-    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
-    parser.add_argument("--early_stop_ema", type=float, default=0.95)
+    parser.add_argument("--early_stop_patience", type=int, default=2)
+    parser.add_argument("--early_stop_min_steps", type=int, default=300)
+    parser.add_argument("--early_stop_warmup_steps", type=int, default=200)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.002)
+    parser.add_argument("--early_stop_ema", type=float, default=0.6)
+    parser.add_argument("--early_stop_window", type=int, default=8)
+    parser.add_argument("--adaptive_min_batch_size", type=int, default=1)
+    parser.add_argument("--adaptive_target_utilization", type=float, default=0.92)
+    parser.add_argument("--adaptive_low_utilization", type=float, default=0.82)
+    parser.add_argument("--adaptive_grow_patience_steps", type=int, default=8)
+    parser.add_argument("--adaptive_cooldown_steps", type=int, default=3)
+    parser.add_argument("--adaptive_oom_retries", type=int, default=8)
     parser.add_argument("--max_train_hours_per_stage", type=float, default=0.0)
     parser.add_argument("--start_at", choices=["stage1", "stage2", "slat", "slat_joint"], default="stage1")
     parser.add_argument("--stop_after", choices=["stage1", "stage2", "slat", "slat_joint"], default="slat_joint")
     parser.add_argument("--skip_slat_joint", action="store_true")
+    parser.add_argument("--speculative_handoff_gpus", type=str, default=None, help="Optional spare CUDA_VISIBLE_DEVICES for concurrent next-stage warmup/probing.")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -106,21 +115,62 @@ def main() -> None:
         stages = [stage for stage in stages if stage.name != "slat_joint"]
 
     selected = {}
-    for stage in stages:
+    handoff = HandoffCoordinator(args, env, nproc)
+    for index, stage in enumerate(stages):
+        next_stage = stages[index + 1] if index + 1 < len(stages) else None
         if _stage_is_complete(stage) and not args.force_rerun_completed:
             step = _checkpoint_step(_resolve_resume_path(stage))
             selected[stage.name] = "already_complete"
             print(f"\n==== {stage.name}: already complete at checkpoint step={step}; skipping ====", flush=True)
             continue
+        if next_stage is not None:
+            handoff.start_when_ready(next_stage, current_stage=stage)
         print(f"\n==== {stage.name}: probing per-GPU batch size up to {stage.max_batch_size} on {nproc} GPUs ====", flush=True)
-        batch_size = stage.max_batch_size if args.no_auto_batch else _probe_batch(stage, args, env, nproc)
+        batch_size = handoff.consume(stage.name) or (stage.max_batch_size if args.no_auto_batch else _probe_batch(stage, args, env, nproc))
         selected[stage.name] = batch_size
         print(f"==== {stage.name}: selected per-GPU batch_size={batch_size}, global_batch_size={batch_size * nproc} ====", flush=True)
         _run_full_stage(stage, args, env, nproc, batch_size)
+    handoff.close()
 
     summary = {"nproc_per_node": nproc, "selected_per_gpu_batch_size": selected}
     (output_root / "multigpu_sequence_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
+
+
+class HandoffCoordinator:
+    def __init__(self, args: argparse.Namespace, env: dict, nproc: int) -> None:
+        self.args = args
+        self.base_env = dict(env)
+        self.nproc = nproc
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="handoff")
+        self.futures: dict[str, Future] = {}
+
+    def start_when_ready(self, next_stage: Stage, *, current_stage: Stage) -> None:
+        if not self.args.speculative_handoff_gpus or next_stage.name in self.futures:
+            return
+        env = dict(self.base_env)
+        env["CUDA_VISIBLE_DEVICES"] = self.args.speculative_handoff_gpus
+        nproc = len([item for item in self.args.speculative_handoff_gpus.split(",") if item.strip()])
+        if nproc < 1:
+            return
+        self.futures[next_stage.name] = self.pool.submit(self._wait_and_probe, next_stage, current_stage, env, nproc)
+
+    def consume(self, stage_name: str) -> Optional[int]:
+        future = self.futures.pop(stage_name, None)
+        if future is None:
+            return None
+        return future.result()
+
+    def close(self) -> None:
+        for future in self.futures.values():
+            future.cancel()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+    def _wait_and_probe(self, next_stage: Stage, current_stage: Stage, env: dict, nproc: int) -> int:
+        while not _resolve_resume_path(current_stage):
+            time.sleep(2.0)
+        print(f"{next_stage.name}: speculative handoff probing on spare GPUs={env['CUDA_VISIBLE_DEVICES']}", flush=True)
+        return next_stage.max_batch_size if self.args.no_auto_batch else _probe_batch(next_stage, self.args, env, nproc)
 
 
 def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> list[Stage]:
@@ -152,9 +202,19 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             "--early_stop_min_delta", str(args.early_stop_min_delta),
             "--early_stop_relative_delta", "true",
             "--early_stop_ema", str(args.early_stop_ema),
+            "--early_stop_window", str(args.early_stop_window),
             "--max_train_hours", str(args.max_train_hours_per_stage),
             "--save_best", "true",
         ]
+    adaptive_args = [
+        "--adaptive_batch", "true",
+        "--adaptive_min_batch_size", str(args.adaptive_min_batch_size),
+        "--adaptive_target_utilization", str(args.adaptive_target_utilization),
+        "--adaptive_low_utilization", str(args.adaptive_low_utilization),
+        "--adaptive_grow_patience_steps", str(args.adaptive_grow_patience_steps),
+        "--adaptive_cooldown_steps", str(args.adaptive_cooldown_steps),
+        "--adaptive_oom_retries", str(args.adaptive_oom_retries),
+    ]
     vggt_args = []
     if args.vggt_root:
         vggt_args += ["--vggt_root", args.vggt_root]
@@ -183,9 +243,11 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=stage1_out / "geoss_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + adaptive_args
             + vggt_args
             + [
                 "--latent_tokens", str(args.latent_tokens),
+                "--adaptive_max_batch_size", str(args.stage1_max_batch_size),
                 "--lr", str(args.stage1_lr),
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
@@ -204,10 +266,12 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=stage2_out / "ss_velocity_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + adaptive_args
             + vggt_args
             + trellis_args
             + [
                 "--geoss_checkpoint", str(stage1_geoss_checkpoint),
+                "--adaptive_max_batch_size", str(args.stage2_max_batch_size),
                 "--lr", str(args.stage2_lr),
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
@@ -224,9 +288,11 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=slat_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + adaptive_args
             + trellis_args
             + [
                 "--active_tokens", str(args.active_tokens),
+                "--adaptive_max_batch_size", str(args.slat_max_batch_size),
                 "--lr", str(args.slat_lr),
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
@@ -244,9 +310,11 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             best_path=slat_joint_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
             + early_stop_args
+            + adaptive_args
             + trellis_args
             + [
                 "--active_tokens", str(args.active_tokens),
+                "--adaptive_max_batch_size", str(args.slat_joint_max_batch_size),
                 "--lr", str(args.slat_joint_lr),
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
