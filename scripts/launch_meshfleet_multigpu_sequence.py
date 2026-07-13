@@ -99,7 +99,7 @@ def main() -> None:
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--torch_hub_dir", type=str, default=None)
     parser.add_argument("--dinov2_repo", type=str, default=None)
-    parser.add_argument("--cuda_alloc_conf", type=str, default="max_split_size_mb:512,garbage_collection_threshold:0.9")
+    parser.add_argument("--cuda_alloc_conf", type=str, default="expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.9")
     parser.add_argument("--nccl_socket_ifname", type=str, default=None)
     parser.add_argument("--stage1_steps", type=int, default=100000)
     parser.add_argument("--stage2_steps", type=int, default=100000)
@@ -337,6 +337,13 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
                 "--adaptive_max_batch_size", str(args.stage2_max_batch_size),
                 "--lr", str(args.stage2_lr),
                 "--raw_residual_weight", str(args.stage2_raw_residual_weight),
+                "--amp", "true",
+                "--amp_dtype", "bf16",
+                "--activation_checkpointing", "true",
+                "--attention_chunk_size", "8192",
+                "--adaptive_voxel_pruning", "true",
+                "--voxel_prune_epsilon", "0.0",
+                "--spconv_algo", "mask_implicit_gemm",
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
             ],

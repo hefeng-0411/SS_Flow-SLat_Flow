@@ -4,6 +4,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .guidance_gate import GuidanceGate, normalize_timestep
 
@@ -23,6 +24,8 @@ class SSVelocityAdapter(nn.Module):
         enabled: bool = True,
         local_attention: bool = True,
         knn_k: int = 32,
+        attention_chunk_size: int = 8192,
+        activation_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -32,6 +35,8 @@ class SSVelocityAdapter(nn.Module):
         self.enabled = enabled
         self.local_attention = local_attention
         self.knn_k = knn_k
+        self.attention_chunk_size = max(1, int(attention_chunk_size))
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.latent_proj = nn.Linear(latent_dim, hidden_dim)
         self.geo_proj = nn.Linear(geo_dim, hidden_dim)
         self.cross_attn = None if local_attention else nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
@@ -61,6 +66,7 @@ class SSVelocityAdapter(nn.Module):
         voxel_xyz: torch.Tensor | None = None,
         anchor_xyz: torch.Tensor | None = None,
         anchor_metadata: torch.Tensor | None = None,
+        voxel_valid_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         if not self.enabled:
             zero = torch.zeros_like(v_base)
@@ -83,7 +89,9 @@ class SSVelocityAdapter(nn.Module):
         k = self.geo_proj(geo_tokens)
         geo_conf = geo_confidence.clamp(0, 1)
         if self.local_attention and voxel_xyz is not None and anchor_xyz is not None:
-            attn_out, attn_weights, token_confidence, local_debug = self._local_anchor_attention(q, k, geo_conf, voxel_xyz, anchor_xyz, anchor_metadata)
+            attn_out, attn_weights, token_confidence, local_debug = self._local_attention_with_optional_pruning(
+                q, k, geo_conf, voxel_xyz, anchor_xyz, anchor_metadata, voxel_valid_mask,
+            )
         else:
             if self.cross_attn is None:
                 raise ValueError("SSVelocityAdapter was constructed for local attention but voxel_xyz/anchor_xyz were not provided.")
@@ -127,6 +135,39 @@ class SSVelocityAdapter(nn.Module):
             },
         }
 
+    def _local_attention_with_optional_pruning(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        geo_conf: torch.Tensor,
+        voxel_xyz: torch.Tensor,
+        anchor_xyz: torch.Tensor,
+        anchor_metadata: torch.Tensor | None,
+        voxel_valid_mask: torch.Tensor | None,
+    ):
+        if voxel_valid_mask is None or q.shape[0] != 1:
+            return self._local_anchor_attention(q, k, geo_conf, voxel_xyz, anchor_xyz, anchor_metadata)
+        mask = voxel_valid_mask.to(device=q.device, dtype=torch.bool)
+        if mask.shape != q.shape[:2]:
+            raise ValueError(f"voxel_valid_mask must be [B,L], got {tuple(mask.shape)}")
+        active = torch.nonzero(mask[0], as_tuple=False).flatten()
+        if active.numel() == q.shape[1]:
+            return self._local_anchor_attention(q, k, geo_conf, voxel_xyz, anchor_xyz, anchor_metadata)
+        # MeshFleet encodes padded/inactive SS sites as exact zeros. Skipping only
+        # those sites leaves learned latent values untouched and returns v_base
+        # there, avoiding needless geometry-attention activations.
+        if active.numel() == 0:
+            zero_attn = torch.zeros_like(q)
+            zero_conf = q.new_zeros(q.shape[0], q.shape[1], 1)
+            return zero_attn, q.new_empty(0), zero_conf, {"local_attention": torch.tensor(True, device=q.device), "voxel_prune_ratio": torch.tensor(1.0, device=q.device)}
+        active_attn, _, active_conf, debug = self._local_anchor_attention(
+            q[:, active], k, geo_conf, voxel_xyz[:, active], anchor_xyz, anchor_metadata,
+        )
+        attn_out = torch.zeros_like(q).index_copy(1, active, active_attn)
+        token_confidence = q.new_zeros(q.shape[0], q.shape[1], 1).index_copy(1, active, active_conf)
+        debug["voxel_prune_ratio"] = q.new_tensor(1.0 - active.numel() / q.shape[1])
+        return attn_out, q.new_empty(0), token_confidence, debug
+
     def _local_anchor_attention(
         self,
         q: torch.Tensor,
@@ -141,32 +182,72 @@ class SSVelocityAdapter(nn.Module):
             raise RuntimeError("Local anchor attention requires rel_mlp, but this adapter was constructed with local_attention=False.")
         M = anchor_xyz.shape[1]
         k_nn = min(self.knn_k, M)
-        dist = torch.cdist(voxel_xyz.to(anchor_xyz.dtype), anchor_xyz.to(anchor_xyz.dtype)).clamp_min(1e-6)
-        knn_dist, knn_idx = dist.topk(k_nn, dim=-1, largest=False)
-        gather_h = knn_idx[..., None].expand(-1, -1, -1, H)
-        local_k = k[:, None].expand(B, L, M, H).gather(2, gather_h)
-        local_conf = geo_conf[:, None].expand(B, L, M, 1).gather(2, knn_idx[..., None])
-        rel = voxel_xyz[:, :, None, :] - anchor_xyz[:, None].expand(B, L, M, 3).gather(2, knn_idx[..., None].expand(-1, -1, -1, 3))
-        rel_feat = self.rel_mlp(torch.cat([rel, knn_dist[..., None]], dim=-1))
-        local_k = local_k + rel_feat
-        score = (q[:, :, None, :] * local_k).sum(dim=-1) / (H ** 0.5)
-        score = score - knn_dist
+        attn_chunks, confidence_chunks, distance_chunks = [], [], []
+        # Never materialize [B,L,M] distances or [B,L,M,H] expanded keys. At
+        # 64^3 voxels and 4096 anchors those temporary tensors dominate VRAM.
+        for start in range(0, L, self.attention_chunk_size):
+            end = min(L, start + self.attention_chunk_size)
+            voxel_chunk = voxel_xyz[:, start:end]
+            with torch.no_grad():
+                distances = torch.cdist(voxel_chunk.float(), anchor_xyz.float()).clamp_min(1e-6)
+                knn_dist, knn_idx = distances.topk(k_nn, dim=-1, largest=False)
+            if self.training and self.activation_checkpointing:
+                # Keep optional metadata out of checkpoint's tensor argument
+                # list: older PyTorch releases only guarantee tensor inputs.
+                def run_chunk(q_chunk, keys, confidence, voxels, anchors, indices, distances):
+                    return self._local_attention_chunk(
+                        q_chunk, keys, confidence, voxels, anchors, indices, distances, anchor_metadata,
+                    )
+
+                attn_chunk, confidence_chunk = checkpoint(
+                    run_chunk, q[:, start:end], k, geo_conf, voxel_chunk, anchor_xyz, knn_idx, knn_dist,
+                    use_reentrant=False,
+                )
+            else:
+                attn_chunk, confidence_chunk = self._local_attention_chunk(
+                    q[:, start:end], k, geo_conf, voxel_chunk, anchor_xyz, knn_idx, knn_dist, anchor_metadata,
+                )
+            attn_chunks.append(attn_chunk)
+            confidence_chunks.append(confidence_chunk)
+            distance_chunks.append(knn_dist)
+        attn_out = torch.cat(attn_chunks, dim=1)
+        token_confidence = torch.cat(confidence_chunks, dim=1)
+        # Attention weights were not consumed by the SS flow. Returning an empty
+        # tensor avoids retaining a 64^3 x 4096 diagnostic allocation.
+        return attn_out, q.new_empty(0), token_confidence, {
+            "local_attention": torch.tensor(True, device=q.device),
+            "knn_distance_mean": torch.cat(distance_chunks, dim=1).mean(),
+            "knn_k": torch.tensor(k_nn, device=q.device),
+            "attention_chunk_size": torch.tensor(self.attention_chunk_size, device=q.device),
+        }
+
+    def _local_attention_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        geo_conf: torch.Tensor,
+        voxel_xyz: torch.Tensor,
+        anchor_xyz: torch.Tensor,
+        knn_idx: torch.Tensor,
+        knn_dist: torch.Tensor,
+        anchor_metadata: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Exact local-attention math for one bounded voxel chunk."""
+        B, _, H = q.shape
+        batch_index = torch.arange(B, device=q.device).view(B, 1, 1)
+        local_k = k[batch_index, knn_idx]
+        local_conf = geo_conf[batch_index, knn_idx]
+        local_anchor = anchor_xyz[batch_index, knn_idx]
+        rel = voxel_xyz[:, :, None, :] - local_anchor
+        local_k = local_k + self.rel_mlp(torch.cat([rel, knn_dist[..., None]], dim=-1))
+        score = (q[:, :, None, :] * local_k).sum(dim=-1) / (H ** 0.5) - knn_dist
         if anchor_metadata is not None:
-            meta = anchor_metadata[:, None].expand(B, L, M, anchor_metadata.shape[-1]).gather(2, knn_idx[..., None].expand(-1, -1, -1, anchor_metadata.shape[-1]))
+            meta = anchor_metadata[batch_index, knn_idx]
             source_bonus = torch.where(meta[..., 0] > 0.5, 0.15, 0.0)
             uncertainty_penalty = meta[..., 6].clamp(0, 1)
             support_bonus = torch.log1p(meta[..., 4].clamp_min(0))
             conflict_penalty = meta[..., 5].clamp_min(0)
             score = score + source_bonus + support_bonus - uncertainty_penalty - conflict_penalty
             local_conf = (local_conf * meta[..., 2:3].clamp(0, 1) * torch.exp(-conflict_penalty[..., None])).clamp(0, 1)
-        score = score + local_conf.squeeze(-1).clamp_min(1e-4).log()
-        weights = torch.softmax(score, dim=-1)
-        attn_out = (weights[..., None] * local_k).sum(dim=2)
-        token_confidence = (weights[..., None] * local_conf).sum(dim=2).clamp(0, 1)
-        dense_weights = q.new_zeros(B, L, M)
-        dense_weights.scatter_add_(2, knn_idx, weights)
-        return attn_out, dense_weights, token_confidence, {
-            "local_attention": torch.tensor(True, device=q.device),
-            "knn_distance_mean": knn_dist.mean(),
-            "knn_k": torch.tensor(k_nn, device=q.device),
-        }
+        weights = torch.softmax(score + local_conf.squeeze(-1).clamp_min(1e-4).log(), dim=-1)
+        return (weights[..., None] * local_k).sum(dim=2), (weights[..., None] * local_conf).sum(dim=2).clamp(0, 1)

@@ -238,6 +238,7 @@ def train_step_with_oom_retry(
 ) -> OOMRetryResult:
     retries = 0
     while True:
+        memory_before = cuda_memory_watermark(device)
         snapshot = capture_train_step_snapshot(model, optimizer, scaler, sampler)
         local_oom = torch.tensor(0, device=device, dtype=torch.int32)
         result = None
@@ -267,6 +268,16 @@ def train_step_with_oom_retry(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+        memory_after = cuda_memory_watermark(device)
+        adjustment = None
+        structural_oom = False
+        if batch_controller is not None:
+            try:
+                # Persist the next smaller batch in the event log before the DDP
+                # restart; the parent launcher can make the same safe transition.
+                adjustment = batch_controller.update_after_oom(device)
+            except RuntimeError:
+                structural_oom = True
         if dist.is_available() and dist.is_initialized():
             # DDP cannot safely re-enter the same reducer after a CUDA OOM that
             # may have happened after forward hooks were registered but before
@@ -275,7 +286,15 @@ def train_step_with_oom_retry(
             # error on the next forward. Restore state, then force a process-
             # level retry so torchrun rebuilds the reducer from a clean graph.
             if log_oom is not None:
-                log_oom({"event": "oom_restart_required", "retry": retries + 1, "distributed": True})
+                log_oom({
+                    "event": "oom_restart_required",
+                    "retry": retries + 1,
+                    "distributed": True,
+                    "structural_oom": structural_oom,
+                    "next_batch": adjustment.as_dict() if adjustment is not None else None,
+                    "memory_before": memory_before,
+                    "memory_after": memory_after,
+                })
             raise RuntimeError(
                 "CUDA OOM requires a DDP process restart after state rollback; "
                 "the launcher should lower batch size and relaunch from the last checkpoint. "
@@ -290,11 +309,37 @@ def train_step_with_oom_retry(
                 f"Original OOM: {caught_oom_message or 'observed on a peer rank'}"
             ) from None
 
-        adjustment = batch_controller.update_after_oom(device)
+        if adjustment is None:
+            adjustment = batch_controller.update_after_oom(device)
         if rebuild_after_adjustment is not None:
             rebuild_after_adjustment(adjustment)
         if log_oom is not None:
-            log_oom({"event": "oom_retry", "retry": retries, "adaptive_batch": adjustment.as_dict()})
+            log_oom({
+                "event": "oom_retry",
+                "retry": retries,
+                "adaptive_batch": adjustment.as_dict(),
+                "memory_before": memory_before,
+                "memory_after": memory_after,
+            })
+
+
+def cuda_memory_watermark(device: torch.device, *, reset_peak: bool = False) -> dict[str, float] | None:
+    """Return allocator and driver watermarks for train logs and OOM triage."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats(index)
+    free, total = torch.cuda.mem_get_info(index)
+    gib = float(1024 ** 3)
+    return {
+        "allocated_gib": torch.cuda.memory_allocated(index) / gib,
+        "reserved_gib": torch.cuda.memory_reserved(index) / gib,
+        "peak_allocated_gib": torch.cuda.max_memory_allocated(index) / gib,
+        "peak_reserved_gib": torch.cuda.max_memory_reserved(index) / gib,
+        "driver_used_gib": (total - free) / gib,
+        "total_gib": total / gib,
+    }
 
 
 def capture_train_step_snapshot(model, optimizer, scaler=None, sampler=None) -> TrainStepSnapshot:

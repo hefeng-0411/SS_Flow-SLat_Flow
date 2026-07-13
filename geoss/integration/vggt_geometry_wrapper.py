@@ -76,7 +76,8 @@ class VGGTGeometryWrapper(nn.Module):
             return predictions, None, 0, None
         aggregated_tokens_list, patch_start_idx = self.model.aggregator(images)
         predictions: Dict[str, torch.Tensor] = {}
-        with torch.cuda.amp.autocast(enabled=False):
+        # Keep geometry heads FP32 while using the non-deprecated AMP API.
+        with torch.amp.autocast(device_type=images.device.type, enabled=False):
             if getattr(self.model, "camera_head", None) is not None:
                 pose_enc_list = self.model.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]
