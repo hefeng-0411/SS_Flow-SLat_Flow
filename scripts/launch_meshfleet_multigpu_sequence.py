@@ -571,7 +571,7 @@ def _configure_training_env(env: dict, args: argparse.Namespace) -> dict:
     tuned.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
     tuned.setdefault("NCCL_P2P_DISABLE", "0")
     tuned.setdefault("NCCL_SHM_DISABLE", "0")
-    tuned.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    tuned.pop("NCCL_ASYNC_ERROR_HANDLING", None)
     tuned.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     tuned.setdefault("TORCH_SHOW_CPP_STACKTRACES", "0")
     if args.nccl_socket_ifname:

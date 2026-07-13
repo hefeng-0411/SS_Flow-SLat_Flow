@@ -225,6 +225,18 @@ def compute_losses(
     raw_flow = slat_flow_matching_loss(raw_delta, target_residual.detach())
     effective_flow = slat_flow_matching_loss(effective_delta, target_residual.detach())
     flow_loss = raw_residual_weight * raw_flow["loss"] + effective_residual_weight * effective_flow["loss"]
+    base_valid_mask = batch.get("v_slat_base_valid_mask")
+    joint_confidence = out["debug"]["joint_confidence"]
+    if base_valid_mask is not None:
+        assert base_valid_mask.shape == joint_confidence.shape, (
+            f"v_slat_base_valid_mask shape {tuple(base_valid_mask.shape)} "
+            f"must match joint_confidence {tuple(joint_confidence.shape)}"
+        )
+        # The prior loss uses weight=(1-confidence). Invalid frozen-teacher
+        # tokens must therefore be assigned confidence=1 so they contribute
+        # zero preservation pressure instead of preserving the placeholder base.
+        joint_confidence = torch.where(base_valid_mask.bool(), joint_confidence, torch.ones_like(joint_confidence))
+    base_invalid_ratio = batch.get("v_slat_base_invalid_ratio", torch.zeros((), device=out["v_slat_geo"].device))
     return {
         "slat_flow": {
             "loss": flow_loss,
@@ -232,6 +244,7 @@ def compute_losses(
             "raw_residual_mse": raw_flow["loss"],
             "effective_residual_mse": effective_flow["loss"],
         },
+        "base_velocity": {"invalid_ratio": base_invalid_ratio.detach()},
         "view": view_consistency_loss(out["sampled_features"], out["visibility"]),
         "appearance": appearance_feature_loss(out["slat_cond_tokens"], out["sampled_features"], out["visibility"], out["view_weights"]),
         "visibility_confidence": visibility_confidence_loss(
@@ -242,7 +255,7 @@ def compute_losses(
             occlusion_score=out["occlusion_score"],
         ),
         "velocity": slat_velocity_regularization_loss(out["delta_v_slat"], batch["timestep"]),
-        "prior": slat_prior_preservation_loss(out["v_slat_geo"], batch["v_slat_base"], out["debug"]["joint_confidence"]),
+        "prior": slat_prior_preservation_loss(out["v_slat_geo"], batch["v_slat_base"], joint_confidence),
     }
 
 
@@ -261,6 +274,7 @@ def summarize(out: dict, terms: dict, mode: str) -> dict:
         "loss_slat_flow": float(terms["slat_flow"]["loss"].detach().cpu()),
         "loss_slat_raw_residual": float(terms["slat_flow"]["raw_residual_mse"].detach().cpu()),
         "loss_slat_effective_residual": float(terms["slat_flow"]["effective_residual_mse"].detach().cpu()),
+        "slat_base_invalid_ratio": float(terms["base_velocity"]["invalid_ratio"].detach().cpu()),
         "loss_prior": float(terms["prior"]["loss"].detach().cpu()),
         "loss_velocity": float(terms["velocity"]["loss"].detach().cpu()),
     }
@@ -283,6 +297,14 @@ def _assert_slat_training_contract(
     assert target_residual.shape == x_t.shape, f"target_residual shape {tuple(target_residual.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
     assert raw_delta.shape == x_t.shape, f"raw SLAT residual shape {tuple(raw_delta.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
     assert effective_delta.shape == x_t.shape, f"effective SLAT residual shape {tuple(effective_delta.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
+    base_valid_mask = batch.get("v_slat_base_valid_mask")
+    if base_valid_mask is not None:
+        assert base_valid_mask.shape == (*x_t.shape[:2], 1), (
+            f"v_slat_base_valid_mask must be [B,L,1], got {tuple(base_valid_mask.shape)}"
+        )
+        assert base_valid_mask.dtype == torch.float32, f"v_slat_base_valid_mask must be float32, got {base_valid_mask.dtype}"
+        assert torch.isfinite(base_valid_mask).all().item(), "v_slat_base_valid_mask contains NaN or Inf."
+        assert base_valid_mask.min().item() >= 0.0 and base_valid_mask.max().item() <= 1.0, "v_slat_base_valid_mask must be in [0, 1]."
     for name, tensor in {
         "slat_latent_tokens": x_t,
         "v_slat_base": v_base,
@@ -359,6 +381,9 @@ def make_synthetic_slat_batch(cfg: dict, args: argparse.Namespace, device: torch
             "vggt_features": torch.rand(B, args.num_views, 16, args.image_size // 4, args.image_size // 4, device=device),
         }
     )
+    batch["v_slat_base_valid_mask"] = torch.ones(B, L, 1, device=device, dtype=torch.float32)
+    batch["v_slat_base_invalid_ratio"] = torch.zeros((), device=device, dtype=torch.float32)
+    batch["target_residual"] = batch["target_velocity"].detach()
     return batch
 
 
@@ -383,15 +408,55 @@ def prepare_batch(raw: dict, cfg: dict, args: argparse.Namespace, device: torch.
     x_t = (1 - t.view(B, 1, 1)) * x0 + (sigma_min + (1 - sigma_min) * t.view(B, 1, 1)) * noise
     batch.update(context)
     batch["slat_latent_tokens"] = x_t
+    batch["target_velocity"] = (1 - sigma_min) * noise - x0
     base = batch.get("trellis_slat_base_velocity")
     if base is None:
         base = _compute_trellis_slat_base_velocity(batch, x_t, indices, t, trellis_pipeline, device)
-    batch["v_slat_base"] = base[:, : x_t.shape[1], : x_t.shape[2]].to(device=device, dtype=x_t.dtype)
-    batch["target_velocity"] = (1 - sigma_min) * noise - x0
+    base, base_valid_mask, base_invalid_ratio = _sanitize_slat_base_velocity(base, expected_shape=x_t.shape, device=device, dtype=x_t.dtype)
+    batch["v_slat_base"] = base
+    batch["v_slat_base_valid_mask"] = base_valid_mask
+    batch["v_slat_base_invalid_ratio"] = base_invalid_ratio
     batch["target_residual"] = (batch["target_velocity"] - batch["v_slat_base"]).detach()
     batch["timestep"] = t
     batch["slat_target_source"] = source
     return batch
+
+
+def _sanitize_slat_base_velocity(
+    base: torch.Tensor,
+    *,
+    expected_shape: torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return a finite frozen-teacher velocity and a mask of valid teacher tokens.
+
+    Stage 3 trains a residual velocity:
+        delta_theta(x_t, t, c) ~= v_target - v_base.
+    When the frozen TRELLIS teacher produces NaN/Inf for a sparse token, v_base is
+    undefined for that token. The correct objective is to remove the teacher prior
+    for that token and train against the direct target velocity, which is exactly
+    implemented by setting the invalid teacher contribution to zero and carrying
+    a validity mask into the prior-preservation term.
+    """
+    assert isinstance(base, torch.Tensor), f"v_slat_base must be a tensor, got {type(base)!r}"
+    assert len(expected_shape) == 3, f"expected_shape must describe [B,L,C], got {tuple(expected_shape)}"
+    B, L, C = expected_shape
+    assert base.ndim == 3, f"v_slat_base must be [B,L,C], got {tuple(base.shape)}"
+    assert base.shape[0] == B, f"v_slat_base batch {base.shape[0]} != expected {B}"
+    assert base.shape[1] >= L, f"v_slat_base tokens {base.shape[1]} < expected {L}"
+    assert base.shape[2] >= C, f"v_slat_base channels {base.shape[2]} < expected {C}"
+    sliced = base[:, :L, :C].to(device=device, dtype=dtype)
+    assert sliced.dtype == torch.float32, f"SLAT base velocity must be float32 after conversion, got {sliced.dtype}"
+    valid_mask_bool = torch.isfinite(sliced).all(dim=-1, keepdim=True)
+    invalid_ratio = 1.0 - valid_mask_bool.float().mean()
+    safe_base = torch.where(valid_mask_bool, torch.nan_to_num(sliced, nan=0.0, posinf=0.0, neginf=0.0), torch.zeros_like(sliced))
+    valid_mask = valid_mask_bool.to(dtype=torch.float32)
+    assert safe_base.shape == expected_shape, f"sanitized v_slat_base shape {tuple(safe_base.shape)} != {tuple(expected_shape)}"
+    assert valid_mask.shape == (B, L, 1), f"v_slat_base_valid_mask shape {tuple(valid_mask.shape)} != {(B, L, 1)}"
+    assert torch.isfinite(safe_base).all().item(), "sanitized v_slat_base still contains NaN or Inf."
+    assert torch.isfinite(invalid_ratio).all().item(), "v_slat_base_invalid_ratio is non-finite."
+    return safe_base, valid_mask, invalid_ratio
 
 
 def build_real_loader(args: argparse.Namespace, ctx):
@@ -640,7 +705,14 @@ def _compute_trellis_slat_base_velocity(batch: dict, x_t: torch.Tensor, indices:
     v_sparse = pipeline.models["slat_flow_model"](sparse, t * 1000.0, cond)
     if not hasattr(v_sparse, "feats"):
         raise TypeError("TRELLIS slat_flow_model must return a SparseTensor with feats.")
-    return v_sparse.feats.reshape(B, L, C).to(device=device, dtype=x_t.dtype).detach()
+    feats = v_sparse.feats
+    if feats.ndim != 2:
+        raise ValueError(f"TRELLIS slat_flow_model feats must be [B*L,C], got {tuple(feats.shape)}")
+    if feats.shape[0] != B * L:
+        raise ValueError(f"TRELLIS slat_flow_model returned {feats.shape[0]} tokens, expected {B * L}.")
+    if feats.shape[1] < C:
+        raise ValueError(f"TRELLIS slat_flow_model returned {feats.shape[1]} channels, expected at least {C}.")
+    return feats[:, :C].reshape(B, L, C).to(device=device, dtype=x_t.dtype).detach()
 
 
 @torch.no_grad()

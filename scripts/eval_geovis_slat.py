@@ -43,6 +43,9 @@ def main() -> None:
         "official_metrics": False,
     }
     metrics = {"ablation": args.ablation, **run_modes}
+    controlled = in_dir / "geovis_controlled_slat.npz"
+    original = in_dir / "original_slat.npz"
+    has_asset_eval = bool(args.gaussian_ply or args.pred_points or (controlled.exists() and original.exists()))
     if args.prediction and args.gt_render:
         pred = np.load(args.prediction)
         gt = np.load(args.gt_render)
@@ -54,16 +57,14 @@ def main() -> None:
                 torch.tensor(gt["mask"]) if "mask" in gt else None,
             )
         )
-    elif not args.dry_run:
-        raise FileNotFoundError("real_eval requires --prediction and --gt_render render npz files; latent fallback is dry_run only.")
+    elif not args.dry_run and not has_asset_eval:
+        raise FileNotFoundError("real_eval requires render npz files or asset/latent outputs such as --gaussian_ply, --pred_points, or geovis_controlled_slat.npz.")
     if args.gaussian_ply:
         metrics.update(gaussian_statistics(read_gaussian_ply(args.gaussian_ply, real_mode=not args.dry_run)))
     if args.pred_points:
         pred_points = torch.tensor(np.load(args.pred_points)["points"]).float()
         gt_points = torch.tensor(np.load(args.gt_points)["points"]).float() if args.gt_points else None
         metrics.update(geometry_metrics(pred_points, gt_points, real_mode=not args.dry_run))
-    controlled = in_dir / "geovis_controlled_slat.npz"
-    original = in_dir / "original_slat.npz"
     if controlled.exists() and original.exists():
         c = np.load(controlled)["feats"]
         o = np.load(original)["feats"]

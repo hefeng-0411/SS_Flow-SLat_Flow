@@ -11,11 +11,13 @@ import torch
 import numpy as np
 from PIL import Image
 
+from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
+from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset
 from geoss.integration.real_trellis_pipeline import RealTrellisGeoPipeline
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
-from geoss.utils.config import add_common_args, load_config
+from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
-from scripts.train_geovis_slat import make_synthetic_slat_batch
+from scripts.train_geovis_slat import make_synthetic_slat_batch, prepare_batch
 from geoss.slat.models.geovis_slat_adapter import GeoVisSLATAdapter
 
 
@@ -30,7 +32,15 @@ def main() -> None:
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--slat_adapter_checkpoint", type=str, default=None)
+    parser.add_argument("--meshfleet_root", type=str, default=None)
+    parser.add_argument("--meshfleet_split", type=str, default="test")
+    parser.add_argument("--meshfleet_category", type=str, default=None)
+    parser.add_argument("--meshfleet_index", type=int, default=0)
+    parser.add_argument("--meshfleet_slat_latent_model", type=str, default="dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16")
     parser.add_argument("--geovis_context", type=str, default=None)
+    parser.add_argument("--geoss_context", type=str, default=None)
+    parser.add_argument("--decode", type=str2bool, default=True)
+    parser.add_argument("--save_context", type=str2bool, default=True)
     parser.add_argument("--real_infer", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -41,17 +51,58 @@ def main() -> None:
         model.load_state_dict(state.get("model", state), strict=False)
 
     if not args.dry_run:
-        run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=("trellis", "dataset", "decoder"))
-        if not args.geovis_context or not Path(args.geovis_context).exists():
-            raise FileNotFoundError("real_infer requires --geovis_context produced by the SS/GeoVis context stage; no zero-context fallback is allowed.")
-        images = _load_images(args.input)
-        context = _load_context(args.geovis_context, device)
+        required = ("trellis", "dataset", "decoder") if args.decode else ("trellis", "dataset")
+        run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=required)
         pipe = RealTrellisGeoPipeline(args.trellis_root, args.trellis_model_path, device=args.device)
-        pipe.install_slat_adapter(model.velocity_adapter)
-        decoded = pipe.run(images, geovis_slat_context=context, formats=("gaussian", "mesh"))
         out_dir = Path(args.output_dir)
-        saved_assets = pipe.save_outputs(decoded, out_dir)
-        metrics = {**run_modes, "mode": "real_infer", "saved_assets": saved_assets, "continue_to_decoder": True}
+        out_dir.mkdir(parents=True, exist_ok=True)
+        context = _load_context(args.geovis_context, device) if args.geovis_context and Path(args.geovis_context).exists() else None
+        batch = None
+        if context is None:
+            batch = _load_meshfleet_batch(args)
+            batch = _move_batch(batch, device)
+            batch = prepare_batch(batch, cfg, args, device, trellis_pipeline=pipe.pipeline)
+            with torch.no_grad():
+                out = model(batch)
+            context = {
+                "slat_cond_tokens": out["slat_cond_tokens"].detach().cpu(),
+                "slat_confidence": out["slat_confidence"].detach().cpu(),
+                "ss_confidence": out["ss_confidence"].detach().cpu(),
+                "active_xyz": out["active_xyz"].detach().cpu(),
+            }
+            torch.save(context, out_dir / "geovis_slat_context.pt")
+            save_slat_debug_npz(out_dir / "geovis_controlled_slat.npz", feats=out["v_slat_geo"], indices=batch["ss_active_indices"])
+            write_active_voxels_ply(out_dir / "ss_active_voxels.ply", out["active_xyz"][0], out["ss_confidence"][0])
+            write_active_voxels_ply(out_dir / "slat_confidence.ply", out["active_xyz"][0], out["slat_confidence"][0])
+            save_slat_debug_npz(out_dir / "slat_visibility_debug.npz", visibility=out["visibility"])
+            save_slat_debug_npz(out_dir / "view_weights.npz", view_weights=out["view_weights"])
+            save_slat_debug_npz(out_dir / "slat_velocity_debug.npz", delta_v_slat=out["delta_v_slat"], clipping_ratio=out["debug"]["clipping_ratio"])
+        elif args.save_context:
+            torch.save({k: v.detach().cpu() if isinstance(v, torch.Tensor) else v for k, v in context.items()}, out_dir / "geovis_slat_context.pt")
+        saved_assets = {}
+        if args.decode:
+            images = _images_from_batch_or_path(batch, args)
+            pipe.install_slat_adapter(model.velocity_adapter)
+            geoss_context = _load_context(args.geoss_context, device) if args.geoss_context and Path(args.geoss_context).exists() else None
+            decoded = pipe.run(images, geoss_context=geoss_context, geovis_slat_context={k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in context.items()}, formats=("gaussian", "mesh"))
+            saved_assets = pipe.save_outputs(decoded, out_dir)
+        metrics = {
+            **run_modes,
+            "mode": "real_infer",
+            "saved_assets": saved_assets,
+            "continue_to_decoder": bool(args.decode),
+            "geovis_context": str(out_dir / "geovis_slat_context.pt") if args.save_context or batch is not None else args.geovis_context,
+        }
+        if batch is not None:
+            metrics.update(
+                {
+                    "uid": _first_scalar(batch.get("uid")),
+                    "slat_confidence_mean": float(out["slat_confidence"].mean().detach().cpu()),
+                    "visibility_mean": float(out["visibility"].mean().detach().cpu()),
+                    "delta_norm": float(out["delta_v_slat"].norm(dim=-1).mean().detach().cpu()),
+                    "slat_base_invalid_ratio": float(batch.get("v_slat_base_invalid_ratio", torch.zeros(())).detach().cpu()),
+                }
+            )
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         print(json.dumps(metrics, indent=2))
         return
@@ -90,6 +141,42 @@ def _load_images(path: str | None) -> list[Image.Image]:
     if not files:
         raise FileNotFoundError(f"No input images found in {p}")
     return [Image.open(f).convert("RGB") for f in files]
+
+
+def _load_meshfleet_batch(args: argparse.Namespace) -> dict:
+    if not args.meshfleet_root:
+        raise FileNotFoundError("real_infer requires --geovis_context or --meshfleet_root to build SLAT context.")
+    dataset = MeshFleetTrellisDataset(
+        args.meshfleet_root,
+        split=args.meshfleet_split,
+        category=args.meshfleet_category,
+        num_views=args.num_views,
+        image_size=args.image_size,
+        slat_latent_model=args.meshfleet_slat_latent_model,
+        require_slat_latents=True,
+    )
+    if len(dataset) == 0:
+        raise FileNotFoundError(f"No MeshFleet samples found at root={args.meshfleet_root}, split={args.meshfleet_split}.")
+    return VehicleMultiViewDataset.collate_fn([dataset[min(args.meshfleet_index, len(dataset) - 1)]])
+
+
+def _move_batch(batch: dict, device: torch.device) -> dict:
+    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+
+def _images_from_batch_or_path(batch: dict | None, args: argparse.Namespace) -> list[Image.Image] | torch.Tensor:
+    if batch is not None:
+        cond = batch.get("trellis_cond_image")
+        if isinstance(cond, torch.Tensor):
+            return cond
+        return batch["images"][:, 0]
+    return _load_images(args.input)
+
+
+def _first_scalar(value):
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
 
 
 def _load_context(path: str, device: torch.device) -> dict:

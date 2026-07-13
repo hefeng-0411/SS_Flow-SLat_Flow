@@ -16,7 +16,7 @@ from geoss.datasets.vehicle_multiview_dataset import make_dry_run_batch
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
 from geoss.integration.real_trellis_pipeline import RealTrellisGeoPipeline
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
-from geoss.utils.config import add_common_args, load_config
+from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
 from geoss.utils.visualization import save_npz, write_point_cloud_ply
 
@@ -39,6 +39,9 @@ def main() -> None:
     parser.add_argument("--vggt_pretrained", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--decode", type=str2bool, default=True)
+    parser.add_argument("--save_context", type=str2bool, default=True)
+    parser.add_argument("--disable_ss_adapter", type=str2bool, default=False)
     parser.add_argument("--real_infer", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -50,7 +53,8 @@ def main() -> None:
         vggt = VGGTGeometryWrapper(mock=True).to(args.device)
         mode = "dry_run"
     else:
-        run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=("vggt", "trellis", "dataset", "decoder"))
+        required = ("vggt", "trellis", "dataset", "decoder") if args.decode else ("vggt", "trellis", "dataset")
+        run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=required)
         batch = _load_real_batch(args)
         batch = _move_batch(batch, torch.device(args.device))
         vggt = VGGTGeometryWrapper(
@@ -67,19 +71,23 @@ def main() -> None:
     model.eval()
     with torch.no_grad():
         out = model(_context_only_batch(batch))
-    if not args.dry_run:
+    geoss_context = {
+        "geo_tokens": out["geo_tokens"].detach().cpu(),
+        "geo_confidence": out["geo_confidence"].detach().cpu(),
+        "anchor_xyz": out["anchor_xyz"].detach().cpu(),
+        "anchor_metadata": out["anchor_metadata"].detach().cpu(),
+    }
+    if args.save_context:
+        torch.save(geoss_context, output_dir / "geoss_context.pt")
+    if not args.dry_run and args.decode:
         pipe = RealTrellisGeoPipeline(args.trellis_root, args.trellis_model_path, device=args.device)
-        pipe.install_ss_adapter(model.velocity_adapter)
-        geoss_context = {
-            "geo_tokens": out["geo_tokens"],
-            "geo_confidence": out["geo_confidence"],
-            "anchor_xyz": out["anchor_xyz"],
-            "anchor_metadata": out["anchor_metadata"],
-        }
+        if not args.disable_ss_adapter:
+            pipe.install_ss_adapter(model.velocity_adapter)
         cond_input = batch.get("trellis_cond_image")
         if not isinstance(cond_input, torch.Tensor):
             cond_input = batch["images"][:, 0]
-        decoded = pipe.run(cond_input, geoss_context=geoss_context, formats=("gaussian", "mesh"))
+        decode_context = None if args.disable_ss_adapter else {k: v.to(args.device) for k, v in geoss_context.items()}
+        decoded = pipe.run(cond_input, geoss_context=decode_context, formats=("gaussian", "mesh"))
         saved_assets = pipe.save_outputs(decoded, output_dir)
     else:
         run_modes = {"vggt_mode": "mock", "trellis_mode": "mock", "data_mode": "synthetic", "decoder_enabled": False, "render_eval_enabled": False, "official_metrics": False}
@@ -107,6 +115,9 @@ def main() -> None:
         "continue_to_slat": False,
         "mode": mode,
         **run_modes,
+        "decode_enabled": bool(args.decode),
+        "ss_adapter_enabled": bool(args.decode and not args.disable_ss_adapter),
+        "geoss_context": str(output_dir / "geoss_context.pt") if args.save_context else None,
         "saved_assets": saved_assets,
     }
     if "gt_occ" in batch:
