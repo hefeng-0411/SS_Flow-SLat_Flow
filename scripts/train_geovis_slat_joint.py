@@ -24,6 +24,9 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--velocity_weight", type=float, default=1e-3)
     parser.add_argument("--prior_weight", type=float, default=1e-2)
+    parser.add_argument("--raw_residual_weight", type=float, default=1.0)
+    parser.add_argument("--effective_residual_weight", type=float, default=1.0)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
@@ -36,17 +39,21 @@ def main() -> None:
     parser.add_argument("--objaverse_rendered_root", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--torch_hub_dir", type=str, default=None)
+    parser.add_argument("--dinov2_repo", type=str, default=None)
     add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
-    summary = run_dry_run(cfg, args) if args.dry_run else run_training(cfg, args)
-    summary["joint_mode"] = "adapter_only_joint_finetune_sanity"
-    if getattr(args, "rank", 0) == 0:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        (Path(args.output_dir) / "train_geovis_slat_joint_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        print(json.dumps(summary, indent=2))
-    cleanup_distributed()
+    try:
+        summary = run_dry_run(cfg, args) if args.dry_run else run_training(cfg, args)
+        summary["joint_mode"] = "adapter_only_joint_finetune_sanity"
+        if getattr(args, "rank", 0) == 0:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(args.output_dir) / "train_geovis_slat_joint_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            print(json.dumps(summary, indent=2))
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

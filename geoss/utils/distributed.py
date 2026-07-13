@@ -60,8 +60,10 @@ def init_distributed(args) -> DistributedContext:
 
 def cleanup_distributed() -> None:
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 def barrier() -> None:

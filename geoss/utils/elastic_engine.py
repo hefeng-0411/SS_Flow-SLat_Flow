@@ -241,13 +241,13 @@ def train_step_with_oom_retry(
         snapshot = capture_train_step_snapshot(model, optimizer, scaler, sampler)
         local_oom = torch.tensor(0, device=device, dtype=torch.int32)
         result = None
-        caught_oom: BaseException | None = None
+        caught_oom_message: str | None = None
         try:
             result = step_fn()
         except RuntimeError as exc:
             if not _is_cuda_oom(exc):
                 raise
-            caught_oom = exc
+            caught_oom_message = str(exc)
             local_oom.fill_(1)
 
         # Every rank must observe the same decision. If rank 0 succeeds while
@@ -267,10 +267,28 @@ def train_step_with_oom_retry(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+        if dist.is_available() and dist.is_initialized():
+            # DDP cannot safely re-enter the same reducer after a CUDA OOM that
+            # may have happened after forward hooks were registered but before
+            # every bucket received its backward gradient. Retrying in-process
+            # can convert the original OOM into a misleading "unused parameter"
+            # error on the next forward. Restore state, then force a process-
+            # level retry so torchrun rebuilds the reducer from a clean graph.
+            if log_oom is not None:
+                log_oom({"event": "oom_restart_required", "retry": retries + 1, "distributed": True})
+            raise RuntimeError(
+                "CUDA OOM requires a DDP process restart after state rollback; "
+                "the launcher should lower batch size and relaunch from the last checkpoint. "
+                f"Original OOM: {caught_oom_message or 'observed on a peer rank'}"
+            ) from None
+
         retries += 1
         if retries > max_retries:
             detail = f"after {max_retries} elastic retries"
-            raise RuntimeError(f"CUDA OOM could not be recovered {detail}") from caught_oom
+            raise RuntimeError(
+                f"CUDA OOM could not be recovered {detail}. "
+                f"Original OOM: {caught_oom_message or 'observed on a peer rank'}"
+            ) from None
 
         adjustment = batch_controller.update_after_oom(device)
         if rebuild_after_adjustment is not None:

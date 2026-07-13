@@ -24,6 +24,20 @@ OOM_PATTERNS = (
     "processgroupnccl",
 )
 
+TRANSIENT_SETUP_PATTERNS = (
+    "remotedisconnected",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection timed out",
+    "read timed out",
+    "temporary failure in name resolution",
+    "urlopen error",
+    "http error 5",
+    "tlsv1_alert",
+    "torch.hub",
+)
+
 
 DISTRIBUTED_ENV_KEYS = (
     "RANK",
@@ -66,10 +80,12 @@ def main() -> None:
     parser.add_argument("--no_auto_batch", action="store_true")
     parser.add_argument("--batch_probe_strategy", choices=["binary", "halve"], default="binary")
     parser.add_argument("--oom_retry_limit", type=int, default=8)
+    parser.add_argument("--setup_retry_limit", type=int, default=3)
     parser.add_argument("--restart_sleep_seconds", type=float, default=20.0)
     parser.add_argument("--force_rerun_completed", action="store_true")
     parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--pin_memory", type=str, default="true")
+    parser.add_argument("--ddp_find_unused_parameters", action="store_true", help="Diagnostic compatibility flag; Stage 2 is architected to run without relying on this.")
     parser.add_argument("--num_views", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--latent_tokens", type=int, default=4096)
@@ -81,6 +97,10 @@ def main() -> None:
     parser.add_argument("--vggt_pretrained", type=str, default="facebook/VGGT-1B")
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--torch_hub_dir", type=str, default=None)
+    parser.add_argument("--dinov2_repo", type=str, default=None)
+    parser.add_argument("--cuda_alloc_conf", type=str, default="max_split_size_mb:512,garbage_collection_threshold:0.9")
+    parser.add_argument("--nccl_socket_ifname", type=str, default=None)
     parser.add_argument("--stage1_steps", type=int, default=100000)
     parser.add_argument("--stage2_steps", type=int, default=100000)
     parser.add_argument("--slat_steps", type=int, default=100000)
@@ -91,8 +111,12 @@ def main() -> None:
     parser.add_argument("--slat_joint_max_batch_size", type=int, default=6)
     parser.add_argument("--stage1_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_lr", type=float, default=1e-4)
+    parser.add_argument("--stage2_raw_residual_weight", type=float, default=1.0)
     parser.add_argument("--slat_lr", type=float, default=1e-4)
     parser.add_argument("--slat_joint_lr", type=float, default=5e-5)
+    parser.add_argument("--slat_raw_residual_weight", type=float, default=1.0)
+    parser.add_argument("--slat_effective_residual_weight", type=float, default=1.0)
+    parser.add_argument("--slat_grad_accum_steps", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--fault_tolerant_save_every", type=int, default=25)
     parser.add_argument("--visualize_every", type=int, default=1000)
@@ -124,6 +148,7 @@ def main() -> None:
     if args.gpus:
         env["CUDA_VISIBLE_DEVICES"] = args.gpus
     env = _sanitize_torchrun_parent_env(env)
+    env = _configure_training_env(env, args)
     visible_count = _visible_gpu_count(env)
     requested_nproc = args.nproc_per_node if args.nproc_per_node > 0 else visible_count
     nproc = min(requested_nproc, visible_count)
@@ -215,6 +240,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
         "--image_size", str(args.image_size),
         "--num_workers", str(args.num_workers),
         "--pin_memory", args.pin_memory,
+        "--ddp_find_unused_parameters", "true" if args.ddp_find_unused_parameters else "false",
     ]
     if args.meshfleet_category:
         common_data += ["--meshfleet_category", args.meshfleet_category]
@@ -255,6 +281,15 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
         trellis_args += ["--trellis_root", args.trellis_root]
     if args.trellis_model_path:
         trellis_args += ["--trellis_model_path", args.trellis_model_path]
+    slat_runtime_args = [
+        "--raw_residual_weight", str(args.slat_raw_residual_weight),
+        "--effective_residual_weight", str(args.slat_effective_residual_weight),
+        "--grad_accum_steps", str(args.slat_grad_accum_steps),
+    ]
+    if args.torch_hub_dir:
+        slat_runtime_args += ["--torch_hub_dir", args.torch_hub_dir]
+    if args.dinov2_repo:
+        slat_runtime_args += ["--dinov2_repo", args.dinov2_repo]
     stage1_geoss_checkpoint = stage1_out / "geoss_adapter_last.pt"
     if not stage1_geoss_checkpoint.exists() and (stage1_out / "geoss_adapter_best.pt").exists():
         stage1_geoss_checkpoint = stage1_out / "geoss_adapter_best.pt"
@@ -301,6 +336,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
                 "--geoss_checkpoint", str(stage1_geoss_checkpoint),
                 "--adaptive_max_batch_size", str(args.stage2_max_batch_size),
                 "--lr", str(args.stage2_lr),
+                "--raw_residual_weight", str(args.stage2_raw_residual_weight),
                 "--save_every", str(args.save_every),
                 "--fault_tolerant_save_every", str(args.fault_tolerant_save_every),
             ],
@@ -318,6 +354,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             + early_stop_args
             + adaptive_args
             + trellis_args
+            + slat_runtime_args
             + [
                 "--active_tokens", str(args.active_tokens),
                 "--adaptive_max_batch_size", str(args.slat_max_batch_size),
@@ -340,6 +377,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             + early_stop_args
             + adaptive_args
             + trellis_args
+            + slat_runtime_args
             + [
                 "--active_tokens", str(args.active_tokens),
                 "--adaptive_max_batch_size", str(args.slat_joint_max_batch_size),
@@ -370,6 +408,7 @@ def _probe_batch(stage: Stage, args: argparse.Namespace, env: dict, nproc: int) 
 def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc: int) -> int:
     batch_size = max(stage.max_batch_size, args.min_batch_size)
     last_error = ""
+    setup_retries: dict[int, int] = {}
     while batch_size >= args.min_batch_size:
         probe_dir = stage.output_dir / f"_probe_bs{batch_size}"
         command = _torchrun_command(stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False)
@@ -385,6 +424,15 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
             return batch_size
         last_error = text[-8000:]
         if not _looks_like_oom(text):
+            if _looks_like_transient_setup(text) and setup_retries.get(batch_size, 0) < args.setup_retry_limit:
+                setup_retries[batch_size] = setup_retries.get(batch_size, 0) + 1
+                print(
+                    f"{stage.name}: transient setup failure at per-GPU batch_size={batch_size}; "
+                    f"retry {setup_retries[batch_size]}/{args.setup_retry_limit}",
+                    flush=True,
+                )
+                time.sleep(max(0.0, args.restart_sleep_seconds))
+                continue
             raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
         print(f"{stage.name}: per-GPU batch_size={batch_size} OOM, retrying with {batch_size // 2}", flush=True)
         time.sleep(max(0.0, args.restart_sleep_seconds))
@@ -398,6 +446,7 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
     best = 0
     last_error = ""
     tried = set()
+    setup_retries: dict[int, int] = {}
 
     while low <= high:
         if high == stage.max_batch_size and high not in tried:
@@ -423,6 +472,16 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
         else:
             last_error = text[-12000:]
             if not _looks_like_oom(text):
+                if _looks_like_transient_setup(text) and setup_retries.get(batch_size, 0) < args.setup_retry_limit:
+                    setup_retries[batch_size] = setup_retries.get(batch_size, 0) + 1
+                    print(
+                        f"{stage.name}: transient setup failure at per-GPU batch_size={batch_size}; "
+                        f"retry {setup_retries[batch_size]}/{args.setup_retry_limit}",
+                        flush=True,
+                    )
+                    time.sleep(max(0.0, args.restart_sleep_seconds))
+                    tried.discard(batch_size)
+                    continue
                 raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
             high = batch_size - 1
             print(f"{stage.name}: probe OOM at per-GPU batch_size={batch_size}; next search range [{low}, {high}]", flush=True)
@@ -435,6 +494,7 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
 def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: int, batch_size: int) -> None:
     current = batch_size
     oom_retries = 0
+    setup_retries = 0
     launcher_log = stage.output_dir / "launcher_stage.log"
     while current >= args.min_batch_size:
         if _stage_is_complete(stage):
@@ -463,6 +523,15 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
             )
             current = next_batch
             oom_retries += 1
+            time.sleep(max(0.0, args.restart_sleep_seconds))
+            continue
+        if _looks_like_transient_setup(tail) and setup_retries < args.setup_retry_limit:
+            setup_retries += 1
+            print(
+                f"{stage.name}: transient setup failure, relaunching same batch_size={current}; "
+                f"retry {setup_retries}/{args.setup_retry_limit}",
+                flush=True,
+            )
             time.sleep(max(0.0, args.restart_sleep_seconds))
             continue
         raise RuntimeError(
@@ -497,6 +566,29 @@ def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, out
     return command
 
 
+def _configure_training_env(env: dict, args: argparse.Namespace) -> dict:
+    tuned = dict(env)
+    tuned.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    tuned.setdefault("NCCL_P2P_DISABLE", "0")
+    tuned.setdefault("NCCL_SHM_DISABLE", "0")
+    tuned.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    tuned.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    tuned.setdefault("TORCH_SHOW_CPP_STACKTRACES", "0")
+    if args.nccl_socket_ifname:
+        tuned["NCCL_SOCKET_IFNAME"] = args.nccl_socket_ifname
+    if args.cuda_alloc_conf is not None:
+        alloc_conf = str(args.cuda_alloc_conf).strip()
+        if alloc_conf:
+            tuned["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
+        else:
+            tuned.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    if args.torch_hub_dir:
+        hub = Path(args.torch_hub_dir)
+        tuned["TORCH_HUB_DIR"] = str(hub)
+        tuned.setdefault("TORCH_HOME", str(hub.parent if hub.name == "hub" else hub))
+    return tuned
+
+
 def _visible_gpu_count(env: dict) -> int:
     visible = env.get("CUDA_VISIBLE_DEVICES")
     if visible:
@@ -519,6 +611,11 @@ def _sanitize_torchrun_parent_env(env: dict) -> dict:
 def _looks_like_oom(text: str) -> bool:
     lower = text.lower()
     return any(pattern in lower for pattern in OOM_PATTERNS)
+
+
+def _looks_like_transient_setup(text: str) -> bool:
+    lower = text.lower()
+    return any(pattern in lower for pattern in TRANSIENT_SETUP_PATTERNS)
 
 
 def _probe_too_hot(text: str, args: argparse.Namespace) -> bool:

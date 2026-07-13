@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
-from geoss.integration.trellis_ss_hook import GeoSSTrellisSSWrapper
+from geoss.integration.trellis_ss_hook import GeoSSTrellisSSWrapper, ss_grid_to_tokens, tokens_to_ss_grid
 from geoss.losses.prior_preservation_loss import prior_preservation_loss
 from geoss.losses.velocity_loss import velocity_regularization_loss
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
@@ -94,15 +94,17 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     geo_dim = cfg.get("geo_dim", 256)
     num_anchors = cfg.get("num_anchors", 4096)
     adapter = SSVelocityAdapter(latent_dim=latent_dim, geo_dim=geo_dim).to(device)
-    wrapper = GeoSSTrellisSSWrapper(base, adapter, use_geoss_adapter=True).to(device)
+    _repair_zero_terminal_delta_head(adapter)
     start_step = 0
     resume_state = None
     if args.resume and Path(args.resume).exists():
         resume_state = torch.load(args.resume, map_location="cpu")
         adapter.load_state_dict(resume_state.get("velocity_adapter", resume_state), strict=False)
+        _repair_zero_terminal_delta_head(adapter)
         start_step = int(resume_state.get("step", 0))
-    wrapper = maybe_wrap_ddp(wrapper, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
-    opt = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    _assert_terminal_delta_head_is_trainable(adapter)
+    adapter_model = maybe_wrap_ddp(adapter, ctx, find_unused_parameters=False)
+    opt = torch.optim.AdamW(adapter_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
     loader, sampler = _build_meshfleet_loader(args, ctx)
@@ -185,29 +187,55 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 geoss_context = _compute_geoss_context(data_batch, geoss_model, vggt)
             else:
                 raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
+            _assert_stage2_batch_contract(data_batch, x0, device)
             t_model = t * 1000.0
             with torch.no_grad():
                 v_base = base(x_t, t_model, cond)
                 direct_base = v_base
                 identity_error = (v_base - direct_base).abs().max()
-            v_geo = wrapper(x_t, t_model, cond, geoss_context=geoss_context, use_geoss_adapter=True)
-            debug = unwrap_model(wrapper).last_debug
-            target_residual = (target_v - v_base).detach()
-            mse = F.mse_loss(debug["delta_v_geo"], target_residual)
-            delta_tokens = debug["delta_v_geo"].flatten(2).transpose(1, 2)
-            v_geo_tokens = v_geo.flatten(2).transpose(1, 2)
-            v_base_tokens = v_base.flatten(2).transpose(1, 2)
+            ss_tokens = ss_grid_to_tokens(x_t)
+            v_base_tokens = ss_grid_to_tokens(v_base).detach()
+            target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()
+            _assert_stage2_geoss_context(geoss_context, ss_tokens)
+            vel = adapter_model(
+                ss_latent_tokens=ss_tokens,
+                geo_tokens=geoss_context["geo_tokens"],
+                geo_confidence=geoss_context["geo_confidence"],
+                timestep=t_model,
+                v_base=v_base_tokens,
+                voxel_xyz=geoss_context.get("ss_voxel_xyz", _ss_grid_xyz(x_t, ss_tokens.dtype)),
+                anchor_xyz=geoss_context["anchor_xyz"],
+                anchor_metadata=geoss_context.get("anchor_metadata"),
+            )
+            _assert_velocity_adapter_output(vel, ss_tokens, v_base_tokens)
+            v_geo_tokens = vel["v_geo"]
+            effective_delta_tokens = v_geo_tokens - v_base_tokens
+            if not effective_delta_tokens.requires_grad:
+                raise RuntimeError(
+                    "Stage 2 graph invariant failed: effective residual is detached. "
+                    "The loss must consume SSVelocityAdapter's DDP forward output."
+                )
+            delta_tokens = vel["delta_v_geo"]
+            raw_delta_tokens = vel["debug"]["delta_raw"]
+            _assert_residual_training_contract(raw_delta_tokens, effective_delta_tokens, target_residual_tokens)
+            effective_mse = F.mse_loss(effective_delta_tokens, target_residual_tokens)
+            raw_mse = F.mse_loss(raw_delta_tokens, target_residual_tokens)
+            mse = effective_mse + args.raw_residual_weight * raw_mse
             vel_reg = velocity_regularization_loss(delta_tokens, t)
-            prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, debug["token_confidence"])
+            prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, vel["token_confidence"].detach())
             loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            grad_norms = _assert_adapter_gradients(unwrap_model(adapter_model), step)
             opt.step()
-            return loss, mse, target_residual, debug, vel_reg, prior, identity_error
+            debug = vel["debug"]
+            effective_delta_grid = tokens_to_ss_grid(effective_delta_tokens, tuple(x_t.shape[-3:]))
+            target_residual_grid = tokens_to_ss_grid(target_residual_tokens, tuple(x_t.shape[-3:]))
+            return loss, mse, effective_mse, raw_mse, target_residual_grid, debug, effective_delta_grid, vel_reg, prior, identity_error, grad_norms
 
         retry = train_step_with_oom_retry(
             step_fn,
-            model=adapter,
+            model=adapter_model,
             optimizer=opt,
             sampler=sampler,
             device=device,
@@ -217,7 +245,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             log_oom=log_oom,
         )
         batch_adjustment = retry.adjustment
-        loss, mse, target_residual, debug, vel_reg, prior, identity_error = retry.value
+        loss, mse, effective_mse, raw_mse, target_residual, debug, effective_delta, vel_reg, prior, identity_error, grad_norms = retry.value
         if batch_adjustment.changed:
             args.batch_size = batch_adjustment.new_batch_size
             loader, sampler = _build_meshfleet_loader(args, ctx)
@@ -226,13 +254,15 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "step": step,
             "loss": float(loss.detach().cpu()),
             "cfm_mse": float(mse.detach().cpu()),
+            "loss_effective_residual": float(effective_mse.detach().cpu()),
+            "loss_raw_residual": float(raw_mse.detach().cpu()),
             "residual_target_norm": float(target_residual.norm(dim=1).mean().detach().cpu()),
-            "residual_base_ratio": float((debug["velocity_delta_norm"] / debug["velocity_base_norm"].clamp_min(1e-6)).detach().cpu()),
+            "residual_base_ratio": float((effective_delta.norm(dim=1).mean() / debug["velocity_base_norm"].clamp_min(1e-6)).detach().cpu()),
             "velocity_regularization": float(vel_reg.detach().cpu()),
             "prior_preservation": float(prior.detach().cpu()),
             "identity_error": float(identity_error.detach().cpu()),
             "velocity_norm": float(debug["velocity_norm"].detach().cpu()),
-            "delta_norm": float(debug["velocity_delta_norm"].detach().cpu()),
+            "delta_norm": float(effective_delta.norm(dim=1).mean().detach().cpu()),
             "clipping_ratio": float(debug["clipping_ratio"].detach().cpu()),
             "mode": _training_mode(args, data_batch is not None),
             **run_modes,
@@ -240,6 +270,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "world_size": ctx.world_size,
             "per_gpu_batch_size": args.batch_size,
             "global_batch_size": args.batch_size * ctx.world_size,
+            "adapter_grad_norms": grad_norms,
             "adaptive_batch": {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()},
         }
         early_status = early_stopper.update(last)
@@ -248,13 +279,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last) + "\n")
         if ctx.is_main and args.save_best and early_status.is_best:
-            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_best.pt", adapter, opt, step, cfg, early_stopper, early_status)
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_best.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
         if ctx.is_main and (should_fault_save or step % args.save_every == 0 or step == end_step):
-            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", adapter, opt, step, cfg, early_stopper, early_status)
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
         if sync_should_stop(early_status.should_stop, device):
             if ctx.is_main:
-                _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", adapter, opt, step, cfg, early_stopper, early_status)
+                _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
             break
     return last
 
@@ -268,6 +299,7 @@ def main() -> None:
     parser.add_argument("--sigma_min", type=float, default=1e-5)
     parser.add_argument("--velocity_reg_weight", type=float, default=1e-3)
     parser.add_argument("--prior_weight", type=float, default=1e-2)
+    parser.add_argument("--raw_residual_weight", type=float, default=1.0)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
@@ -369,6 +401,152 @@ def _move_batch(batch, device):
     return out
 
 
+def _assert_stage2_batch_contract(batch: dict, x0: torch.Tensor, device: torch.device) -> None:
+    assert isinstance(batch, dict), "Stage 2 batch must be a dict."
+    assert x0.ndim == 5, f"ss_latent_grid must be [B,C,D,H,W], got {tuple(x0.shape)}"
+    assert x0.device == device, f"ss_latent_grid is on {x0.device}, expected {device}"
+    assert x0.dtype == torch.float32, f"ss_latent_grid must be float32 after load, got {x0.dtype}"
+    assert x0.shape[0] > 0 and x0.shape[1] > 0, f"invalid ss_latent_grid shape {tuple(x0.shape)}"
+    assert torch.isfinite(x0).all().item(), "ss_latent_grid contains NaN or Inf."
+    for key in ("images", "K", "c2w", "w2c", "masks"):
+        assert key in batch, f"Stage 2 requires batch['{key}'] for GeoSS context construction."
+        value = batch[key]
+        assert isinstance(value, torch.Tensor), f"batch['{key}'] must be a tensor."
+        assert value.shape[0] == x0.shape[0], f"batch['{key}'] batch size {value.shape[0]} != ss_latent_grid batch size {x0.shape[0]}"
+
+
+def _assert_stage2_geoss_context(context: dict, ss_tokens: torch.Tensor) -> None:
+    assert isinstance(context, dict), "GeoSS context must be a dict."
+    for key in ("geo_tokens", "geo_confidence", "anchor_xyz"):
+        assert key in context, f"GeoSS context missing '{key}'."
+        assert isinstance(context[key], torch.Tensor), f"GeoSS context '{key}' must be a tensor."
+    geo_tokens = context["geo_tokens"]
+    geo_confidence = context["geo_confidence"]
+    anchor_xyz = context["anchor_xyz"]
+    B = ss_tokens.shape[0]
+    assert ss_tokens.ndim == 3, f"ss_tokens must be [B,L,C], got {tuple(ss_tokens.shape)}"
+    assert geo_tokens.ndim == 3, f"geo_tokens must be [B,M,G], got {tuple(geo_tokens.shape)}"
+    assert geo_tokens.shape[0] == B, f"geo_tokens batch {geo_tokens.shape[0]} != ss_tokens batch {B}"
+    assert geo_tokens.device == ss_tokens.device, f"geo_tokens is on {geo_tokens.device}, expected {ss_tokens.device}"
+    assert geo_tokens.dtype == torch.float32, f"geo_tokens must be float32, got {geo_tokens.dtype}"
+    assert torch.isfinite(geo_tokens).all().item(), "geo_tokens contains NaN or Inf."
+    assert geo_confidence.shape == (*geo_tokens.shape[:2], 1), (
+        f"geo_confidence must be [B,M,1], got {tuple(geo_confidence.shape)} for geo_tokens {tuple(geo_tokens.shape)}"
+    )
+    assert geo_confidence.device == ss_tokens.device, f"geo_confidence is on {geo_confidence.device}, expected {ss_tokens.device}"
+    assert geo_confidence.dtype == torch.float32, f"geo_confidence must be float32, got {geo_confidence.dtype}"
+    assert torch.isfinite(geo_confidence).all().item(), "geo_confidence contains NaN or Inf."
+    assert geo_confidence.min().item() >= 0.0 and geo_confidence.max().item() <= 1.0, "geo_confidence must be in [0, 1]."
+    assert anchor_xyz.shape == (*geo_tokens.shape[:2], 3), (
+        f"anchor_xyz must be [B,M,3], got {tuple(anchor_xyz.shape)} for geo_tokens {tuple(geo_tokens.shape)}"
+    )
+    assert anchor_xyz.device == ss_tokens.device, f"anchor_xyz is on {anchor_xyz.device}, expected {ss_tokens.device}"
+    assert anchor_xyz.dtype == torch.float32, f"anchor_xyz must be float32, got {anchor_xyz.dtype}"
+    assert torch.isfinite(anchor_xyz).all().item(), "anchor_xyz contains NaN or Inf."
+    anchor_metadata = context.get("anchor_metadata")
+    if isinstance(anchor_metadata, torch.Tensor):
+        assert anchor_metadata.shape[:2] == geo_tokens.shape[:2], (
+            f"anchor_metadata must align with anchors, got {tuple(anchor_metadata.shape)} vs {tuple(geo_tokens.shape[:2])}"
+        )
+        assert anchor_metadata.device == ss_tokens.device, f"anchor_metadata is on {anchor_metadata.device}, expected {ss_tokens.device}"
+
+
+def _assert_velocity_adapter_output(output: dict, ss_tokens: torch.Tensor, v_base_tokens: torch.Tensor) -> None:
+    assert isinstance(output, dict), "SSVelocityAdapter must return a dict."
+    required = ("v_geo", "delta_v_geo", "token_confidence", "debug")
+    for key in required:
+        assert key in output, f"SSVelocityAdapter output missing '{key}'."
+    assert output["v_geo"].shape == v_base_tokens.shape, f"v_geo shape {tuple(output['v_geo'].shape)} != {tuple(v_base_tokens.shape)}"
+    assert output["delta_v_geo"].shape == ss_tokens.shape, f"delta_v_geo shape {tuple(output['delta_v_geo'].shape)} != {tuple(ss_tokens.shape)}"
+    expected_conf = (*ss_tokens.shape[:2], 1)
+    assert output["token_confidence"].shape == expected_conf, f"token_confidence shape {tuple(output['token_confidence'].shape)} != {expected_conf}"
+    assert output["v_geo"].dtype == torch.float32, f"v_geo must be float32, got {output['v_geo'].dtype}"
+    assert output["delta_v_geo"].dtype == torch.float32, f"delta_v_geo must be float32, got {output['delta_v_geo'].dtype}"
+    assert output["token_confidence"].dtype == torch.float32, f"token_confidence must be float32, got {output['token_confidence'].dtype}"
+    assert torch.isfinite(output["v_geo"]).all().item(), "v_geo contains NaN or Inf."
+    assert torch.isfinite(output["delta_v_geo"]).all().item(), "delta_v_geo contains NaN or Inf."
+    assert torch.isfinite(output["token_confidence"]).all().item(), "token_confidence contains NaN or Inf."
+    assert output["token_confidence"].min().item() >= 0.0 and output["token_confidence"].max().item() <= 1.0, (
+        "token_confidence must be in [0, 1]."
+    )
+    assert output["delta_v_geo"].requires_grad, "delta_v_geo must carry gradients from SSVelocityAdapter parameters."
+    assert output["v_geo"].requires_grad, "v_geo must carry gradients from SSVelocityAdapter parameters."
+    debug = output["debug"]
+    assert isinstance(debug, dict), "SSVelocityAdapter debug output must be a dict."
+    assert "delta_raw" in debug, "SSVelocityAdapter debug output missing pre-clipped 'delta_raw'."
+    assert debug["delta_raw"].shape == ss_tokens.shape, f"delta_raw shape {tuple(debug['delta_raw'].shape)} != {tuple(ss_tokens.shape)}"
+    assert debug["delta_raw"].dtype == torch.float32, f"delta_raw must be float32, got {debug['delta_raw'].dtype}"
+    assert torch.isfinite(debug["delta_raw"]).all().item(), "delta_raw contains NaN or Inf."
+    assert debug["delta_raw"].requires_grad, "delta_raw must carry gradients from SSVelocityAdapter parameters."
+
+
+def _assert_residual_training_contract(
+    delta_tokens: torch.Tensor,
+    effective_delta_tokens: torch.Tensor,
+    target_residual_tokens: torch.Tensor,
+) -> None:
+    assert delta_tokens.shape == target_residual_tokens.shape, (
+        f"raw residual shape {tuple(delta_tokens.shape)} != target residual {tuple(target_residual_tokens.shape)}"
+    )
+    assert effective_delta_tokens.shape == target_residual_tokens.shape, (
+        f"effective residual shape {tuple(effective_delta_tokens.shape)} != target residual {tuple(target_residual_tokens.shape)}"
+    )
+    assert delta_tokens.dtype == torch.float32, f"raw residual must be float32, got {delta_tokens.dtype}"
+    assert effective_delta_tokens.dtype == torch.float32, f"effective residual must be float32, got {effective_delta_tokens.dtype}"
+    assert target_residual_tokens.dtype == torch.float32, f"target residual must be float32, got {target_residual_tokens.dtype}"
+    assert torch.isfinite(delta_tokens).all().item(), "raw residual contains NaN or Inf."
+    assert torch.isfinite(effective_delta_tokens).all().item(), "effective residual contains NaN or Inf."
+    assert torch.isfinite(target_residual_tokens).all().item(), "target residual contains NaN or Inf."
+    assert delta_tokens.requires_grad, "raw residual must depend on SSVelocityAdapter parameters."
+    assert effective_delta_tokens.requires_grad, "effective residual must depend on SSVelocityAdapter parameters."
+    assert not target_residual_tokens.requires_grad, "target residual must be a frozen flow-matching target."
+
+
+def _assert_adapter_gradients(adapter: SSVelocityAdapter, step: int) -> dict[str, float]:
+    critical = {
+        "latent_proj.weight": adapter.latent_proj.weight,
+        "latent_proj.bias": adapter.latent_proj.bias,
+        "geo_proj.weight": adapter.geo_proj.weight,
+        "geo_proj.bias": adapter.geo_proj.bias,
+        "delta_head.2.weight": adapter.delta_head[-1].weight,
+        "delta_head.2.bias": adapter.delta_head[-1].bias,
+    }
+    missing = [name for name, param in critical.items() if param.grad is None]
+    assert not missing, f"Stage 2 DDP graph break at step={step}; missing gradients for {missing}"
+    nonfinite = [name for name, param in critical.items() if param.grad is not None and not torch.isfinite(param.grad).all().item()]
+    assert not nonfinite, f"Stage 2 non-finite gradients at step={step}: {nonfinite}"
+    grad_norms = {name: float(param.grad.detach().norm().cpu()) for name, param in critical.items()}
+    zero_weights = [name for name in ("latent_proj.weight", "geo_proj.weight", "delta_head.2.weight") if grad_norms[name] == 0.0]
+    assert not zero_weights, (
+        f"Stage 2 degenerate residual graph at step={step}; zero gradient norms for {zero_weights}. "
+        "The raw residual estimator must receive supervised gradients independent of the confidence gate."
+    )
+    return grad_norms
+
+
+def _assert_terminal_delta_head_is_trainable(adapter: SSVelocityAdapter) -> None:
+    final = adapter.delta_head[-1]
+    assert isinstance(final, nn.Linear), "SSVelocityAdapter.delta_head terminal layer must be nn.Linear."
+    assert final.weight.requires_grad, "terminal delta head weight must be trainable."
+    assert final.weight.abs().max().item() > 0.0, (
+        "terminal delta head was initialized to exact zero. "
+        "That blocks first-step gradients into latent_proj/geo_proj under the raw residual objective."
+    )
+
+
+def _ss_grid_xyz(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    assert x.ndim == 5, f"SS grid must be [B,C,D,H,W], got {tuple(x.shape)}"
+    B, _, D, H, W = x.shape
+    zz, yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, D, device=x.device, dtype=dtype),
+        torch.linspace(-1, 1, H, device=x.device, dtype=dtype),
+        torch.linspace(-1, 1, W, device=x.device, dtype=dtype),
+        indexing="ij",
+    )
+    xyz = torch.stack([xx, yy, zz], dim=-1).reshape(1, D * H * W, 3)
+    return xyz.expand(B, -1, -1).contiguous()
+
+
 @torch.no_grad()
 def _compute_geoss_context(batch: dict, geoss_model: SparseRayGeoSSAdapter, vggt: VGGTGeometryWrapper) -> dict:
     batch = dict(batch)
@@ -467,6 +645,15 @@ def _save_velocity_checkpoint(path: Path, adapter: SSVelocityAdapter, optimizer,
     )
 
 
+def _repair_zero_terminal_delta_head(adapter: SSVelocityAdapter) -> None:
+    final = adapter.delta_head[-1]
+    if not isinstance(final, nn.Linear):
+        return
+    with torch.no_grad():
+        if final.weight.abs().max().item() == 0.0:
+            nn.init.normal_(final.weight, mean=0.0, std=1e-5)
+
+
 def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse.ArgumentParser) -> None:
     if not cfg:
         return
@@ -493,6 +680,7 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "sigma_min": cfg.get("sigma_min"),
         "velocity_reg_weight": cfg.get("velocity_reg_weight"),
         "prior_weight": cfg.get("prior_weight"),
+        "raw_residual_weight": cfg.get("raw_residual_weight"),
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),

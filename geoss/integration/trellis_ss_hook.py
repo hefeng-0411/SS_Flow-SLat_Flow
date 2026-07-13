@@ -75,15 +75,18 @@ class GeoSSTrellisSSWrapper(nn.Module):
         self.last_debug = {
             "enabled": True,
             "v_base": v_base.detach(),
-            "delta_v_geo": tokens_to_ss_grid(vel["delta_v_geo"], tuple(x.shape[-3:])).detach(),
-            "v_geo": v_geo.detach(),
-            "alpha_t": vel["alpha_t"].detach(),
-            "token_confidence": vel["token_confidence"].detach(),
-            "velocity_norm": vel["debug"]["velocity_norm"].detach(),
-            "velocity_base_norm": vel["debug"]["velocity_base_norm"].detach(),
-            "velocity_delta_norm": vel["debug"]["velocity_delta_norm"].detach(),
-            "clipping_ratio": vel["debug"]["clipping_ratio"].detach(),
-            "confidence_mean": vel["debug"]["confidence_mean"].detach(),
+            # Stage 2 trains from these debug tensors. Do not detach them here:
+            # detaching makes the adapter projections invisible to DDP, which
+            # leaves reducer buckets unfinished on the next iteration.
+            "delta_v_geo": tokens_to_ss_grid(vel["delta_v_geo"], tuple(x.shape[-3:])),
+            "v_geo": v_geo,
+            "alpha_t": vel["alpha_t"],
+            "token_confidence": vel["token_confidence"],
+            "velocity_norm": vel["debug"]["velocity_norm"],
+            "velocity_base_norm": vel["debug"]["velocity_base_norm"],
+            "velocity_delta_norm": vel["debug"]["velocity_delta_norm"],
+            "clipping_ratio": vel["debug"]["clipping_ratio"],
+            "confidence_mean": vel["debug"]["confidence_mean"],
         }
         self.debug_trajectory.append(
             {

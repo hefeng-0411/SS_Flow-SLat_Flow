@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 from itertools import cycle
 from pathlib import Path
 import sys
@@ -9,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
@@ -59,7 +62,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     device = ctx.device
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
-    trellis_pipeline = _load_trellis_pipeline(args, device)
+    trellis_pipeline = _load_trellis_pipeline(args, device, ctx)
     model = GeoVisSLATAdapter(**cfg.get("model", {})).to(device)
     start_step = 0
     resume_state = None
@@ -114,21 +117,48 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                     f.write(json.dumps({"step": step, **record}) + "\n")
 
         def step_fn():
-            batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
-            out = model(batch)
-            terms = compute_losses(out, batch)
-            loss = (
-                terms["slat_flow"]["loss"]
-                + 0.25 * terms["view"]["loss"]
-                + 0.25 * terms["appearance"]["loss"]
-                + 0.2 * terms["visibility_confidence"]["loss"]
-                + args.velocity_weight * terms["velocity"]["loss"]
-                + args.prior_weight * terms["prior"]["loss"]
-            )
+            nonlocal raw_batch, iterator, data_epoch
+            grad_accum_steps = max(1, int(args.grad_accum_steps))
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            last_batch = None
+            last_out = None
+            last_terms = None
+            total_loss = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                if micro_step > 0:
+                    raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
+                batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
+                out = model(batch)
+                terms = compute_losses(
+                    out,
+                    batch,
+                    raw_residual_weight=args.raw_residual_weight,
+                    effective_residual_weight=args.effective_residual_weight,
+                )
+                loss = (
+                    terms["slat_flow"]["loss"]
+                    + 0.25 * terms["view"]["loss"]
+                    + 0.25 * terms["appearance"]["loss"]
+                    + 0.2 * terms["visibility_confidence"]["loss"]
+                    + args.velocity_weight * terms["velocity"]["loss"]
+                    + args.prior_weight * terms["prior"]["loss"]
+                )
+                if not torch.isfinite(loss).all().item():
+                    raise FloatingPointError("Stage 3 loss became NaN/Inf before backward.")
+                sync_context = (
+                    model.no_sync()
+                    if ctx.distributed and hasattr(model, "no_sync") and micro_step < grad_accum_steps - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    (loss / grad_accum_steps).backward()
+                total_loss = total_loss + loss.detach()
+                last_batch, last_out, last_terms = batch, out, terms
+            grad_norms = _assert_geovis_slat_gradients(unwrap_model(model), step)
             opt.step()
-            return batch, out, terms, loss
+            assert last_batch is not None and last_out is not None and last_terms is not None
+            last_terms["grad_norms"] = grad_norms
+            return last_batch, last_out, last_terms, total_loss / grad_accum_steps
 
         retry = train_step_with_oom_retry(
             step_fn,
@@ -155,6 +185,9 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["world_size"] = ctx.world_size
         last["per_gpu_batch_size"] = args.batch_size
         last["global_batch_size"] = args.batch_size * ctx.world_size
+        last["effective_global_batch_size"] = args.batch_size * ctx.world_size * max(1, int(args.grad_accum_steps))
+        last["grad_accum_steps"] = max(1, int(args.grad_accum_steps))
+        last["adapter_grad_norms"] = terms.get("grad_norms", {})
         last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
@@ -177,10 +210,28 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     return last
 
 
-def compute_losses(out: dict, batch: dict) -> dict:
+def compute_losses(
+    out: dict,
+    batch: dict,
+    *,
+    raw_residual_weight: float = 1.0,
+    effective_residual_weight: float = 1.0,
+) -> dict:
     target_residual = batch.get("target_residual", batch["target_velocity"] - batch["v_slat_base"])
+    velocity_debug = out.get("debug", {}).get("velocity", {})
+    raw_delta = velocity_debug.get("delta_raw", out["delta_v_slat"])
+    effective_delta = out["v_slat_geo"] - batch["v_slat_base"]
+    _assert_slat_training_contract(batch, out, raw_delta, effective_delta, target_residual)
+    raw_flow = slat_flow_matching_loss(raw_delta, target_residual.detach())
+    effective_flow = slat_flow_matching_loss(effective_delta, target_residual.detach())
+    flow_loss = raw_residual_weight * raw_flow["loss"] + effective_residual_weight * effective_flow["loss"]
     return {
-        "slat_flow": slat_flow_matching_loss(out["delta_v_slat"], target_residual.detach()),
+        "slat_flow": {
+            "loss": flow_loss,
+            "slat_flow_mse": flow_loss,
+            "raw_residual_mse": raw_flow["loss"],
+            "effective_residual_mse": effective_flow["loss"],
+        },
         "view": view_consistency_loss(out["sampled_features"], out["visibility"]),
         "appearance": appearance_feature_loss(out["slat_cond_tokens"], out["sampled_features"], out["visibility"], out["view_weights"]),
         "visibility_confidence": visibility_confidence_loss(
@@ -208,9 +259,68 @@ def summarize(out: dict, terms: dict, mode: str) -> dict:
         "delta_norm": float(out["delta_v_slat"].norm(dim=-1).mean().detach().cpu()),
         "clipping_ratio": float(out["debug"]["clipping_ratio"].detach().cpu()),
         "loss_slat_flow": float(terms["slat_flow"]["loss"].detach().cpu()),
+        "loss_slat_raw_residual": float(terms["slat_flow"]["raw_residual_mse"].detach().cpu()),
+        "loss_slat_effective_residual": float(terms["slat_flow"]["effective_residual_mse"].detach().cpu()),
         "loss_prior": float(terms["prior"]["loss"].detach().cpu()),
         "loss_velocity": float(terms["velocity"]["loss"].detach().cpu()),
     }
+
+
+def _assert_slat_training_contract(
+    batch: dict,
+    out: dict,
+    raw_delta: torch.Tensor,
+    effective_delta: torch.Tensor,
+    target_residual: torch.Tensor,
+) -> None:
+    required_batch = ("slat_latent_tokens", "v_slat_base", "target_velocity", "timestep", "images", "masks", "K", "w2c")
+    for key in required_batch:
+        assert key in batch, f"Stage 3 batch missing '{key}'."
+    x_t = batch["slat_latent_tokens"]
+    v_base = batch["v_slat_base"]
+    assert x_t.ndim == 3, f"slat_latent_tokens must be [B,L,C], got {tuple(x_t.shape)}"
+    assert v_base.shape == x_t.shape, f"v_slat_base shape {tuple(v_base.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
+    assert target_residual.shape == x_t.shape, f"target_residual shape {tuple(target_residual.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
+    assert raw_delta.shape == x_t.shape, f"raw SLAT residual shape {tuple(raw_delta.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
+    assert effective_delta.shape == x_t.shape, f"effective SLAT residual shape {tuple(effective_delta.shape)} != slat_latent_tokens {tuple(x_t.shape)}"
+    for name, tensor in {
+        "slat_latent_tokens": x_t,
+        "v_slat_base": v_base,
+        "target_residual": target_residual,
+        "raw_delta": raw_delta,
+        "effective_delta": effective_delta,
+        "v_slat_geo": out["v_slat_geo"],
+        "delta_v_slat": out["delta_v_slat"],
+        "slat_cond_tokens": out["slat_cond_tokens"],
+        "slat_confidence": out["slat_confidence"],
+        "visibility": out["visibility"],
+    }.items():
+        assert tensor.dtype == torch.float32, f"{name} must be float32, got {tensor.dtype}"
+        assert torch.isfinite(tensor).all().item(), f"{name} contains NaN or Inf."
+    assert raw_delta.requires_grad, "raw SLAT residual must depend on GeoVisSLATAdapter parameters."
+    assert effective_delta.requires_grad, "effective SLAT residual must depend on GeoVisSLATAdapter parameters."
+    assert not target_residual.requires_grad, "target_residual must be a frozen flow-matching target."
+    assert out["slat_confidence"].shape == (*x_t.shape[:2], 1), f"slat_confidence must be [B,L,1], got {tuple(out['slat_confidence'].shape)}"
+    assert out["visibility"].shape[:2] == x_t.shape[:2], f"visibility must align with SLAT tokens, got {tuple(out['visibility'].shape)}"
+    assert out["slat_confidence"].min().item() >= 0.0 and out["slat_confidence"].max().item() <= 1.0, "slat_confidence must be in [0, 1]."
+    assert out["visibility"].min().item() >= 0.0 and out["visibility"].max().item() <= 1.0, "visibility must be in [0, 1]."
+
+
+def _assert_geovis_slat_gradients(model: GeoVisSLATAdapter, step: int) -> dict[str, float]:
+    critical = {
+        "evidence_sampler.token_mlp.0.weight": model.evidence_sampler.token_mlp[0].weight,
+        "aggregator.evidence_proj.weight": model.aggregator.evidence_proj.weight,
+        "aggregator.slat_proj.weight": model.aggregator.slat_proj.weight,
+        "aggregator.out.2.weight": model.aggregator.out[-1].weight,
+        "velocity_adapter.latent_proj.weight": model.velocity_adapter.latent_proj.weight,
+        "velocity_adapter.cond_proj.weight": model.velocity_adapter.cond_proj.weight,
+        "velocity_adapter.delta_head.2.weight": model.velocity_adapter.delta_head[-1].weight,
+    }
+    missing = [name for name, param in critical.items() if param.grad is None]
+    assert not missing, f"Stage 3 DDP graph break at step={step}; missing gradients for {missing}"
+    nonfinite = [name for name, param in critical.items() if param.grad is not None and not torch.isfinite(param.grad).all().item()]
+    assert not nonfinite, f"Stage 3 non-finite gradients at step={step}: {nonfinite}"
+    return {name: float(param.grad.detach().norm().cpu()) for name, param in critical.items()}
 
 
 def make_synthetic_slat_batch(cfg: dict, args: argparse.Namespace, device: torch.device) -> dict:
@@ -378,6 +488,9 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--velocity_weight", type=float, default=1e-3)
     parser.add_argument("--prior_weight", type=float, default=1e-2)
+    parser.add_argument("--raw_residual_weight", type=float, default=1.0)
+    parser.add_argument("--effective_residual_weight", type=float, default=1.0)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
@@ -389,22 +502,37 @@ def main() -> None:
     parser.add_argument("--objaverse_rendered_root", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--torch_hub_dir", type=str, default=None)
+    parser.add_argument("--dinov2_repo", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
     add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
-    summary = run_dry_run(cfg, args) if args.dry_run else run_training(cfg, args)
-    if getattr(args, "rank", 0) == 0:
-        print(json.dumps(summary, indent=2))
-    cleanup_distributed()
+    try:
+        summary = run_dry_run(cfg, args) if args.dry_run else run_training(cfg, args)
+        if getattr(args, "rank", 0) == 0:
+            print(json.dumps(summary, indent=2))
+    finally:
+        cleanup_distributed()
 
 
-def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device):
+def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device, ctx):
     if args.trellis_root:
         sys.path.insert(0, args.trellis_root)
     if not args.trellis_model_path:
         raise FileNotFoundError("real_train requires --trellis_model_path or trellis.pipeline in config.")
+    _configure_trellis_hub(args)
+
+    if ctx.distributed and not ctx.is_main:
+        dist.barrier()
+    pipeline = _load_trellis_pipeline_impl(args, device)
+    if ctx.distributed and ctx.is_main:
+        dist.barrier()
+    return pipeline
+
+
+def _load_trellis_pipeline_impl(args: argparse.Namespace, device: torch.device):
     from trellis.pipelines import TrellisImageTo3DPipeline
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained(args.trellis_model_path)
@@ -412,10 +540,90 @@ def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device):
     for name in ("slat_flow_model", "image_cond_model"):
         if name not in pipeline.models or pipeline.models[name] is None:
             raise RuntimeError(f"TRELLIS pipeline is missing {name}, required for real SLAT residual training.")
-    pipeline.models["slat_flow_model"].eval()
-    for p in pipeline.models["slat_flow_model"].parameters():
-        p.requires_grad_(False)
+    for model in pipeline.models.values():
+        if model is None:
+            continue
+        if hasattr(model, "eval"):
+            model.eval()
+        if hasattr(model, "parameters"):
+            for p in model.parameters():
+                p.requires_grad_(False)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return pipeline
+
+
+def _configure_trellis_hub(args: argparse.Namespace) -> None:
+    hub_dir = _resolve_torch_hub_dir(args)
+    if hub_dir is not None:
+        torch.hub.set_dir(str(hub_dir))
+        os.environ["TORCH_HUB_DIR"] = str(hub_dir)
+        os.environ.setdefault("TORCH_HOME", str(hub_dir.parent if hub_dir.name == "hub" else hub_dir))
+    dinov2_repo = _resolve_dinov2_repo(args, hub_dir)
+    if dinov2_repo is not None:
+        _patch_torch_hub_for_local_dinov2(dinov2_repo)
+
+
+def _resolve_torch_hub_dir(args: argparse.Namespace) -> Path | None:
+    candidates: list[Path] = []
+    for value in (args.torch_hub_dir, os.environ.get("TORCH_HUB_DIR")):
+        if value:
+            candidates.append(Path(value).expanduser())
+    torch_home = os.environ.get("TORCH_HOME")
+    if torch_home:
+        home = Path(torch_home).expanduser()
+        candidates.extend([home / "hub", home])
+    candidates.extend(
+        [
+            Path.home() / ".cache" / "torch" / "hub",
+            Path("/mnt/sda3/yu/checkpoints/hub/hub"),
+            Path("/mnt/sda3/yu/checkpoints/hub"),
+        ]
+    )
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "facebookresearch_dinov2_main" / "hubconf.py").exists():
+            return candidate
+        nested = candidate / "hub"
+        if (nested / "facebookresearch_dinov2_main" / "hubconf.py").exists():
+            return nested
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _resolve_dinov2_repo(args: argparse.Namespace, hub_dir: Path | None) -> Path | None:
+    candidates: list[Path] = []
+    if args.dinov2_repo:
+        candidates.append(Path(args.dinov2_repo).expanduser())
+    if hub_dir is not None:
+        candidates.append(hub_dir / "facebookresearch_dinov2_main")
+        candidates.extend(sorted(hub_dir.glob("facebookresearch_dinov2*")))
+    for candidate in candidates:
+        if (candidate / "hubconf.py").exists():
+            return candidate
+    return None
+
+
+def _patch_torch_hub_for_local_dinov2(local_repo: Path) -> None:
+    if getattr(torch.hub, "_geoss_local_dinov2_patch", False):
+        return
+    original_load = torch.hub.load
+
+    def load(repo_or_dir, model, *args, **kwargs):
+        if str(repo_or_dir).rstrip("/") == "facebookresearch/dinov2":
+            local_kwargs = dict(kwargs)
+            local_kwargs.pop("trust_repo", None)
+            local_kwargs.pop("force_reload", None)
+            return original_load(str(local_repo), model, *args, source="local", **local_kwargs)
+        return original_load(repo_or_dir, model, *args, **kwargs)
+
+    torch.hub.load = load
+    torch.hub._geoss_local_dinov2_patch = True
 
 
 @torch.no_grad()
@@ -470,9 +678,14 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "weight_decay": cfg.get("weight_decay"),
         "velocity_weight": cfg.get("velocity_weight"),
         "prior_weight": cfg.get("prior_weight"),
+        "raw_residual_weight": cfg.get("raw_residual_weight"),
+        "effective_residual_weight": cfg.get("effective_residual_weight"),
+        "grad_accum_steps": cfg.get("grad_accum_steps"),
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),
+        "torch_hub_dir": cfg.get("torch_hub_dir") or trellis.get("torch_hub_dir"),
+        "dinov2_repo": cfg.get("dinov2_repo") or trellis.get("dinov2_repo"),
         **adaptive_config_defaults(cfg),
     }
     for name, value in mappings.items():

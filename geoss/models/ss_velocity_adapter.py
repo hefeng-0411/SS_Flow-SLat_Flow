@@ -42,7 +42,12 @@ class SSVelocityAdapter(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, latent_dim),
         )
-        nn.init.zeros_(self.delta_head[-1].weight)
+        # Do not initialize the terminal projection exactly to zero. With DDP,
+        # an exactly-zero final layer blocks first-step gradients into
+        # latent_proj/geo_proj, so their reducer buckets are never marked ready.
+        # This tiny init preserves a near-zero residual while keeping the full
+        # adapter graph active from step 1.
+        nn.init.normal_(self.delta_head[-1].weight, mean=0.0, std=1e-5)
         nn.init.zeros_(self.delta_head[-1].bias)
         self.gate = GuidanceGate(mode=alpha_mode, strength=alpha_strength)
 
@@ -89,6 +94,12 @@ class SSVelocityAdapter(nn.Module):
             local_debug = {"local_attention": torch.tensor(False, device=v_base.device)}
         h = self.norm(q + attn_out)
         delta_raw = self.delta_head(h)
+        # Backward-compatibility for old checkpoints whose final delta head was
+        # saved as exact zeros: keep a zero-valued autograd edge from delta_raw
+        # to h so DDP marks upstream projection parameters as used even before
+        # the terminal head has learned nonzero weights.
+        graph_anchor = h.sum(dim=-1, keepdim=True).expand_as(delta_raw) * 0.0
+        delta_raw = delta_raw + graph_anchor
 
         t_norm = normalize_timestep(timestep, B).to(v_base.device)
         tau = self.trust_region * (0.25 + 0.75 * t_norm).view(B, 1, 1)
