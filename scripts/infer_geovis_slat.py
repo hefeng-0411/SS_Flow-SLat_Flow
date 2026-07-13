@@ -39,14 +39,27 @@ def main() -> None:
     parser.add_argument("--meshfleet_slat_latent_model", type=str, default="dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16")
     parser.add_argument("--geovis_context", type=str, default=None)
     parser.add_argument("--geoss_context", type=str, default=None)
+    parser.add_argument("--trellis_latents", type=str, default=None, help="Stage-2 trellis_latents.pt; preserves its sparse structure for SLAT.")
     parser.add_argument("--decode", type=str2bool, default=True)
+    parser.add_argument("--render_eval", type=str2bool, default=True)
     parser.add_argument("--save_context", type=str2bool, default=True)
     parser.add_argument("--real_infer", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config)
     device = torch.device(args.device)
-    model = GeoVisSLATAdapter(**cfg.get("model", {})).to(device).eval()
+    stage2_latents, stage2_status = _load_stage2_latents(args.trellis_latents, device)
+    model_cfg = dict(cfg.get("model", {}))
+    if stage2_latents is not None:
+        actual_dim = int(stage2_latents["slat"].shape[-1])
+        configured_dim = int(model_cfg.get("slat_dim", actual_dim))
+        if configured_dim != actual_dim:
+            _write_blocked_metrics(args.output_dir, f"SLAT channel mismatch: checkpoint/config expects {configured_dim}, Stage 2 emitted {actual_dim}.", stage2_status)
+            return
+    model = GeoVisSLATAdapter(**model_cfg).to(device).eval()
     if args.slat_adapter_checkpoint:
+        if not Path(args.slat_adapter_checkpoint).is_file():
+            _write_blocked_metrics(args.output_dir, f"SLAT adapter checkpoint not found: {args.slat_adapter_checkpoint}", stage2_status)
+            return
         state = torch.load(args.slat_adapter_checkpoint, map_location="cpu")
         model.load_state_dict(state.get("model", state), strict=False)
 
@@ -84,13 +97,22 @@ def main() -> None:
             images = _images_from_batch_or_path(batch, args)
             pipe.install_slat_adapter(model.velocity_adapter)
             geoss_context = _load_context(args.geoss_context, device) if args.geoss_context and Path(args.geoss_context).exists() else None
-            decoded = pipe.run(images, geoss_context=geoss_context, geovis_slat_context={k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in context.items()}, formats=("gaussian", "mesh"))
+            decoded = pipe.run(
+                images,
+                geoss_context=geoss_context,
+                geovis_slat_context={k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in context.items()},
+                # Reuse Stage 2 coordinates so the adapter sees the exact sparse
+                # structure that produced trellis_latents.pt instead of resampling it.
+                coords_override=stage2_latents["coords"] if stage2_latents is not None else None,
+                formats=("gaussian", "mesh"),
+            )
             saved_assets = pipe.save_outputs(decoded, out_dir)
         metrics = {
             **run_modes,
             "mode": "real_infer",
             "saved_assets": saved_assets,
             "continue_to_decoder": bool(args.decode),
+            "stage2_latents": stage2_status,
             "geovis_context": str(out_dir / "geovis_slat_context.pt") if args.save_context or batch is not None else args.geovis_context,
         }
         if batch is not None:
@@ -190,6 +212,38 @@ def _load_context(path: str, device: torch.device) -> dict:
     if missing:
         raise KeyError(f"geovis_context is missing required arrays: {sorted(missing)}")
     return {k: torch.tensor(data[k], device=device).float() for k in required}
+
+
+def _load_stage2_latents(path: str | None, device: torch.device) -> tuple[dict | None, dict]:
+    """Validate the explicit Stage-2→3 contract before TRELLIS allocation."""
+    if not path:
+        return None, {"used": False, "reason": "not_requested"}
+    source = Path(path)
+    if not source.is_file():
+        return None, {"used": False, "reason": "missing", "path": str(source)}
+    payload = torch.load(source, map_location="cpu")
+    if not isinstance(payload, dict) or not isinstance(payload.get("coords"), torch.Tensor):
+        return None, {"used": False, "reason": "invalid_payload", "path": str(source)}
+    coords = payload["coords"]
+    slat = payload.get("slat")
+    feats = slat.feats if hasattr(slat, "feats") else slat
+    if coords.ndim != 2 or coords.shape[1] != 4 or coords.numel() == 0:
+        return None, {"used": False, "reason": "invalid_coords", "shape": list(coords.shape), "path": str(source)}
+    if not isinstance(feats, torch.Tensor) or feats.ndim != 2 or feats.shape[0] != coords.shape[0] or not torch.isfinite(feats).all():
+        return None, {"used": False, "reason": "invalid_slat", "path": str(source)}
+    return {
+        "coords": coords.to(device=device, dtype=torch.int32).contiguous(),
+        "slat": feats.to(device=device, dtype=torch.float32).contiguous(),
+    }, {"used": True, "path": str(source), "coords_shape": list(coords.shape), "slat_shape": list(feats.shape)}
+
+
+def _write_blocked_metrics(output_dir: str, error: str, stage2_status: dict) -> None:
+    """Publish actionable diagnostics instead of failing a worker with an opaque returncode=1."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    metrics = {"status": "blocked", "mode": "real_infer", "error": error, "stage2_latents": stage2_status}
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    print(json.dumps(metrics, indent=2), file=sys.stderr)
 
 
 if __name__ == "__main__":

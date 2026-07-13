@@ -48,4 +48,16 @@ def read_gaussian_ply(path: str | Path, *, real_mode: bool = False) -> Dict[str,
     scale_names = ["scale_0", "scale_1", "scale_2"]
     if all(name in names for name in scale_names):
         out["scaling"] = torch.tensor([[row[name] for name in scale_names] for row in vertex], dtype=torch.float32)
+    rotation_names = [f"rot_{i}" for i in range(4)]
+    if all(name in names for name in rotation_names):
+        out["rotation"] = torch.tensor([[row[name] for name in rotation_names] for row in vertex], dtype=torch.float32)
+    dc_names = [f"f_dc_{i}" for i in range(3)]
+    if all(name in names for name in dc_names):
+        # TRELLIS exports spherical-harmonic DC coefficients; convert them to
+        # RGB before gsplat rasterization instead of treating them as colors.
+        dc = torch.tensor([[row[name] for name in dc_names] for row in vertex], dtype=torch.float32)
+        out["colors"] = (0.5 + 0.28209479177387814 * dc).clamp(0.0, 1.0)
+    elif {"red", "green", "blue"} <= names:
+        rgb = torch.tensor([[row["red"], row["green"], row["blue"]] for row in vertex], dtype=torch.float32)
+        out["colors"] = rgb / 255.0 if rgb.max() > 1.0 else rgb
     return out

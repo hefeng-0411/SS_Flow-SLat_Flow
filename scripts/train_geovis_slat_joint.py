@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from geoss.utils.config import add_common_args, load_config
+from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.distributed import cleanup_distributed
 from geoss.utils.adaptive_batch import add_adaptive_batch_args
 from scripts.train_geovis_slat import _apply_config_defaults, run_dry_run, run_training
@@ -31,6 +31,8 @@ def main() -> None:
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--joint_enabled", type=str, default="true")
+    parser.add_argument("--amp", type=str2bool, default=True)
+    parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
     parser.add_argument("--meshfleet_root", type=str, default=None)
     parser.add_argument("--meshfleet_split", type=str, default="train")
     parser.add_argument("--meshfleet_category", type=str, default=None)

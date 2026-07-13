@@ -89,6 +89,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         start_step = int(resume_state.get("step", 0))
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
+    base_lrs = [group["lr"] for group in opt.param_groups]
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
     loader, sampler = _build_real_loader(args, ctx)
@@ -187,6 +188,10 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss = retry.value
         if batch_adjustment is not None and batch_adjustment.changed:
             rebuild_after_adjustment(batch_adjustment)
+        confidence_std = float(out["geo_confidence"].std(unbiased=False).detach().cpu())
+        lr_adapted = _adapt_lr_for_confidence_collapse(
+            opt, base_lrs, confidence_std, args.confidence_std_target, args.confidence_lr_boost,
+        )
         last_summary = {
             "step": step,
             "loss": float(loss.detach().cpu()),
@@ -197,7 +202,9 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "loss_proj": float(proj_terms["loss"].detach().cpu()),
             "anchor_sparsity": float(anchor_sparsity.detach().cpu()),
             "confidence_mean": float(out["geo_confidence"].mean().detach().cpu()),
-            "confidence_std": float(out["geo_confidence"].std(unbiased=False).detach().cpu()),
+            "confidence_std": confidence_std,
+            "learning_rate": float(opt.param_groups[0]["lr"]),
+            "confidence_lr_adapted": lr_adapted,
             "occ_score_mean": float(ray["occ_score"].mean().detach().cpu()),
             "free_score_mean": float(ray["free_score"].mean().detach().cpu()),
             "ray_valid_mean": float(ray["ray_valid"].mean().detach().cpu()),
@@ -245,6 +252,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--anchor_sparsity_weight", type=float, default=1e-3)
+    parser.add_argument("--confidence_std_target", type=float, default=0.02)
+    parser.add_argument("--confidence_lr_boost", type=float, default=1.10)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--val_every", type=int, default=0)
@@ -310,6 +319,15 @@ def _move_batch(batch, device):
     for key, value in batch.items():
         out[key] = value.to(device) if isinstance(value, torch.Tensor) else value
     return out
+
+
+def _adapt_lr_for_confidence_collapse(optimizer, base_lrs: list[float], std: float, target: float, boost: float) -> bool:
+    """Temporarily raise adapter LR when confidence variance signals a dead gate."""
+    collapsed = std < target
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        current = float(group["lr"])
+        group["lr"] = min(base_lr * 4.0, current * max(boost, 1.0)) if collapsed else max(base_lr, current * 0.98)
+    return collapsed
 
 
 def _without_sparse_structure_latents(batch: dict) -> dict:

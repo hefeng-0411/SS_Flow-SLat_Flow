@@ -40,6 +40,7 @@ def main() -> None:
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--decode", type=str2bool, default=True)
+    parser.add_argument("--render_eval", type=str2bool, default=True)
     parser.add_argument("--save_context", type=str2bool, default=True)
     parser.add_argument("--disable_ss_adapter", type=str2bool, default=False)
     parser.add_argument("--real_infer", action="store_true")

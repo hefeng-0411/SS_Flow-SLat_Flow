@@ -154,6 +154,9 @@ class MeshFleetTrellisDataset(Dataset):
                 "num_views_requested": self.num_views,
                 "num_views_returned": len(chosen),
             },
+            # Keep GT availability explicit: an object such as test_000025 can
+            # still train its appearance branch without inventing geometry GT.
+            "has_gt": torch.tensor(sample.get("voxel_path") is not None, dtype=torch.float32),
         }
         cond_image = _load_condition_image(sample.get("cond_render_dir"), chosen[0][1])
         if cond_image is not None:

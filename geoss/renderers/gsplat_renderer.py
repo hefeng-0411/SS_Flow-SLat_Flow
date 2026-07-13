@@ -83,7 +83,13 @@ def _gaussian_tensors(gaussians: Any) -> tuple[torch.Tensor, torch.Tensor, torch
     if colors.ndim == 3:
         colors = colors[:, 0]
     opacities = opacities.reshape(-1)
-    return means.float(), quats.float(), scales.float(), opacities.float(), colors.float()
+    # PLY exports retain the optimizer parameterization (log-scales/logits).
+    # Decode it here so evaluation renders the same physical Gaussians as TRELLIS.
+    if scales.median() < 0:
+        scales = scales.exp()
+    if opacities.min() < 0 or opacities.max() > 1:
+        opacities = opacities.sigmoid()
+    return means.float(), quats.float(), scales.float(), opacities.float(), colors.float().clamp(0, 1)
 
 
 def _first(get, *names: str):

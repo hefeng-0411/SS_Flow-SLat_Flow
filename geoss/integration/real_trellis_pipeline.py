@@ -76,6 +76,7 @@ class RealTrellisGeoPipeline:
         *,
         geoss_context: Optional[Dict[str, torch.Tensor]] = None,
         geovis_slat_context: Optional[Dict[str, torch.Tensor]] = None,
+        coords_override: Optional[torch.Tensor] = None,
         formats: Iterable[str] = ("gaussian", "mesh"),
         seed: int = 42,
         ss_sampler_params: Optional[dict] = None,
@@ -83,12 +84,17 @@ class RealTrellisGeoPipeline:
     ) -> Dict[str, object]:
         cond = self.pipeline.get_cond(images)
         torch.manual_seed(seed)
-        coords = self.sample_sparse_structure(cond, geoss_context=geoss_context, sampler_params=ss_sampler_params or {})
+        coords = self._validate_coords(coords_override) if coords_override is not None else self.sample_sparse_structure(cond, geoss_context=geoss_context, sampler_params=ss_sampler_params or {})
         slat = self.sample_slat(cond, coords, geovis_slat_context=geovis_slat_context, sampler_params=slat_sampler_params or {})
         decoded = self.pipeline.decode_slat(slat, list(formats))
         decoded["coords"] = coords
         decoded["slat"] = slat
         return decoded
+
+    def _validate_coords(self, coords: torch.Tensor) -> torch.Tensor:
+        if coords.ndim != 2 or coords.shape[1] != 4 or coords.numel() == 0:
+            raise ValueError(f"Stage-2 sparse coordinates must be non-empty [N,4], got {tuple(coords.shape)}")
+        return coords.to(device=self.device, dtype=torch.int32).contiguous()
 
     def sample_sparse_structure(self, cond: dict, *, geoss_context: Optional[Dict[str, torch.Tensor]], sampler_params: dict) -> torch.Tensor:
         flow_model = self.pipeline.models["sparse_structure_flow_model"]

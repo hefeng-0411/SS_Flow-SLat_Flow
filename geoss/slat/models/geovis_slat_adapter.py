@@ -4,6 +4,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .active_voxel_projector import ActiveVoxelProjector
 from .geovis_slat_aggregator import GeoVisSLATAggregator
@@ -49,6 +50,11 @@ class GeoVisSLATAdapter(nn.Module):
             trust_region=trust_region,
             enabled=use_geovis_slat,
         )
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
+        """Checkpoint the attention-heavy aggregation path during joint training."""
+        self.gradient_checkpointing = bool(enabled)
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         images = batch["images"]
@@ -77,15 +83,23 @@ class GeoVisSLATAdapter(nn.Module):
             vggt_pointmap=batch.get("aligned_pointmap", batch.get("vggt_pointmap")),
             vggt_features=batch.get("vggt_features"),
         )
-        aggregated = self.aggregator(
-            evidence["view_slat_tokens"],
-            evidence["visibility"],
-            evidence["occlusion_score"],
-            evidence["depth_residual"],
-            projection["ss_confidence"],
-            appearance_conflict=evidence["appearance_conflict"],
-            ss_geo_tokens=batch.get("ss_geo_tokens"),
-            slat_latent_tokens=batch["slat_latent_tokens"],
+        def aggregate(view_tokens, visibility, occlusion, depth_residual, confidence, conflict):
+            return self.aggregator(
+                view_tokens, visibility, occlusion, depth_residual, confidence,
+                appearance_conflict=conflict,
+                ss_geo_tokens=batch.get("ss_geo_tokens"),
+                slat_latent_tokens=batch["slat_latent_tokens"],
+            )
+        # The non-reentrant implementation preserves the nested dict output and
+        # recomputes attention in backward, substantially reducing joint VRAM.
+        aggregated = checkpoint(
+            aggregate,
+            evidence["view_slat_tokens"], evidence["visibility"], evidence["occlusion_score"],
+            evidence["depth_residual"], projection["ss_confidence"], evidence["appearance_conflict"],
+            use_reentrant=False,
+        ) if self.training and self.gradient_checkpointing else aggregate(
+            evidence["view_slat_tokens"], evidence["visibility"], evidence["occlusion_score"],
+            evidence["depth_residual"], projection["ss_confidence"], evidence["appearance_conflict"],
         )
         velocity = self.velocity_adapter(
             batch["slat_latent_tokens"],

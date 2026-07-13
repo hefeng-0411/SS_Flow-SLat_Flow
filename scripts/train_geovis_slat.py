@@ -29,7 +29,7 @@ from geoss.slat.models.geovis_slat_adapter import GeoVisSLATAdapter
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
 from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
-from geoss.utils.config import add_common_args, load_config
+from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
 from geoss.utils.distributed import (
     build_dataloader,
@@ -63,7 +63,16 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
     trellis_pipeline = _load_trellis_pipeline(args, device, ctx)
-    model = GeoVisSLATAdapter(**cfg.get("model", {})).to(device)
+    model_cfg = dict(cfg.get("model", {}))
+    actual_slat_dim = int(trellis_pipeline.models["slat_flow_model"].in_channels)
+    configured_slat_dim = int(model_cfg.get("slat_dim", actual_slat_dim))
+    if configured_slat_dim != actual_slat_dim:
+        # A hardcoded eight-channel adapter silently drifts from real TRELLIS
+        # checkpoints; construct the adapter with the model's actual interface.
+        model_cfg["slat_dim"] = actual_slat_dim
+        cfg = {**cfg, "model": model_cfg}
+    model = GeoVisSLATAdapter(**model_cfg).to(device)
+    model.enable_gradient_checkpointing(args.gradient_checkpointing)
     start_step = 0
     resume_state = None
     if args.resume and Path(args.resume).exists():
@@ -72,6 +81,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         start_step = int(resume_state.get("step", 0))
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
     loader, sampler = build_real_loader(args, ctx)
@@ -128,21 +138,17 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 if micro_step > 0:
                     raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
                 batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
-                out = model(batch)
-                terms = compute_losses(
-                    out,
-                    batch,
-                    raw_residual_weight=args.raw_residual_weight,
-                    effective_residual_weight=args.effective_residual_weight,
-                )
-                loss = (
-                    terms["slat_flow"]["loss"]
-                    + 0.25 * terms["view"]["loss"]
-                    + 0.25 * terms["appearance"]["loss"]
-                    + 0.2 * terms["visibility_confidence"]["loss"]
-                    + args.velocity_weight * terms["velocity"]["loss"]
-                    + args.prior_weight * terms["prior"]["loss"]
-                )
+                with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
+                    out = model(batch)
+                    terms = compute_losses(
+                        out, batch, raw_residual_weight=args.raw_residual_weight,
+                        effective_residual_weight=args.effective_residual_weight,
+                    )
+                    loss = (
+                        terms["slat_flow"]["loss"] + 0.25 * terms["view"]["loss"]
+                        + 0.25 * terms["appearance"]["loss"] + 0.2 * terms["visibility_confidence"]["loss"]
+                        + args.velocity_weight * terms["velocity"]["loss"] + args.prior_weight * terms["prior"]["loss"]
+                    )
                 if not torch.isfinite(loss).all().item():
                     raise FloatingPointError("Stage 3 loss became NaN/Inf before backward.")
                 sync_context = (
@@ -151,11 +157,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                     else contextlib.nullcontext()
                 )
                 with sync_context:
-                    (loss / grad_accum_steps).backward()
+                    scaler.scale(loss / grad_accum_steps).backward()
                 total_loss = total_loss + loss.detach()
                 last_batch, last_out, last_terms = batch, out, terms
+            scaler.unscale_(opt)
             grad_norms = _assert_geovis_slat_gradients(unwrap_model(model), step)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             assert last_batch is not None and last_out is not None and last_terms is not None
             last_terms["grad_norms"] = grad_norms
             return last_batch, last_out, last_terms, total_loss / grad_accum_steps
@@ -222,8 +230,9 @@ def compute_losses(
     raw_delta = velocity_debug.get("delta_raw", out["delta_v_slat"])
     effective_delta = out["v_slat_geo"] - batch["v_slat_base"]
     _assert_slat_training_contract(batch, out, raw_delta, effective_delta, target_residual)
-    raw_flow = slat_flow_matching_loss(raw_delta, target_residual.detach())
-    effective_flow = slat_flow_matching_loss(effective_delta, target_residual.detach())
+    supervision_mask = batch.get("slat_supervision_mask")
+    raw_flow = slat_flow_matching_loss(raw_delta, target_residual.detach(), supervision_mask)
+    effective_flow = slat_flow_matching_loss(effective_delta, target_residual.detach(), supervision_mask)
     flow_loss = raw_residual_weight * raw_flow["loss"] + effective_residual_weight * effective_flow["loss"]
     base_valid_mask = batch.get("v_slat_base_valid_mask")
     joint_confidence = out["debug"]["joint_confidence"]
@@ -317,7 +326,7 @@ def _assert_slat_training_contract(
         "slat_confidence": out["slat_confidence"],
         "visibility": out["visibility"],
     }.items():
-        assert tensor.dtype == torch.float32, f"{name} must be float32, got {tensor.dtype}"
+        assert tensor.dtype in (torch.float16, torch.bfloat16, torch.float32), f"{name} must be a floating point training dtype, got {tensor.dtype}"
         assert torch.isfinite(tensor).all().item(), f"{name} contains NaN or Inf."
     assert raw_delta.requires_grad, "raw SLAT residual must depend on GeoVisSLATAdapter parameters."
     assert effective_delta.requires_grad, "effective SLAT residual must depend on GeoVisSLATAdapter parameters."
@@ -417,6 +426,11 @@ def prepare_batch(raw: dict, cfg: dict, args: argparse.Namespace, device: torch.
     batch["v_slat_base_valid_mask"] = base_valid_mask
     batch["v_slat_base_invalid_ratio"] = base_invalid_ratio
     batch["target_residual"] = (batch["target_velocity"] - batch["v_slat_base"]).detach()
+    has_gt = batch.get("has_gt", batch.get("gt_available", True))
+    has_gt = torch.as_tensor(has_gt, device=device, dtype=torch.float32).reshape(-1, 1, 1)
+    if has_gt.shape[0] == 1 and B > 1:
+        has_gt = has_gt.expand(B, -1, -1)
+    batch["slat_supervision_mask"] = has_gt.expand(B, x_t.shape[1], 1) * torch.isfinite(batch["target_residual"]).all(dim=-1, keepdim=True).float()
     batch["timestep"] = t
     batch["slat_target_source"] = source
     return batch
@@ -570,6 +584,8 @@ def main() -> None:
     parser.add_argument("--torch_hub_dir", type=str, default=None)
     parser.add_argument("--dinov2_repo", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
+    parser.add_argument("--amp", type=str2bool, default=True)
+    parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
     add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)

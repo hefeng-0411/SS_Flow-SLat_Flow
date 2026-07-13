@@ -40,6 +40,7 @@ class VehicleMultiViewDataset(Dataset):
             "trellis_feature_indices",
             "trellis_slat_feats",
             "trellis_slat_indices",
+            "has_gt",
         ]
         out: Dict = {}
         for key in tensor_keys:
