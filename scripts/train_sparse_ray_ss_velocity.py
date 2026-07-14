@@ -23,7 +23,7 @@ from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
 from geoss.models.ss_velocity_adapter import SSVelocityAdapter
 from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
-from geoss.utils.config import add_common_args, load_config
+from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
 from geoss.utils.distributed import (
     build_dataloader,

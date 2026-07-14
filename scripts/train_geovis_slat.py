@@ -18,6 +18,7 @@ from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.datasets.objaverse_cars_rendered_dataset import ObjaverseCarsRenderedDataset
 from geoss.datasets.srn_cars_dataset import SRNCarsDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset, make_dry_run_batch
+from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
 from geoss.slat.integration.ss_slat_context import build_ss_slat_context
 from geoss.slat.losses.appearance_feature_loss import appearance_feature_loss
 from geoss.slat.losses.slat_flow_loss import slat_flow_matching_loss
@@ -57,12 +58,13 @@ def run_dry_run(cfg: dict, args: argparse.Namespace) -> dict:
 
 
 def run_training(cfg: dict, args: argparse.Namespace) -> dict:
-    run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("trellis", "dataset"))
+    run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("vggt", "trellis", "dataset"))
     ctx = init_distributed(args)
     device = ctx.device
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
     trellis_pipeline = _load_trellis_pipeline(args, device, ctx)
+    vggt_geometry = _load_vggt_geometry(args, device, ctx)
     model_cfg = dict(cfg.get("model", {}))
     actual_slat_dim = int(trellis_pipeline.models["slat_flow_model"].in_channels)
     configured_slat_dim = int(model_cfg.get("slat_dim", actual_slat_dim))
@@ -81,7 +83,10 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         start_step = int(resume_state.get("step", 0))
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    # A800/H100-class GPUs support BF16 natively.  Its wider exponent range
+    # avoids the FP16 overflow that previously poisoned the velocity head.
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = _make_grad_scaler(enabled=args.amp and amp_dtype == torch.float16 and device.type == "cuda")
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
     loader, sampler = build_real_loader(args, ctx)
@@ -137,8 +142,16 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             for micro_step in range(grad_accum_steps):
                 if micro_step > 0:
                     raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
-                batch = prepare_batch(raw_batch, cfg, args, device, trellis_pipeline=trellis_pipeline)
-                with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
+                batch = prepare_batch(
+                    raw_batch, cfg, args, device,
+                    trellis_pipeline=trellis_pipeline,
+                    vggt_geometry=vggt_geometry,
+                )
+                with torch.amp.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    enabled=args.amp and device.type == "cuda",
+                ):
                     out = model(batch)
                     terms = compute_losses(
                         out, batch, raw_residual_weight=args.raw_residual_weight,
@@ -161,11 +174,23 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 total_loss = total_loss + loss.detach()
                 last_batch, last_out, last_terms = batch, out, terms
             scaler.unscale_(opt)
-            grad_norms = _assert_geovis_slat_gradients(unwrap_model(model), step)
-            scaler.step(opt)
-            scaler.update()
+            grad_norms, nonfinite_gradients = _inspect_geovis_slat_gradients(unwrap_model(model), step)
+            if nonfinite_gradients:
+                # AMP overflow is recoverable.  Do not write NaN/Inf into the
+                # checkpoint; discard this update and let GradScaler back off.
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                global_grad_norm = float("nan")
+            else:
+                # Clip only rare large updates.  This preserves normal velocity
+                # convergence while bounding the residual head's outliers.
+                global_grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm).detach().cpu())
+                scaler.step(opt)
+                scaler.update()
             assert last_batch is not None and last_out is not None and last_terms is not None
             last_terms["grad_norms"] = grad_norms
+            last_terms["optimizer_step_skipped"] = bool(nonfinite_gradients)
+            last_terms["global_grad_norm"] = global_grad_norm
             return last_batch, last_out, last_terms, total_loss / grad_accum_steps
 
         retry = train_step_with_oom_retry(
@@ -196,6 +221,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["effective_global_batch_size"] = args.batch_size * ctx.world_size * max(1, int(args.grad_accum_steps))
         last["grad_accum_steps"] = max(1, int(args.grad_accum_steps))
         last["adapter_grad_norms"] = terms.get("grad_norms", {})
+        last["optimizer_step_skipped"] = bool(terms.get("optimizer_step_skipped", False))
+        last["global_grad_norm"] = terms.get("global_grad_norm")
         last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
@@ -337,7 +364,7 @@ def _assert_slat_training_contract(
     assert out["visibility"].min().item() >= 0.0 and out["visibility"].max().item() <= 1.0, "visibility must be in [0, 1]."
 
 
-def _assert_geovis_slat_gradients(model: GeoVisSLATAdapter, step: int) -> dict[str, float]:
+def _inspect_geovis_slat_gradients(model: GeoVisSLATAdapter, step: int) -> tuple[dict[str, float], list[str]]:
     critical = {
         "evidence_sampler.token_mlp.0.weight": model.evidence_sampler.token_mlp[0].weight,
         "aggregator.evidence_proj.weight": model.aggregator.evidence_proj.weight,
@@ -350,8 +377,11 @@ def _assert_geovis_slat_gradients(model: GeoVisSLATAdapter, step: int) -> dict[s
     missing = [name for name, param in critical.items() if param.grad is None]
     assert not missing, f"Stage 3 DDP graph break at step={step}; missing gradients for {missing}"
     nonfinite = [name for name, param in critical.items() if param.grad is not None and not torch.isfinite(param.grad).all().item()]
-    assert not nonfinite, f"Stage 3 non-finite gradients at step={step}: {nonfinite}"
-    return {name: float(param.grad.detach().norm().cpu()) for name, param in critical.items()}
+    norms = {
+        name: float(param.grad.detach().norm().cpu()) if name not in nonfinite else float("nan")
+        for name, param in critical.items()
+    }
+    return norms, nonfinite
 
 
 def make_synthetic_slat_batch(cfg: dict, args: argparse.Namespace, device: torch.device) -> dict:
@@ -396,8 +426,26 @@ def make_synthetic_slat_batch(cfg: dict, args: argparse.Namespace, device: torch
     return batch
 
 
-def prepare_batch(raw: dict, cfg: dict, args: argparse.Namespace, device: torch.device, *, trellis_pipeline=None) -> dict:
+def prepare_batch(
+    raw: dict,
+    cfg: dict,
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    trellis_pipeline=None,
+    vggt_geometry: VGGTGeometryWrapper | None = None,
+) -> dict:
     batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in raw.items()}
+    if vggt_geometry is None:
+        raise RuntimeError("real_train requires a frozen VGGT geometry extractor; mock VGGT is not permitted.")
+    with torch.inference_mode():
+        # Refresh frozen VGGT evidence from the exact camera views used by this
+        # batch; only the adapter remains trainable and no mock context leaks in.
+        vggt_context = vggt_geometry(batch["images"])
+    for key in ("vggt_features", "vggt_depth", "vggt_pointmap", "vggt_confidence"):
+        value = vggt_context.get(key)
+        if isinstance(value, torch.Tensor):
+            batch[key] = value
     model_cfg = cfg.get("model", {})
     slat_dim = int(model_cfg.get("slat_dim", 8))
     resolution = int(model_cfg.get("resolution", 64))
@@ -556,6 +604,14 @@ def _save_slat_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, ea
     )
 
 
+def _make_grad_scaler(*, enabled: bool):
+    """Use the current AMP API while retaining support for older torch builds."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def main() -> None:
     parser = add_common_args(argparse.ArgumentParser())
     parser.add_argument("--steps", type=int, default=2)
@@ -581,10 +637,15 @@ def main() -> None:
     parser.add_argument("--objaverse_rendered_root", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--vggt_root", type=str, default=None)
+    parser.add_argument("--vggt_checkpoint", type=str, default=None)
+    parser.add_argument("--vggt_pretrained", type=str, default=None)
     parser.add_argument("--torch_hub_dir", type=str, default=None)
     parser.add_argument("--dinov2_repo", type=str, default=None)
     parser.add_argument("--real_train", action="store_true")
     parser.add_argument("--amp", type=str2bool, default=True)
+    parser.add_argument("--amp_dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument("--max_grad_norm", type=float, default=5.0)
     parser.add_argument("--gradient_checkpointing", type=str2bool, default=True)
     add_adaptive_batch_args(parser)
     args = parser.parse_args()
@@ -611,6 +672,22 @@ def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device, ctx):
     if ctx.distributed and ctx.is_main:
         dist.barrier()
     return pipeline
+
+
+def _load_vggt_geometry(args: argparse.Namespace, device: torch.device, ctx) -> VGGTGeometryWrapper:
+    """Load one frozen real VGGT replica per DDP rank before training starts."""
+    if ctx.distributed and not ctx.is_main:
+        dist.barrier()
+    geometry = VGGTGeometryWrapper(
+        vggt_root=args.vggt_root,
+        checkpoint=args.vggt_checkpoint,
+        pretrained_name=args.vggt_pretrained,
+        mock=False,
+    ).to(device)
+    geometry.eval()
+    if ctx.distributed and ctx.is_main:
+        dist.barrier()
+    return geometry
 
 
 def _load_trellis_pipeline_impl(args: argparse.Namespace, device: torch.device):

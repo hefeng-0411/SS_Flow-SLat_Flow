@@ -360,6 +360,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + early_stop_args
             + adaptive_args
+            + vggt_args
             + trellis_args
             + slat_runtime_args
             + [
@@ -383,6 +384,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + early_stop_args
             + adaptive_args
+            + vggt_args
             + trellis_args
             + slat_runtime_args
             + [
