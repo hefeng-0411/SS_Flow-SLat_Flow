@@ -14,6 +14,7 @@ from PIL import Image
 from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset
 from geoss.integration.real_trellis_pipeline import RealTrellisGeoPipeline
+from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
 from geoss.utils.config import add_common_args, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
@@ -31,6 +32,9 @@ def main() -> None:
     parser.add_argument("--continue_to_decoder", type=str, default="false")
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
+    parser.add_argument("--vggt_root", type=str, default=None)
+    parser.add_argument("--vggt_checkpoint", type=str, default=None)
+    parser.add_argument("--vggt_pretrained", type=str, default=None)
     parser.add_argument("--slat_adapter_checkpoint", type=str, default=None)
     parser.add_argument("--meshfleet_root", type=str, default=None)
     parser.add_argument("--meshfleet_split", type=str, default="test")
@@ -47,7 +51,14 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     device = torch.device(args.device)
-    stage2_latents, stage2_status = _load_stage2_latents(args.trellis_latents, device)
+    # Legacy Stage-2 artifacts may contain trellis.modules.sparse.SparseTensor.
+    # Make that package importable *before* torch.load resolves its class.
+    _configure_trellis_import_path(args.trellis_root)
+    try:
+        stage2_latents, stage2_status = _load_stage2_latents(args.trellis_latents, device)
+    except Exception as exc:
+        _write_blocked_metrics(args.output_dir, f"Could not load Stage-2 TRELLIS latents: {exc}", {"used": False})
+        return
     model_cfg = dict(cfg.get("model", {}))
     if stage2_latents is not None:
         actual_dim = int(stage2_latents["slat"].shape[-1])
@@ -64,9 +75,10 @@ def main() -> None:
         model.load_state_dict(state.get("model", state), strict=False)
 
     if not args.dry_run:
-        required = ("trellis", "dataset", "decoder") if args.decode else ("trellis", "dataset")
+        required = ("vggt", "trellis", "dataset", "decoder") if args.decode else ("vggt", "trellis", "dataset")
         run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=required)
         pipe = RealTrellisGeoPipeline(args.trellis_root, args.trellis_model_path, device=args.device)
+        vggt_geometry = _load_vggt_geometry(args, device)
         out_dir = Path(args.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         context = _load_context(args.geovis_context, device) if args.geovis_context and Path(args.geovis_context).exists() else None
@@ -74,7 +86,11 @@ def main() -> None:
         if context is None:
             batch = _load_meshfleet_batch(args)
             batch = _move_batch(batch, device)
-            batch = prepare_batch(batch, cfg, args, device, trellis_pipeline=pipe.pipeline)
+            batch = prepare_batch(
+                batch, cfg, args, device,
+                trellis_pipeline=pipe.pipeline,
+                vggt_geometry=vggt_geometry,
+            )
             with torch.no_grad():
                 out = model(batch)
             context = {
@@ -201,6 +217,27 @@ def _first_scalar(value):
     return value
 
 
+def _configure_trellis_import_path(trellis_root: str | None) -> None:
+    """Expose the local TRELLIS package before unpickling legacy sparse latents."""
+    if not trellis_root:
+        return
+    root = Path(trellis_root).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"TRELLIS root does not exist: {root}")
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+
+
+def _load_vggt_geometry(args: argparse.Namespace, device: torch.device) -> VGGTGeometryWrapper:
+    return VGGTGeometryWrapper(
+        vggt_root=args.vggt_root,
+        checkpoint=args.vggt_checkpoint,
+        pretrained_name=args.vggt_pretrained,
+        mock=False,
+    ).to(device).eval()
+
+
 def _load_context(path: str, device: torch.device) -> dict:
     p = Path(path)
     if p.suffix.lower() == ".pt":
@@ -221,7 +258,13 @@ def _load_stage2_latents(path: str | None, device: torch.device) -> tuple[dict |
     source = Path(path)
     if not source.is_file():
         return None, {"used": False, "reason": "missing", "path": str(source)}
-    payload = torch.load(source, map_location="cpu")
+    try:
+        # New artifacts are tensor-only and can use the restricted loader.
+        payload = torch.load(source, map_location="cpu", weights_only=True)
+    except Exception:
+        # Backward compatibility for trusted legacy artifacts containing a
+        # TRELLIS SparseTensor; _configure_trellis_import_path ran first.
+        payload = torch.load(source, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict) or not isinstance(payload.get("coords"), torch.Tensor):
         return None, {"used": False, "reason": "invalid_payload", "path": str(source)}
     coords = payload["coords"]

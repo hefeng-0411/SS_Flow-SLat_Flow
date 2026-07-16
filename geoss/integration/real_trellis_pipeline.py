@@ -140,7 +140,18 @@ class RealTrellisGeoPipeline:
             if hasattr(mesh[0], "export"):
                 mesh[0].export(str(path))
                 saved["mesh_glb"] = str(path)
-        torch.save({"coords": outputs.get("coords"), "slat": outputs.get("slat")}, output_dir / "trellis_latents.pt")
+        # Persist plain tensors, not TRELLIS SparseTensor Python objects. This
+        # keeps Stage-2→3 artifacts portable and compatible with weights-only
+        # loading during isolated evaluation workers.
+        slat = outputs.get("slat")
+        slat_feats = slat.feats if hasattr(slat, "feats") else slat
+        coords = outputs.get("coords")
+        if not isinstance(coords, torch.Tensor) or not isinstance(slat_feats, torch.Tensor):
+            raise TypeError("TRELLIS sampler must return tensor coordinates and SLAT features for Stage-2 handoff.")
+        torch.save(
+            {"coords": coords.detach().cpu().contiguous(), "slat": slat_feats.detach().cpu().contiguous()},
+            output_dir / "trellis_latents.pt",
+        )
         saved["latents"] = str(output_dir / "trellis_latents.pt")
         return saved
 

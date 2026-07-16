@@ -291,6 +291,10 @@ def _run_slat_stage(args: argparse.Namespace, sample_root: Path, index: int, nam
     ]
     if args.trellis_root:
         command += ["--trellis_root", str(args.trellis_root)]
+    if args.vggt_root:
+        command += ["--vggt_root", str(args.vggt_root)]
+    if args.vggt_pretrained:
+        command += ["--vggt_pretrained", str(args.vggt_pretrained)]
     if args.category:
         command += ["--meshfleet_category", args.category]
     return _run_and_collect(name, command, out_dir, args.overwrite, evaluate_assets=True, eval_args=args, gpu=gpu)
