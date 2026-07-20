@@ -29,6 +29,7 @@ def main() -> None:
     parser.add_argument("--meshfleet_split", type=str, default="test")
     parser.add_argument("--meshfleet_category", type=str, default=None)
     parser.add_argument("--meshfleet_index", type=int, default=0)
+    parser.add_argument("--meshfleet_uid", type=str, default=None, help="Exact UID; preferred over layout-dependent --meshfleet_index.")
     parser.add_argument("--num_views", type=int, default=4)
     parser.add_argument("--image_size", type=int, default=64)
     parser.add_argument("--meshfleet_occ_resolution", type=int, default=64)
@@ -40,6 +41,7 @@ def main() -> None:
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--decode", type=str2bool, default=True)
+    parser.add_argument("--export_textured_glb", type=str2bool, default=False)
     parser.add_argument("--render_eval", type=str2bool, default=True)
     parser.add_argument("--save_context", type=str2bool, default=True)
     parser.add_argument("--disable_ss_adapter", type=str2bool, default=False)
@@ -56,7 +58,7 @@ def main() -> None:
     else:
         required = ("vggt", "trellis", "dataset", "decoder") if args.decode else ("vggt", "trellis", "dataset")
         run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_infer", required=required)
-        batch = _load_real_batch(args)
+        batch = _context_only_batch(_load_real_batch(args))
         batch = _move_batch(batch, torch.device(args.device))
         vggt = VGGTGeometryWrapper(
             vggt_root=args.vggt_root,
@@ -84,12 +86,13 @@ def main() -> None:
         pipe = RealTrellisGeoPipeline(args.trellis_root, args.trellis_model_path, device=args.device)
         if not args.disable_ss_adapter:
             pipe.install_ss_adapter(model.velocity_adapter)
-        cond_input = batch.get("trellis_cond_image")
-        if not isinstance(cond_input, torch.Tensor):
-            cond_input = batch["images"][:, 0]
+        images = batch["images"]
+        if not isinstance(images, torch.Tensor) or images.ndim != 5 or images.shape[0] != 1:
+            raise ValueError(f"Expected one multi-view object [1,N,3,H,W], got {type(images)!r} {getattr(images, 'shape', None)}")
+        cond_input = images[0]
         decode_context = None if args.disable_ss_adapter else {k: v.to(args.device) for k, v in geoss_context.items()}
         decoded = pipe.run(cond_input, geoss_context=decode_context, formats=("gaussian", "mesh"))
-        saved_assets = pipe.save_outputs(decoded, output_dir)
+        saved_assets = pipe.save_outputs(decoded, output_dir, export_textured_glb=args.export_textured_glb)
     else:
         run_modes = {"vggt_mode": "mock", "trellis_mode": "mock", "data_mode": "synthetic", "decoder_enabled": False, "render_eval_enabled": False, "official_metrics": False}
         saved_assets = {}
@@ -120,9 +123,9 @@ def main() -> None:
         "ss_adapter_enabled": bool(args.decode and not args.disable_ss_adapter),
         "geoss_context": str(output_dir / "geoss_context.pt") if args.save_context else None,
         "saved_assets": saved_assets,
+        "test_time_ground_truth_latents_used": False if not args.dry_run else None,
+        "inference_context_source": "conditioning_images_cameras_and_vggt_only" if not args.dry_run else "synthetic_dry_run",
     }
-    if "gt_occ" in batch:
-        metrics["gt_occ_voxels"] = int(batch["gt_occ"].sum().detach().cpu())
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     (output_dir / "projection_debug").mkdir(exist_ok=True)
     print(json.dumps(metrics, indent=2))
@@ -136,13 +139,20 @@ def _load_real_batch(args: argparse.Namespace) -> dict:
             num_views=args.num_views,
             image_size=args.image_size,
             occ_resolution=args.meshfleet_occ_resolution,
+            uid_manifest=[args.meshfleet_uid] if args.meshfleet_uid else None,
         )
         if len(dataset) == 0:
             raise FileNotFoundError(
                 "No reconstructed MeshFleet_TRELLIS samples found. "
                 f"Checked root={args.meshfleet_root}, split={args.meshfleet_split}, category={args.meshfleet_category}."
             )
-        return VehicleMultiViewDataset.collate_fn([dataset[min(args.meshfleet_index, len(dataset) - 1)]])
+        if args.meshfleet_uid:
+            sample = dataset.get_by_uid(args.meshfleet_uid)
+        else:
+            if args.meshfleet_index < 0 or args.meshfleet_index >= len(dataset):
+                raise IndexError(f"meshfleet_index={args.meshfleet_index} outside [0, {len(dataset) - 1}]")
+            sample = dataset[args.meshfleet_index]
+        return VehicleMultiViewDataset.collate_fn([sample])
     if args.input:
         obj_dir = Path(args.input)
         if (obj_dir / "transforms.json").exists():
@@ -162,15 +172,27 @@ def _move_batch(batch: dict, device: torch.device) -> dict:
 def _load_optional_checkpoints(model: SparseRayGeoSSAdapter, args: argparse.Namespace) -> None:
     if args.geoss_checkpoint and Path(args.geoss_checkpoint).exists():
         state = torch.load(args.geoss_checkpoint, map_location="cpu")
-        model.load_state_dict(state.get("model", state), strict=False)
+        model.load_state_dict(state.get("model", state), strict=True)
     if args.ss_adapter_checkpoint and Path(args.ss_adapter_checkpoint).exists():
         state = torch.load(args.ss_adapter_checkpoint, map_location="cpu")
         adapter_state = state.get("velocity_adapter", state)
-        model.velocity_adapter.load_state_dict(adapter_state, strict=False)
+        model.velocity_adapter.load_state_dict(adapter_state, strict=True)
 
 
 def _context_only_batch(batch: dict) -> dict:
-    blocked = {"ss_latent_grid", "ss_latent_tokens", "v_base", "timestep"}
+    # Test-time geometry is inferred exclusively from conditioning images,
+    # cameras, and VGGT predictions. Dataset 3D products remain available to
+    # training/evaluation code but must never cross this inference boundary.
+    blocked = {
+        "gt_occ",
+        "mesh_path",
+        "ss_latent_grid",
+        "ss_latent_tokens",
+        "trellis_slat_feats",
+        "trellis_slat_indices",
+        "v_base",
+        "timestep",
+    }
     return {key: value for key, value in batch.items() if key not in blocked}
 
 

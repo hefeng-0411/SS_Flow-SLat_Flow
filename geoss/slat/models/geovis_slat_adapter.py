@@ -26,6 +26,9 @@ class GeoVisSLATAdapter(nn.Module):
         trust_region: float = 0.15,
         beta_mode: str = "cosine",
         beta_strength: float = 1.0,
+        fusion_mode: str = "aligned",
+        confidence_floor: float = 0.05,
+        factorized_control: bool = True,
         use_geovis_slat: bool = True,
     ) -> None:
         super().__init__()
@@ -48,9 +51,12 @@ class GeoVisSLATAdapter(nn.Module):
             beta_mode=beta_mode,
             beta_strength=beta_strength,
             trust_region=trust_region,
+            fusion_mode=fusion_mode,
+            confidence_floor=confidence_floor,
             enabled=use_geovis_slat,
         )
         self.gradient_checkpointing = False
+        self.factorized_control = bool(factorized_control)
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
         """Checkpoint the attention-heavy aggregation path during joint training."""
@@ -88,7 +94,11 @@ class GeoVisSLATAdapter(nn.Module):
                 view_tokens, visibility, occlusion, depth_residual, confidence,
                 appearance_conflict=conflict,
                 ss_geo_tokens=batch.get("ss_geo_tokens"),
-                slat_latent_tokens=batch["slat_latent_tokens"],
+                # Evidence aggregation uses a clean/predicted object reference,
+                # while the velocity branch sees the noisy flow state. This
+                # matches inference, where Stage 2 provides a fixed prior and
+                # TRELLIS evolves a separate stochastic state over time.
+                slat_latent_tokens=batch.get("slat_reference_tokens", batch["slat_latent_tokens"]),
             )
         # The non-reentrant implementation preserves the nested dict output and
         # recomputes attention in backward, substantially reducing joint VRAM.
@@ -101,6 +111,21 @@ class GeoVisSLATAdapter(nn.Module):
             evidence["view_slat_tokens"], evidence["visibility"], evidence["occlusion_score"],
             evidence["depth_residual"], projection["ss_confidence"], evidence["appearance_conflict"],
         )
+        token_valid_mask = batch.get("slat_token_valid_mask")
+        if token_valid_mask is not None:
+            if token_valid_mask.shape != (*batch["slat_latent_tokens"].shape[:2], 1):
+                raise ValueError(
+                    "slat_token_valid_mask must be [B,L,1], got "
+                    f"{tuple(token_valid_mask.shape)} for tokens {tuple(batch['slat_latent_tokens'].shape)}"
+                )
+            token_valid_mask = token_valid_mask.to(
+                device=batch["slat_latent_tokens"].device,
+                dtype=batch["slat_latent_tokens"].dtype,
+            )
+            aggregated["slat_cond_tokens"] = aggregated["slat_cond_tokens"] * token_valid_mask
+            aggregated["slat_confidence"] = aggregated["slat_confidence"] * token_valid_mask
+            aggregated["evidence_reliability"] = aggregated["evidence_reliability"] * token_valid_mask
+            aggregated["correction_demand"] = aggregated["correction_demand"] * token_valid_mask
         velocity = self.velocity_adapter(
             batch["slat_latent_tokens"],
             aggregated["slat_cond_tokens"],
@@ -109,10 +134,16 @@ class GeoVisSLATAdapter(nn.Module):
             batch["timestep"],
             batch["v_slat_base"],
             use_geovis_slat=batch.get("use_geovis_slat", None),
+            token_valid_mask=token_valid_mask,
+            correction_demand=aggregated["correction_demand"] if self.factorized_control else None,
+            residual_variance=aggregated["residual_variance"] if self.factorized_control else None,
         )
         return {
             "slat_cond_tokens": aggregated["slat_cond_tokens"],
             "slat_confidence": aggregated["slat_confidence"],
+            "evidence_reliability": aggregated["evidence_reliability"],
+            "correction_demand": aggregated["correction_demand"],
+            "residual_variance": aggregated["residual_variance"],
             "delta_v_slat": velocity["delta_v_slat"],
             "v_slat_geo": velocity["v_slat_geo"],
             "view_weights": aggregated["view_weights"],
@@ -131,6 +162,7 @@ class GeoVisSLATAdapter(nn.Module):
                 "velocity": velocity["debug"],
                 "beta_t": velocity["beta_t"],
                 "joint_confidence": velocity["joint_confidence"],
+                "correction_gate": velocity["correction_gate"],
                 "clipping_ratio": velocity["clipping_ratio"],
             },
         }

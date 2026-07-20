@@ -1,0 +1,15 @@
+{
+  "role": "stage2_train",
+  "uids": [],
+  "count": 0,
+  "split_seed": 20260720,
+  "validation_percent": 10.0,
+  "audit_protocol_version": "meshfleet_dataset_audit_v3",
+  "eligibility_policy": "stage2_train",
+  "payload_validation_enabled": true,
+  "preprocessing_models": {
+    "ss_latents": "ss_enc_conv3d_16l8_fp16",
+    "latents": "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16",
+    "features": "dinov2_vitl14_reg"
+  }
+}

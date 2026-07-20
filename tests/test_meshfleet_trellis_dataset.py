@@ -113,6 +113,39 @@ def test_stage1_batch_sanitizer_drops_sparse_structure_latents():
         assert "gt_occ" in clean
 
 
+def test_exact_uid_lookup_remains_correct_after_required_modality_filtering():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_flat_sample(root / "test", uid="a_missing_voxel")
+        _write_flat_sample(root / "test", uid="b_complete")
+        (root / "test" / "voxels" / "a_missing_voxel.ply").unlink()
+
+        dataset = MeshFleetTrellisDataset(
+            root,
+            split="test",
+            num_views=1,
+            image_size=16,
+            occ_resolution=8,
+            require_voxels=True,
+        )
+        assert len(dataset) == 1
+        assert dataset.get_by_uid("b_complete")["uid"] == "b_complete"
+        with pytest.raises(KeyError, match="a_missing_voxel"):
+            dataset.get_by_uid("a_missing_voxel")
+
+        manifest = root / "uids.json"
+        manifest.write_text(json.dumps({"uids": ["a_missing_voxel", "b_complete"]}), encoding="utf-8")
+        with pytest.raises(KeyError, match="required-modality filtering"):
+            MeshFleetTrellisDataset(
+                root,
+                split="test",
+                num_views=1,
+                image_size=16,
+                require_voxels=True,
+                uid_manifest=str(manifest),
+            )
+
+
 def _write_flat_sample(split_root: Path, uid: str = "flat_uid") -> None:
     render_dir = split_root / "renders" / uid
     render_dir.mkdir(parents=True)

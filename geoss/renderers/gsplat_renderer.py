@@ -3,8 +3,12 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from geoss.utils.optional_deps import require_dependency
+
+
+SH_C0 = 0.28209479177387814
 
 
 def render_gaussians(
@@ -64,15 +68,34 @@ def render_gaussians(
 
 
 def _gaussian_tensors(gaussians: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # TRELLIS' in-memory Gaussian object exposes activated physical attributes
+    # through get_* properties. Reading the private tensors would omit scale and
+    # opacity biases and would render a different asset from TRELLIS itself.
+    if not isinstance(gaussians, dict) and all(
+        hasattr(gaussians, name) for name in ("get_xyz", "get_scaling", "get_rotation", "get_opacity", "get_features")
+    ):
+        means = gaussians.get_xyz
+        quats = gaussians.get_rotation
+        scales = gaussians.get_scaling
+        opacities = gaussians.get_opacity.reshape(-1)
+        colors = _dc_sh_to_rgb(gaussians.get_features)
+        return means.float(), quats.float(), scales.float(), opacities.float(), colors.float()
+    scale_parameterization = None
+    opacity_parameterization = None
     if isinstance(gaussians, dict):
         get = gaussians.get
+        scale_parameterization = gaussians.get("scaling_parameterization")
+        opacity_parameterization = gaussians.get("opacity_parameterization")
     else:
         get = lambda name, default=None: getattr(gaussians, name, getattr(gaussians, f"_{name}", default))
     means = _first(get, "means", "xyz")
     quats = _first(get, "quats", "rotation")
     scales = _first(get, "scales", "scaling")
     opacities = _first(get, "opacities", "opacity")
-    colors = _first(get, "colors", "features_dc")
+    colors = get("colors", None)
+    colors_are_sh = colors is None
+    if colors_are_sh:
+        colors = get("features_dc", None)
     if means is None or scales is None or opacities is None:
         raise ValueError("gaussians must expose means/xyz, scales/scaling, and opacities/opacity.")
     if quats is None:
@@ -80,16 +103,32 @@ def _gaussian_tensors(gaussians: Any) -> tuple[torch.Tensor, torch.Tensor, torch
         quats[:, 0] = 1.0
     if colors is None:
         colors = torch.ones(means.shape[0], 3, device=means.device, dtype=means.dtype)
-    if colors.ndim == 3:
+    if colors_are_sh:
+        colors = _dc_sh_to_rgb(colors)
+    elif colors.ndim == 3:
         colors = colors[:, 0]
+    if colors.ndim != 2 or colors.shape[-1] != 3:
+        raise ValueError(f"Gaussian colors must be [G,3] or [G,1,3], got {tuple(colors.shape)}")
     opacities = opacities.reshape(-1)
     # PLY exports retain the optimizer parameterization (log-scales/logits).
     # Decode it here so evaluation renders the same physical Gaussians as TRELLIS.
-    if scales.median() < 0:
+    if scale_parameterization == "log" or (scale_parameterization is None and scales.median() < 0):
         scales = scales.exp()
-    if opacities.min() < 0 or opacities.max() > 1:
+    if opacity_parameterization == "logit" or (
+        opacity_parameterization is None and (opacities.min() < 0 or opacities.max() > 1)
+    ):
         opacities = opacities.sigmoid()
-    return means.float(), quats.float(), scales.float(), opacities.float(), colors.float().clamp(0, 1)
+    quats = F.normalize(quats.float(), dim=-1, eps=1e-8)
+    return means.float(), quats, scales.float(), opacities.float(), colors.float()
+
+
+def _dc_sh_to_rgb(colors: torch.Tensor) -> torch.Tensor:
+    """Convert TRELLIS/3DGS degree-zero SH coefficients to linear RGB values."""
+    if colors.ndim == 3:
+        colors = colors[:, 0]
+    if colors.ndim != 2 or colors.shape[-1] != 3:
+        raise ValueError(f"Gaussian colors must be [G,3] or [G,1,3], got {tuple(colors.shape)}")
+    return (0.5 + SH_C0 * colors).clamp(0.0, 1.0)
 
 
 def _first(get, *names: str):

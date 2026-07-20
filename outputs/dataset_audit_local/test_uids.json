@@ -1,0 +1,9 @@
+{
+  "role": "test",
+  "uids": [
+    "17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17"
+  ],
+  "count": 1,
+  "split_seed": 20260720,
+  "validation_percent": 10.0
+}

@@ -1,0 +1,12 @@
+{
+  "protocol_version": "phase2_ablation_multiview_teacher_v1",
+  "model": {
+    "resolution": 64, "slat_dim": 8, "evidence_dim": 128, "hidden_dim": 128,
+    "feature_dim": 16, "num_heads": 4, "trust_region": 0.15,
+    "beta_mode": "cosine", "beta_strength": 1.0, "fusion_mode": "aligned",
+    "confidence_floor": 0.05, "factorized_control": false, "use_geovis_slat": true
+  },
+  "flow": {"sigma_min": 1e-5, "latent_space": "trellis_normalized_slat"},
+  "decoded_supervision": {"enabled": false},
+  "training": {"stage": "ablation_multiview_teacher", "multiview_teacher": true, "factorized_control_weight": 0.0}
+}

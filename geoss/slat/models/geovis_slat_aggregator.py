@@ -28,7 +28,13 @@ class GeoVisSLATAggregator(nn.Module):
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
         self.out = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, slat_dim))
+        # Reliability answers "can the observed views support a correction?".
+        # Correction demand answers "does the current prior need correction?".
+        # Uncertainty describes the residual error distribution. These are
+        # deliberately separate statistical quantities.
         self.confidence_head = nn.Sequential(nn.Linear(hidden_dim + 4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.correction_demand_head = nn.Sequential(nn.Linear(hidden_dim + 4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
+        self.uncertainty_head = nn.Sequential(nn.Linear(hidden_dim + 4, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1))
 
     def forward(
         self,
@@ -79,25 +85,32 @@ class GeoVisSLATAggregator(nn.Module):
         appearance_consistency = (1.0 - appearance_conflict.clamp(0, 1)).clamp(0, 1)
         conf_input = torch.cat([h, visible_support, 1.0 - occlusion_mean, residual_score, appearance_consistency], dim=-1)
         learned_conf = torch.sigmoid(self.confidence_head(conf_input))
-        slat_confidence = (
+        evidence_reliability = (
             learned_conf
             * ss_confidence.clamp(0, 1).sqrt()
             * visible_support.clamp(0, 1)
             * appearance_consistency
         ).clamp(0, 1)
+        correction_demand = torch.sigmoid(self.correction_demand_head(conf_input))
+        residual_variance = torch.nn.functional.softplus(self.uncertainty_head(conf_input)) + 1e-4
 
         return {
             "slat_cond_tokens": slat_cond_tokens,
-            "slat_confidence": slat_confidence,
+            "slat_confidence": evidence_reliability,
+            "evidence_reliability": evidence_reliability,
+            "correction_demand": correction_demand,
+            "residual_variance": residual_variance,
             "view_weights": view_weights,
             "appearance_consistency": appearance_consistency,
             "debug": {
                 "visible_support": visible_support,
                 "occlusion_mean": occlusion_mean,
-                "confidence_mean": slat_confidence.mean(),
-                "confidence_std": slat_confidence.std(unbiased=False),
-                "confidence_all_zero": (slat_confidence <= 1e-6).all(),
-                "confidence_all_one": (slat_confidence >= 1.0 - 1e-6).all(),
+                "confidence_mean": evidence_reliability.mean(),
+                "confidence_std": evidence_reliability.std(unbiased=False),
+                "confidence_all_zero": (evidence_reliability <= 1e-6).all(),
+                "confidence_all_one": (evidence_reliability >= 1.0 - 1e-6).all(),
+                "correction_demand_mean": correction_demand.mean(),
+                "residual_variance_mean": residual_variance.mean(),
             },
         }
 

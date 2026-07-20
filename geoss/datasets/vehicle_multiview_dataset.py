@@ -48,6 +48,7 @@ class VehicleMultiViewDataset(Dataset):
             if len(vals) == len(batch):
                 out[key] = _stack_if_same_shape(vals)
         out["dataset_name"] = [b.get("dataset_name", "") for b in batch]
+        out["uid"] = [b.get("uid", b.get("object_id", "")) for b in batch]
         out["object_id"] = [b.get("object_id", b.get("uid", "")) for b in batch]
         if any("mesh_path" in b for b in batch):
             out["mesh_path"] = [b.get("mesh_path") for b in batch]

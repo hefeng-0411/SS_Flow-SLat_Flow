@@ -1,0 +1,87 @@
+{
+  "protocol_version": "meshfleet_dataset_audit_v3",
+  "data_root": "D:\\VsCode\\MVG\\Base\\MeshFleet_TRELLIS",
+  "split_seed": 20260720,
+  "validation_percent": 10.0,
+  "payload_validation_enabled": true,
+  "required_modalities": [
+    "renders",
+    "renders_cond",
+    "renders_eval_70",
+    "renders_eval_90",
+    "voxels",
+    "ss_latents",
+    "latents",
+    "features",
+    "mesh"
+  ],
+  "preprocessing_models": {
+    "ss_latents": "ss_enc_conv3d_16l8_fp16",
+    "latents": "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16",
+    "features": "dinov2_vitl14_reg"
+  },
+  "counts": {
+    "test": 1
+  },
+  "strict_valid_counts": {
+    "test": 1
+  },
+  "train_manifest_count": 0,
+  "validation_manifest_count": 0,
+  "test_manifest_count": 1,
+  "stage_manifest_counts": {
+    "stage1_train_uids.json": 0,
+    "stage2_train_uids.json": 0,
+    "stage3_train_uids.json": 0,
+    "stage4_train_uids.json": 0,
+    "validation_evaluation_uids.json": 0,
+    "test_evaluation_uids.json": 1
+  },
+  "invalid_object_count": 0,
+  "invalid_object_count_by_split": {},
+  "invalid_reason_counts": {},
+  "train_test_overlap_count": 0,
+  "train_test_overlap_uids": [],
+  "discovery_failures": [],
+  "modality_coverage": {
+    "features": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "latents": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "mesh": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_cond": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_eval_70": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_eval_90": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "ss_latents": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "voxels": {
+      "count": 1,
+      "fraction": 1.0
+    }
+  },
+  "all_discovered_valid": true,
+  "manifests_valid": true,
+  "valid": true
+}

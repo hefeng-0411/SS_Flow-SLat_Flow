@@ -22,4 +22,10 @@ def occupancy_bce_loss(
     bce = F.binary_cross_entropy_with_logits(logits, target)
     prob = torch.sigmoid(logits)
     dice = dice_loss(prob, target)
-    return {"occupancy_bce": bce, "occupancy_dice": dice, "loss": bce + dice_weight * dice}
+    return {
+        "occupancy_bce": bce,
+        "occupancy_dice": dice,
+        "loss": bce + dice_weight * dice,
+        "target_occupancy": target.detach(),
+        "predicted_occupancy": prob,
+    }

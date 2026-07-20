@@ -10,7 +10,12 @@ from geoss.slat.utils.active_voxel_utils import pad_sparse_tensor_tokens, unpad_
 
 
 class GeoVisTrellisSLATWrapper(nn.Module):
-    """Minimal wrapper around TRELLIS SLatFlowModel velocity output."""
+    """Adapter wrapper that preserves the public TRELLIS SLatFlowModel contract.
+
+    TRELLIS samplers inspect model metadata such as ``in_channels`` before
+    calling ``forward``.  A plain :class:`nn.Module` wrapper hides those fields,
+    which otherwise makes a healthy adapter checkpoint fail only at decode time.
+    """
 
     def __init__(
         self,
@@ -29,6 +34,26 @@ class GeoVisTrellisSLATWrapper(nn.Module):
         for p in self.slat_flow_model.parameters():
             p.requires_grad_(False)
 
+    def __getattr__(self, name: str):
+        """Delegate unknown TRELLIS model metadata to the wrapped flow model.
+
+        ``nn.Module`` keeps child modules in ``_modules`` rather than the
+        instance dictionary, so the lookup deliberately uses that registry to
+        avoid recursive attribute access.  This preserves sampler-facing
+        attributes (notably ``in_channels``) without duplicating TRELLIS
+        internals or weakening normal module/state-dict behavior.
+        """
+        try:
+            return super().__getattr__(name)
+        except AttributeError as original_error:
+            wrapped = self.__dict__.get("_modules", {}).get("slat_flow_model")
+            if wrapped is not None:
+                try:
+                    return getattr(wrapped, name)
+                except AttributeError:
+                    pass
+            raise original_error
+
     def forward(
         self,
         x,
@@ -38,6 +63,7 @@ class GeoVisTrellisSLATWrapper(nn.Module):
         geovis_slat_context: Optional[Dict[str, torch.Tensor]] = None,
         use_geovis_slat: Optional[bool] = None,
         geovis_branch: str = "cond",
+        geovis_residual_scale: float = 1.0,
         **kwargs,
     ):
         v_base = self.slat_flow_model(x, t, cond, **kwargs)
@@ -49,10 +75,14 @@ class GeoVisTrellisSLATWrapper(nn.Module):
             self.last_debug = {"enabled": False, "branch": geovis_branch, "reason": "uncond_disabled"}
             return v_base
         if hasattr(v_base, "feats") and hasattr(v_base, "coords"):
-            return self._forward_sparse(x, v_base, t, geovis_slat_context, geovis_branch)
-        return self._forward_dense(x, v_base, t, geovis_slat_context, geovis_branch)
+            return self._forward_sparse(
+                x, v_base, t, geovis_slat_context, geovis_branch, float(geovis_residual_scale)
+            )
+        return self._forward_dense(
+            x, v_base, t, geovis_slat_context, geovis_branch, float(geovis_residual_scale)
+        )
 
-    def _forward_sparse(self, x, v_base, t, context: Dict[str, torch.Tensor], branch: str):
+    def _forward_sparse(self, x, v_base, t, context: Dict[str, torch.Tensor], branch: str, residual_scale: float):
         slat_latent_tokens, valid_mask, layout, active_indices = pad_sparse_tensor_tokens(x)
         v_base_tokens, _, _, _ = pad_sparse_tensor_tokens(v_base)
         context = _context_to_padded(context, slat_latent_tokens, active_indices)
@@ -64,13 +94,17 @@ class GeoVisTrellisSLATWrapper(nn.Module):
             t,
             v_base_tokens,
             use_geovis_slat=True,
+            token_valid_mask=valid_mask.unsqueeze(-1).to(slat_latent_tokens.dtype),
+            correction_demand=context.get("correction_demand"),
+            residual_variance=context.get("residual_variance"),
         )
-        v_geo_feats = unpad_sparse_tensor_tokens(out["v_slat_geo"], layout)
+        v_geo_tokens = v_base_tokens + residual_scale * (out["v_slat_geo"] - v_base_tokens)
+        v_geo_feats = unpad_sparse_tensor_tokens(v_geo_tokens, layout)
         v_geo = v_base.replace(v_geo_feats)
-        self.last_debug = _make_debug(out, branch, valid_mask)
+        self.last_debug = _make_debug(out, branch, valid_mask, residual_scale=residual_scale)
         return v_geo
 
-    def _forward_dense(self, x, v_base, t, context: Dict[str, torch.Tensor], branch: str):
+    def _forward_dense(self, x, v_base, t, context: Dict[str, torch.Tensor], branch: str, residual_scale: float):
         if x.ndim != 3:
             raise ValueError(f"dense SLAT hook expects [B,L,C], got {tuple(x.shape)}")
         context = _context_to_padded(context, x, None)
@@ -82,9 +116,13 @@ class GeoVisTrellisSLATWrapper(nn.Module):
             t,
             v_base,
             use_geovis_slat=True,
+            token_valid_mask=context.get("slat_token_valid_mask"),
+            correction_demand=context.get("correction_demand"),
+            residual_variance=context.get("residual_variance"),
         )
-        self.last_debug = _make_debug(out, branch, None)
-        return out["v_slat_geo"]
+        v_geo = v_base + residual_scale * (out["v_slat_geo"] - v_base)
+        self.last_debug = _make_debug(out, branch, None, residual_scale=residual_scale)
+        return v_geo
 
     @torch.no_grad()
     def identity_error(self, x, t: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -111,6 +149,14 @@ def _context_to_padded(context: Dict[str, torch.Tensor], tokens: torch.Tensor, a
     B, L, C = tokens.shape
     device, dtype = tokens.device, tokens.dtype
     out: Dict[str, torch.Tensor] = {}
+    context_indices = context.get("ss_active_indices")
+    if context_indices is not None and active_indices is not None:
+        expected = context_indices.to(device=active_indices.device, dtype=active_indices.dtype)
+        if expected.shape != active_indices.shape or not torch.equal(expected, active_indices):
+            raise RuntimeError(
+                "GeoVis context coordinates do not match the live TRELLIS sparse state; "
+                "refusing to apply token controls to different voxels."
+            )
     if "slat_cond_tokens" in context:
         out["slat_cond_tokens"] = _fit_tokens(context["slat_cond_tokens"].to(device=device, dtype=dtype), B, L, C)
     elif "ss_geo_tokens" in context:
@@ -125,6 +171,10 @@ def _context_to_padded(context: Dict[str, torch.Tensor], tokens: torch.Tensor, a
         out["ss_confidence"] = _fit_tokens(context["ss_confidence"].to(device=device, dtype=dtype), B, L, 1).clamp(0, 1)
     else:
         out["ss_confidence"] = torch.ones(B, L, 1, device=device, dtype=dtype)
+    if "correction_demand" in context:
+        out["correction_demand"] = _fit_tokens(context["correction_demand"].to(device=device, dtype=dtype), B, L, 1).clamp(0, 1)
+    if "residual_variance" in context:
+        out["residual_variance"] = _fit_tokens(context["residual_variance"].to(device=device, dtype=dtype), B, L, 1).clamp_min(0)
     if active_indices is not None:
         out["ss_active_indices"] = active_indices
     return out
@@ -135,21 +185,22 @@ def _fit_tokens(tokens: torch.Tensor, B: int, L: int, C: int) -> torch.Tensor:
         tokens = tokens[None].expand(B, -1, -1)
     if tokens.shape[0] == 1 and B > 1:
         tokens = tokens.expand(B, -1, -1)
-    if tokens.shape[1] > L:
-        tokens = tokens[:, :L]
-    elif tokens.shape[1] < L:
-        tokens = torch.cat([tokens, tokens[:, -1:].expand(-1, L - tokens.shape[1], -1)], dim=1)
-    if tokens.shape[-1] > C:
+    if tokens.ndim != 3 or tokens.shape[0] != B or tokens.shape[1] != L:
         raise ValueError(
-            f"Refusing to truncate SLAT context from {tokens.shape[-1]} to {C}. "
-            "Pass learned slat_cond_tokens with the correct dimension."
+            f"SLAT context must align exactly with live tokens [B,L,*]=[{B},{L},*], got {tuple(tokens.shape)}."
         )
-    elif tokens.shape[-1] < C:
-        tokens = torch.cat([tokens, tokens.new_zeros(*tokens.shape[:-1], C - tokens.shape[-1])], dim=-1)
+    if tokens.shape[-1] != C:
+        raise ValueError(f"SLAT context channel width must be {C}, got {tokens.shape[-1]}.")
     return tokens
 
 
-def _make_debug(out: Dict[str, torch.Tensor], branch: str, valid_mask: Optional[torch.Tensor]) -> Dict[str, Any]:
+def _make_debug(
+    out: Dict[str, torch.Tensor],
+    branch: str,
+    valid_mask: Optional[torch.Tensor],
+    *,
+    residual_scale: float = 1.0,
+) -> Dict[str, Any]:
     debug = {
         "enabled": True,
         "branch": branch,
@@ -160,6 +211,10 @@ def _make_debug(out: Dict[str, torch.Tensor], branch: str, valid_mask: Optional[
         "clipping_ratio": out["clipping_ratio"].detach(),
         "delta_norm": out["debug"]["delta_norm"].detach(),
         "confidence_mean": out["debug"]["confidence_mean"].detach(),
+        "cfg_residual_scale": float(residual_scale),
+        "effective_delta_norm": (
+            (out["v_slat_geo"] - out["v_slat_base"]) * residual_scale
+        ).norm(dim=-1).mean().detach(),
     }
     if valid_mask is not None:
         debug["valid_token_ratio"] = valid_mask.float().mean().detach()

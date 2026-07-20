@@ -61,7 +61,9 @@ class SparseRayGeoSSAdapter(nn.Module):
             anchors = self.anchor_queries.forward_dynamic(
                 B,
                 device=device,
-                aligned_pointmap=batch.get("aligned_pointmap"),
+                # Camera-aligned VGGT points share TRELLIS' physical
+                # [-0.5,0.5] world frame; anchor queries/occupancy use [-1,1].
+                aligned_pointmap=(batch["aligned_pointmap"] * 2.0) if batch.get("aligned_pointmap") is not None else None,
                 masks=batch.get("masks"),
                 confidence=batch.get("alignment_confidence", batch.get("vggt_confidence")),
             )

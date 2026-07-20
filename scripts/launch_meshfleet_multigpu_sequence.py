@@ -89,8 +89,13 @@ def main() -> None:
     parser.add_argument("--num_views", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--latent_tokens", type=int, default=4096)
-    parser.add_argument("--active_tokens", type=int, default=4096)
+    parser.add_argument("--active_tokens", type=int, default=0, help="Maximum SLAT tokens; 0 keeps every active voxel.")
     parser.add_argument("--meshfleet_split", type=str, default="train")
+    parser.add_argument("--train_manifest", type=str, default=None, help="Fallback UID manifest used by every stage.")
+    parser.add_argument("--stage1_train_manifest", type=str, default=None, help="Stage-1 eligible UID manifest from the dataset auditor.")
+    parser.add_argument("--stage2_train_manifest", type=str, default=None, help="Stage-2 eligible UID manifest from the dataset auditor.")
+    parser.add_argument("--stage3_train_manifest", type=str, default=None, help="Stage-3 eligible UID manifest from the dataset auditor.")
+    parser.add_argument("--stage4_train_manifest", type=str, default=None, help="Stage-4 eligible UID manifest from the dataset auditor.")
     parser.add_argument("--meshfleet_category", type=str, default=None)
     parser.add_argument("--vggt_root", type=str, default=None)
     parser.add_argument("--vggt_checkpoint", type=str, default=None)
@@ -114,6 +119,12 @@ def main() -> None:
     parser.add_argument("--stage2_raw_residual_weight", type=float, default=1.0)
     parser.add_argument("--slat_lr", type=float, default=1e-4)
     parser.add_argument("--slat_joint_lr", type=float, default=5e-5)
+    parser.add_argument(
+        "--slat_joint_init_checkpoint",
+        type=str,
+        default=None,
+        help="Validation-selected Phase-II Stage-3 checkpoint; required when slat_joint is included.",
+    )
     parser.add_argument("--slat_raw_residual_weight", type=float, default=1.0)
     parser.add_argument("--slat_effective_residual_weight", type=float, default=1.0)
     parser.add_argument("--slat_grad_accum_steps", type=int, default=1)
@@ -166,6 +177,11 @@ def main() -> None:
     stages = _slice_stages(stages, args.start_at, args.stop_after)
     if args.skip_slat_joint:
         stages = [stage for stage in stages if stage.name != "slat_joint"]
+    if any(stage.name == "slat_joint" for stage in stages) and not args.slat_joint_init_checkpoint:
+        raise ValueError(
+            "Stage 4 requires --slat_joint_init_checkpoint selected by decoded validation metrics; "
+            "the training-loss *_best.pt alias is not a valid automatic selector."
+        )
 
     selected = {}
     handoff = HandoffCoordinator(args, env, nproc)
@@ -220,7 +236,9 @@ class HandoffCoordinator:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _wait_and_probe(self, next_stage: Stage, current_stage: Stage, env: dict, nproc: int) -> int:
-        while not _resolve_resume_path(current_stage):
+        while _checkpoint_step(_resolve_resume_path(current_stage)) is None:
+            time.sleep(2.0)
+        while _required_initialization_path(next_stage) is not None and _resolve_initialization_path(next_stage) is None:
             time.sleep(2.0)
         print(f"{next_stage.name}: speculative handoff probing on spare GPUs={env['CUDA_VISIBLE_DEVICES']}", flush=True)
         return next_stage.max_batch_size if self.args.no_auto_batch else _probe_batch(next_stage, self.args, env, nproc)
@@ -244,6 +262,10 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
     ]
     if args.meshfleet_category:
         common_data += ["--meshfleet_category", args.meshfleet_category]
+    stage1_manifest = _manifest_args(args.stage1_train_manifest or args.train_manifest)
+    stage2_manifest = _manifest_args(args.stage2_train_manifest or args.train_manifest)
+    stage3_manifest = _manifest_args(args.stage3_train_manifest or args.train_manifest)
+    stage4_manifest = _manifest_args(args.stage4_train_manifest or args.stage3_train_manifest or args.train_manifest)
     early_stop_args = []
     if not args.disable_early_stop:
         early_stop_args = [
@@ -305,6 +327,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             resume_path=stage1_out / "geoss_adapter_last.pt",
             best_path=stage1_out / "geoss_adapter_best.pt",
             extra_args=common_data
+            + stage1_manifest
             + early_stop_args
             + adaptive_args
             + vggt_args
@@ -328,6 +351,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             resume_path=stage2_out / "ss_velocity_adapter_last.pt",
             best_path=stage2_out / "ss_velocity_adapter_best.pt",
             extra_args=common_data
+            + stage2_manifest
             + early_stop_args
             + adaptive_args
             + vggt_args
@@ -358,6 +382,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             resume_path=slat_out / "geovis_slat_adapter_last.pt",
             best_path=slat_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
+            + stage3_manifest
             + early_stop_args
             + adaptive_args
             + vggt_args
@@ -375,13 +400,14 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
         Stage(
             name="slat_joint",
             script=str(root / "scripts" / "train_geovis_slat_joint.py"),
-            config=str(root / "configs" / "geovis_slat_joint.yaml"),
+            config=str(root / "configs" / "phase2_decoded_asset.yaml"),
             output_dir=slat_joint_out,
             steps=args.slat_joint_steps,
             max_batch_size=args.slat_joint_max_batch_size,
             resume_path=slat_joint_out / "geovis_slat_adapter_last.pt",
             best_path=slat_joint_out / "geovis_slat_adapter_best.pt",
             extra_args=common_data
+            + stage4_manifest
             + early_stop_args
             + adaptive_args
             + vggt_args
@@ -389,6 +415,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             + slat_runtime_args
             + [
                 "--active_tokens", str(args.active_tokens),
+                "--init_checkpoint", str(Path(args.slat_joint_init_checkpoint)) if args.slat_joint_init_checkpoint else str(slat_out / "geovis_slat_adapter_best.pt"),
                 "--adaptive_max_batch_size", str(args.slat_joint_max_batch_size),
                 "--lr", str(args.slat_joint_lr),
                 "--save_every", str(args.save_every),
@@ -397,6 +424,10 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             ],
         ),
     ]
+
+
+def _manifest_args(path: Optional[str]) -> list[str]:
+    return ["--train_manifest", path] if path else []
 
 
 def _slice_stages(stages: list[Stage], start_at: str, stop_after: str) -> list[Stage]:
@@ -550,6 +581,7 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
 
 
 def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, output_dir: Path, *, resume: bool) -> list[str]:
+    extra_args = _resolved_stage_args(stage)
     command = [
         sys.executable,
         "-m",
@@ -568,11 +600,48 @@ def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, out
         str(batch_size),
         "--steps_are_total",
         "true",
-    ] + list(stage.extra_args)
+    ] + extra_args
     resume_path = _resolve_resume_path(stage)
     if resume and resume_path is not None:
         command += ["--resume", str(resume_path)]
     return command
+
+
+def _required_initialization_path(stage: Stage) -> Optional[Path]:
+    try:
+        index = stage.extra_args.index("--init_checkpoint")
+    except ValueError:
+        return None
+    if index + 1 >= len(stage.extra_args):
+        raise ValueError(f"{stage.name} has --init_checkpoint without a path.")
+    return Path(stage.extra_args[index + 1])
+
+
+def _resolve_initialization_path(stage: Stage) -> Optional[Path]:
+    requested = _required_initialization_path(stage)
+    if requested is None:
+        return None
+    if _checkpoint_step(requested) is not None:
+        return requested
+    name = requested.name
+    if name.endswith("_best.pt"):
+        fallback = requested.with_name(name.removesuffix("_best.pt") + "_last.pt")
+        if _checkpoint_step(fallback) is not None:
+            return fallback
+    return None
+
+
+def _resolved_stage_args(stage: Stage) -> list[str]:
+    args = list(stage.extra_args)
+    requested = _required_initialization_path(stage)
+    if requested is None:
+        return args
+    resolved = _resolve_initialization_path(stage)
+    if resolved is None:
+        raise FileNotFoundError(f"{stage.name} initialization checkpoint is not ready: {requested}")
+    index = args.index("--init_checkpoint")
+    args[index + 1] = str(resolved)
+    return args
 
 
 def _configure_training_env(env: dict, args: argparse.Namespace) -> dict:

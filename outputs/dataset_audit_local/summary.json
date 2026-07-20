@@ -1,0 +1,72 @@
+{
+  "protocol_version": "meshfleet_dataset_audit_v2",
+  "data_root": "/mnt/d/VsCode/MVG/Base/MeshFleet_TRELLIS",
+  "split_seed": 20260720,
+  "validation_percent": 10.0,
+  "required_modalities": [
+    "renders",
+    "renders_cond",
+    "renders_eval_70",
+    "renders_eval_90",
+    "voxels",
+    "ss_latents",
+    "latents",
+    "features",
+    "mesh"
+  ],
+  "counts": {
+    "train": 0,
+    "test": 1
+  },
+  "train_manifest_count": 0,
+  "validation_manifest_count": 0,
+  "test_manifest_count": 1,
+  "invalid_object_count": 0,
+  "train_test_overlap_count": 0,
+  "train_test_overlap_uids": [],
+  "discovery_failures": [
+    {
+      "split": "train",
+      "error": "No flat/category MeshFleet layout under /mnt/d/VsCode/MVG/Base/MeshFleet_TRELLIS/train"
+    }
+  ],
+  "modality_coverage": {
+    "features": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "latents": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "mesh": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_cond": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_eval_70": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "renders_eval_90": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "ss_latents": {
+      "count": 1,
+      "fraction": 1.0
+    },
+    "voxels": {
+      "count": 1,
+      "fraction": 1.0
+    }
+  },
+  "valid": false
+}

@@ -4,21 +4,24 @@ from typing import Iterable, List, Optional, Tuple
 
 import torch
 
-from geoss.utils.coordinates import anchor_to_occ_index, occ_index_to_anchor_center
-
-
 def indices_to_active_xyz(active_indices: torch.Tensor, resolution: int = 64) -> torch.Tensor:
-    """Map TRELLIS active voxel indices to canonical voxel centers in [-1, 1]^3."""
+    """Map TRELLIS indices to decoder-world voxel centers in ``[-0.5,0.5]^3``.
+
+    TRELLIS' Gaussian/RF decoders first compute ``(coord + 0.5) / R`` and
+    instantiate representations with ``aabb=[-0.5,-0.5,-0.5,1,1,1]``.  Using
+    the GeoSS ``[-1,1]`` occupancy convention here doubles every projected
+    SLAT location and destroys image-feature correspondence.
+    """
     if active_indices.shape[-1] == 4:
         active_indices = active_indices[..., 1:]
     if active_indices.shape[-1] != 3:
         raise ValueError(f"active_indices must end in 3 or 4 dims, got {tuple(active_indices.shape)}")
-    return occ_index_to_anchor_center(active_indices.long(), resolution)
+    return (active_indices.to(torch.float32) + 0.5) / float(resolution) - 0.5
 
 
 def active_xyz_to_indices(active_xyz: torch.Tensor, resolution: int = 64) -> torch.Tensor:
-    """Map canonical active voxel centers to nearest TRELLIS voxel indices."""
-    return anchor_to_occ_index(active_xyz, resolution)
+    """Map TRELLIS decoder-world coordinates back to sparse grid indices."""
+    return ((active_xyz + 0.5) * float(resolution)).floor().clamp(0, resolution - 1).long()
 
 
 def sparse_coords_to_padded_indices(
