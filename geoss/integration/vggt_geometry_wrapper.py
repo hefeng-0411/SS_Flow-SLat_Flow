@@ -116,8 +116,22 @@ class VGGTGeometryWrapper(nn.Module):
         out["vggt_depth"] = _resize_b_n_c_h_w(_to_b_n_1_h_w(depth, B, N), (out_h, out_w)) if depth is not None else None
         pointmap = _first_present(predictions, ["world_points", "point_map", "pointmap", "points3d", "vggt_pointmap"])
         out["vggt_pointmap"] = _resize_b_n_c_h_w(_to_b_n_3_h_w(pointmap, B, N), (out_h, out_w)) if pointmap is not None else None
-        conf = _first_present(predictions, ["depth_conf", "world_points_conf", "confidence", "conf"])
-        out["vggt_confidence"] = _resize_confidence(conf, B, N, (out_h, out_w)) if conf is not None else None
+        depth_conf = _first_present(predictions, ["depth_conf"])
+        point_conf = _first_present(predictions, ["world_points_conf", "confidence", "conf"])
+        selected_conf = point_conf if pointmap is not None and point_conf is not None else depth_conf
+        if selected_conf is not None:
+            raw_confidence = _resize_confidence(selected_conf, B, N, (out_h, out_w))
+            out["vggt_confidence_raw"] = raw_confidence
+            out["vggt_confidence"] = _expp1_confidence_to_probability(raw_confidence)
+        else:
+            out["vggt_confidence_raw"] = None
+            out["vggt_confidence"] = None
+        if depth_conf is not None:
+            raw_depth_conf = _resize_confidence(depth_conf, B, N, (out_h, out_w))
+            out["vggt_depth_confidence"] = _expp1_confidence_to_probability(raw_depth_conf)
+        if point_conf is not None:
+            raw_point_conf = _resize_confidence(point_conf, B, N, (out_h, out_w))
+            out["vggt_point_confidence"] = _expp1_confidence_to_probability(raw_point_conf)
         pose = _first_present(predictions, ["pose_enc", "camera", "camera_pose"])
         if pose is not None and self.pose_decoder is not None:
             extrinsic, intrinsic = self.pose_decoder(pose, images.shape[-2:])
@@ -194,7 +208,7 @@ class VGGTGeometryWrapper(nn.Module):
                 raise FileNotFoundError(f"VGGT checkpoint not found: {checkpoint}")
             state = torch.load(ckpt_path, map_location="cpu")
             state = _extract_state_dict(state)
-            model.load_state_dict(state, strict=False)
+            model.load_state_dict(state, strict=True)
         return model, pose_encoding_to_extri_intri
 
 
@@ -263,6 +277,20 @@ def _resize_confidence(conf: torch.Tensor, B: int, N: int, output_size: tuple[in
     return resized[:, :, 0] if resized is not None else conf[:, :, 0]
 
 
+def _expp1_confidence_to_probability(confidence: torch.Tensor) -> torch.Tensor:
+    """Map VGGT's ``1 + exp(raw)`` confidence to a bounded reliability.
+
+    The inverse relationship ``1 - 1 / confidence`` equals ``sigmoid(raw)``
+    and preserves confidence ordering.  Directly clamping expp1 values to
+    ``[0,1]`` makes every finite prediction equal to one and removes all
+    uncertainty information.
+    """
+    finite = torch.nan_to_num(confidence.float(), nan=1.0, posinf=1e6, neginf=1.0)
+    finite = finite.clamp_min(1.0)
+    probability = 1.0 - finite.reciprocal()
+    return probability.to(dtype=confidence.dtype).clamp(0.0, 1.0)
+
+
 def _tokens_to_spatial_features(tokens: torch.Tensor, model_size: tuple[int, int]) -> Optional[torch.Tensor]:
     if tokens.ndim != 4:
         return None
@@ -313,4 +341,4 @@ def _load_vggt_pretrained_fallback(model: nn.Module, pretrained_name: str) -> No
                 "Use --vggt_pretrained facebook/VGGT-1B or --vggt_checkpoint /path/to/model.pt."
             )
         state = torch.load(path, map_location="cpu")
-    model.load_state_dict(_extract_state_dict(state), strict=False)
+    model.load_state_dict(_extract_state_dict(state), strict=True)

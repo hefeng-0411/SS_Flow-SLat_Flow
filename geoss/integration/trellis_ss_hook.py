@@ -115,10 +115,14 @@ def install_trellis_ss_hook(base_model: nn.Module, velocity_adapter: Optional[SS
 
 def _ss_grid_xyz(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     B, _, D, H, W = x.shape
+    # Dense SS tokens correspond to voxel centers, not cube endpoints.
+    z = (torch.arange(D, device=x.device, dtype=dtype) + 0.5) / D * 2.0 - 1.0
+    y = (torch.arange(H, device=x.device, dtype=dtype) + 0.5) / H * 2.0 - 1.0
+    x_coord = (torch.arange(W, device=x.device, dtype=dtype) + 0.5) / W * 2.0 - 1.0
     zz, yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, D, device=x.device, dtype=dtype),
-        torch.linspace(-1, 1, H, device=x.device, dtype=dtype),
-        torch.linspace(-1, 1, W, device=x.device, dtype=dtype),
+        z,
+        y,
+        x_coord,
         indexing="ij",
     )
     xyz = torch.stack([xx, yy, zz], dim=-1).reshape(1, D * H * W, 3)

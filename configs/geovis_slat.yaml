@@ -9,6 +9,9 @@
     "trust_region": 0.15,
     "beta_mode": "cosine",
     "beta_strength": 1.0,
+    "fusion_mode": "aligned",
+    "confidence_floor": 0.05,
+    "factorized_control": true,
     "use_geovis_slat": true
   },
   "flow": {
@@ -26,6 +29,8 @@
     "freeze_vggt": true,
     "freeze_trellis_slat_flow": true,
     "freeze_decoder": true,
+    "multiview_teacher": true,
+    "factorized_control_weight": 0.2,
     "datasets": ["meshfleet_trellis", "objaverse_cars", "srn_cars"]
   },
   "ablation": {

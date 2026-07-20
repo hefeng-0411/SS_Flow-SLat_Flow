@@ -92,23 +92,30 @@ def parse_objaverse_camera(
     if assume_opengl:
         c2w = opengl_to_opencv(c2w, input_is_c2w=True)
 
+    source_h, source_w = _source_image_size(data, image_size)
     h, w = _image_size_from_data(data, image_size)
+    scale_x = float(w) / max(float(source_w), 1.0)
+    scale_y = float(h) / max(float(source_h), 1.0)
     if "K" in data:
         K = torch.tensor(data["K"], dtype=torch.float32).view(3, 3)
+        K = _rescale_intrinsics(K, scale_x, scale_y, h, w)
     elif "intrinsics" in data:
         K = torch.tensor(data["intrinsics"], dtype=torch.float32).view(3, 3)
+        K = _rescale_intrinsics(K, scale_x, scale_y, h, w)
     else:
         angle_x = data.get("camera_angle_x") or data.get("fov_x")
         if angle_x is None and "fl_x" in data:
-            fx = float(data["fl_x"])
-            fy = float(data.get("fl_y", fx))
+            fx_source = float(data["fl_x"])
+            fy_source = float(data.get("fl_y", fx_source))
+            fx = fx_source * scale_x
+            fy = fy_source * scale_y
         elif angle_x is not None:
             fx = 0.5 * w / math.tan(0.5 * float(angle_x))
             fy = fx
         else:
             fx = fy = float(data.get("focal_length", max(h, w)))
-        cx = float(data.get("cx", w / 2.0))
-        cy = float(data.get("cy", h / 2.0))
+        cx = float(data["cx"]) * scale_x if "cx" in data else w / 2.0
+        cy = float(data["cy"]) * scale_y if "cy" in data else h / 2.0
         K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32)
     return c2w, K
 
@@ -165,3 +172,27 @@ def _image_size_from_data(data: Dict[str, Any], fallback: Optional[Tuple[int, in
     if h is None or w is None:
         raise ValueError("image_size is required when camera json lacks width/height")
     return int(h), int(w)
+
+
+def _source_image_size(data: Dict[str, Any], fallback: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    h = data.get("h") or data.get("height") or data.get("H")
+    w = data.get("w") or data.get("width") or data.get("W")
+    if h is not None and w is not None:
+        return int(h), int(w)
+    if fallback is None:
+        raise ValueError("image_size is required when camera json lacks width/height")
+    return int(fallback[0]), int(fallback[1])
+
+
+def _rescale_intrinsics(K: torch.Tensor, scale_x: float, scale_y: float, h: int, w: int) -> torch.Tensor:
+    K = K.clone()
+    # Some preprocessors serialize normalized intrinsics. Detect this before
+    # applying source-pixel resizing.
+    if float(K[:2].abs().max()) <= 2.0:
+        K[0, :] *= float(w)
+        K[1, :] *= float(h)
+    else:
+        K[0, :] *= scale_x
+        K[1, :] *= scale_y
+    K[2] = torch.tensor([0.0, 0.0, 1.0], dtype=K.dtype, device=K.device)
+    return K

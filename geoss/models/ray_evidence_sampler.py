@@ -17,11 +17,13 @@ class RayEvidenceSampler(nn.Module):
         evidence_dim: int = 128,
         depth_near_threshold: float = 0.035,
         depth_free_margin: float = 0.02,
+        geo_to_camera_scale: float = 0.5,
     ) -> None:
         super().__init__()
         self.evidence_dim = evidence_dim
         self.depth_near_threshold = depth_near_threshold
         self.depth_free_margin = depth_free_margin
+        self.geo_to_camera_scale = float(geo_to_camera_scale)
         self.evidence_mlp = nn.Sequential(
             nn.Linear(12, evidence_dim),
             nn.SiLU(),
@@ -58,7 +60,11 @@ class RayEvidenceSampler(nn.Module):
         if depth_source is not None:
             depth_source = _depth_to_b_n_1_h_w(depth_source, B, N)
 
-        flat_points = anchor_xyz[:, None].expand(B, N, M, 3).reshape(B * N, M, 3)
+        # GeoSS occupancy supervision is normalized to [-1,1], whereas
+        # MeshFleet cameras and TRELLIS decoded assets use [-0.5,0.5].
+        # Projection/depth comparisons must happen in the latter world frame.
+        anchor_world = anchor_xyz * self.geo_to_camera_scale
+        flat_points = anchor_world[:, None].expand(B, N, M, 3).reshape(B * N, M, 3)
         flat_K = K.reshape(B * N, 3, 3)
         flat_w2c = w2c.reshape(B * N, 4, 4)
         proj = project_points(flat_points, flat_K, flat_w2c)
@@ -150,6 +156,8 @@ class RayEvidenceSampler(nn.Module):
                 "occupied_geometry": occ_geom.permute(0, 2, 1, 3).float().contiguous(),
                 "free_geometry": free_geom.permute(0, 2, 1, 3).float().contiguous(),
                 "feature_samples": feature_samples,
+                "anchor_world": anchor_world,
+                "geo_to_camera_scale": torch.tensor(self.geo_to_camera_scale, device=anchor_xyz.device),
             },
         }
         assert out["view_tokens"].shape == (B, M, N, self.evidence_dim)

@@ -25,3 +25,29 @@ def test_geometry_alignment_outputs_canonical_tensors():
     assert out["aligned_pointmap"].shape == pointmap.shape
     assert out["aligned_depth"].shape == depth.shape
     assert out["alignment_confidence"].min() >= 0
+
+
+def test_geometry_alignment_uses_camera_center_sim3():
+    B, N, H, W = 1, 4, 3, 3
+    target_centers = torch.tensor(
+        [[[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [-2.0, 0.0, 0.0], [0.0, -2.0, 0.0]]]
+    )
+    source_centers = (target_centers - torch.tensor([[[0.5, -0.25, 1.0]]])) / 2.0
+    target_c2w = torch.eye(4).view(1, 1, 4, 4).repeat(B, N, 1, 1)
+    source_c2w = target_c2w.clone()
+    target_c2w[..., :3, 3] = target_centers
+    source_c2w[..., :3, 3] = source_centers
+    source_points = torch.randn(B, N, 3, H, W) * 0.1
+    K = torch.eye(3).view(1, 1, 3, 3).expand(B, N, 3, 3)
+    out = GeometryAlignment()(
+        vggt_depth=torch.ones(B, N, 1, H, W),
+        vggt_pointmap=source_points,
+        K=K,
+        c2w=target_c2w,
+        w2c=torch.linalg.inv(target_c2w),
+        masks=torch.ones(B, N, 1, H, W),
+        vggt_camera={"c2w": source_c2w, "w2c": torch.linalg.inv(source_c2w), "K": K},
+    )
+    assert bool(out["camera_alignment_valid"].item())
+    assert torch.allclose(out["sim3_scale"], torch.tensor([2.0]), atol=1e-4)
+    assert out["alignment_residual"].item() < 1e-4

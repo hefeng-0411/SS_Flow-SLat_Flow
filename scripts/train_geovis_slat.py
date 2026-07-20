@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import inspect
 import json
 import os
 from itertools import cycle
@@ -19,6 +20,7 @@ from geoss.datasets.objaverse_cars_rendered_dataset import ObjaverseCarsRendered
 from geoss.datasets.srn_cars_dataset import SRNCarsDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset, make_dry_run_batch
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
+from geoss.geometry.alignment import align_vggt_batch
 from geoss.slat.integration.ss_slat_context import build_ss_slat_context
 from geoss.slat.losses.appearance_feature_loss import appearance_feature_loss
 from geoss.slat.losses.slat_flow_loss import slat_flow_matching_loss
@@ -26,7 +28,10 @@ from geoss.slat.losses.slat_prior_preservation_loss import slat_prior_preservati
 from geoss.slat.losses.slat_velocity_loss import slat_velocity_regularization_loss
 from geoss.slat.losses.view_consistency_loss import view_consistency_loss
 from geoss.slat.losses.visibility_confidence_loss import visibility_confidence_loss
+from geoss.slat.losses.factorized_control_loss import factorized_control_loss
+from geoss.slat.losses.decoded_asset_loss import DecodedAssetSupervisor
 from geoss.slat.models.geovis_slat_adapter import GeoVisSLATAdapter
+from geoss.slat.utils.normalization import SLAT_TENSOR_CONTRACT_VERSION, normalize_slat
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
 from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
@@ -64,6 +69,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
     trellis_pipeline = _load_trellis_pipeline(args, device, ctx)
+    decoded_supervisor = DecodedAssetSupervisor(trellis_pipeline, cfg.get("decoded_supervision"))
     vggt_geometry = _load_vggt_geometry(args, device, ctx)
     model_cfg = dict(cfg.get("model", {}))
     actual_slat_dim = int(trellis_pipeline.models["slat_flow_model"].in_channels)
@@ -79,8 +85,18 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     resume_state = None
     if args.resume and Path(args.resume).exists():
         resume_state = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(resume_state.get("model", resume_state), strict=False)
+        _validate_checkpoint_tensor_contract(resume_state, args.resume)
+        _validate_checkpoint_model_config(resume_state, model_cfg, context="Resume")
+        model.load_state_dict(resume_state.get("model", resume_state), strict=True)
         start_step = int(resume_state.get("step", 0))
+    elif args.init_checkpoint:
+        init_path = Path(args.init_checkpoint)
+        if not init_path.is_file():
+            raise FileNotFoundError(f"SLAT initialization checkpoint not found: {init_path}")
+        init_state = torch.load(init_path, map_location="cpu")
+        _validate_checkpoint_tensor_contract(init_state, init_path)
+        _validate_checkpoint_model_config(init_state, model_cfg, context="Initialization")
+        model.load_state_dict(init_state.get("model", init_state), strict=True)
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     # A800/H100-class GPUs support BF16 natively.  Its wider exponent range
@@ -157,10 +173,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                         out, batch, raw_residual_weight=args.raw_residual_weight,
                         effective_residual_weight=args.effective_residual_weight,
                     )
+                    terms["decoded_asset"] = decoded_supervisor(out, batch, step)
                     loss = (
                         terms["slat_flow"]["loss"] + 0.25 * terms["view"]["loss"]
                         + 0.25 * terms["appearance"]["loss"] + 0.2 * terms["visibility_confidence"]["loss"]
+                        + float(cfg.get("training", {}).get("factorized_control_weight", 0.2)) * terms["factorized_control"]["loss"]
                         + args.velocity_weight * terms["velocity"]["loss"] + args.prior_weight * terms["prior"]["loss"]
+                        + terms["decoded_asset"]["loss"]
                     )
                 if not torch.isfinite(loss).all().item():
                     raise FloatingPointError("Stage 3 loss became NaN/Inf before backward.")
@@ -234,8 +253,14 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         if ctx.is_main and args.visualize_every > 0 and step % args.visualize_every == 0:
             write_outputs(out_dir, out, last)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
-        if ctx.is_main and (should_fault_save or step % args.save_every == 0 or step == end_step):
+        periodic_save = args.save_every > 0 and step % args.save_every == 0
+        if ctx.is_main and (should_fault_save or periodic_save or step == end_step):
             _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
+        if ctx.is_main and periodic_save:
+            _save_slat_checkpoint(
+                out_dir / f"geovis_slat_adapter_step_{step:08d}.pt",
+                model, opt, step, cfg, early_stopper, early_status,
+            )
         if sync_should_stop(early_status.should_stop, device):
             if ctx.is_main:
                 _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
@@ -273,6 +298,14 @@ def compute_losses(
         # zero preservation pressure instead of preserving the placeholder base.
         joint_confidence = torch.where(base_valid_mask.bool(), joint_confidence, torch.ones_like(joint_confidence))
     base_invalid_ratio = batch.get("v_slat_base_invalid_ratio", torch.zeros((), device=out["v_slat_geo"].device))
+    token_valid_mask = batch.get("slat_token_valid_mask")
+    factorized = factorized_control_loss(
+        out["correction_demand"],
+        out["residual_variance"],
+        effective_delta,
+        target_residual,
+        token_mask=supervision_mask,
+    )
     return {
         "slat_flow": {
             "loss": flow_loss,
@@ -281,16 +314,20 @@ def compute_losses(
             "effective_residual_mse": effective_flow["loss"],
         },
         "base_velocity": {"invalid_ratio": base_invalid_ratio.detach()},
-        "view": view_consistency_loss(out["sampled_features"], out["visibility"]),
-        "appearance": appearance_feature_loss(out["slat_cond_tokens"], out["sampled_features"], out["visibility"], out["view_weights"]),
+        "view": view_consistency_loss(out["sampled_features"], out["visibility"], token_valid_mask),
+        "appearance": appearance_feature_loss(
+            out["slat_cond_tokens"], out["sampled_features"], out["visibility"], out["view_weights"], token_valid_mask
+        ),
         "visibility_confidence": visibility_confidence_loss(
             out["slat_confidence"],
             out["visibility"],
             out["depth_residual"],
             appearance_conflict=out["appearance_conflict"],
             occlusion_score=out["occlusion_score"],
+            token_valid_mask=token_valid_mask,
         ),
-        "velocity": slat_velocity_regularization_loss(out["delta_v_slat"], batch["timestep"]),
+        "factorized_control": factorized,
+        "velocity": slat_velocity_regularization_loss(out["delta_v_slat"], batch["timestep"], token_valid_mask),
         "prior": slat_prior_preservation_loss(out["v_slat_geo"], batch["v_slat_base"], joint_confidence),
     }
 
@@ -313,6 +350,9 @@ def summarize(out: dict, terms: dict, mode: str) -> dict:
         "slat_base_invalid_ratio": float(terms["base_velocity"]["invalid_ratio"].detach().cpu()),
         "loss_prior": float(terms["prior"]["loss"].detach().cpu()),
         "loss_velocity": float(terms["velocity"]["loss"].detach().cpu()),
+        "loss_decoded_asset": float(terms["decoded_asset"]["loss"].detach().cpu()) if "decoded_asset" in terms else 0.0,
+        "loss_decoded_render": float(terms["decoded_asset"].get("render_loss", terms["decoded_asset"]["loss"]).detach().cpu()) if "decoded_asset" in terms else 0.0,
+        "loss_decoded_geometry": float(terms["decoded_asset"].get("geometry_loss", terms["decoded_asset"]["loss"]).detach().cpu()) if "decoded_asset" in terms else 0.0,
     }
 
 
@@ -442,18 +482,24 @@ def prepare_batch(
         # Refresh frozen VGGT evidence from the exact camera views used by this
         # batch; only the adapter remains trainable and no mock context leaks in.
         vggt_context = vggt_geometry(batch["images"])
-    for key in ("vggt_features", "vggt_depth", "vggt_pointmap", "vggt_confidence"):
+    for key in ("vggt_features", "vggt_depth", "vggt_pointmap", "vggt_confidence", "vggt_camera"):
         value = vggt_context.get(key)
-        if isinstance(value, torch.Tensor):
+        if isinstance(value, (torch.Tensor, dict)):
             batch[key] = value
+    batch = align_vggt_batch(batch)
     model_cfg = cfg.get("model", {})
     slat_dim = int(model_cfg.get("slat_dim", 8))
     resolution = int(model_cfg.get("resolution", 64))
     if "trellis_slat_feats" in batch and "trellis_slat_indices" in batch:
-        feats, indices = _pad_latents(batch["trellis_slat_feats"], batch["trellis_slat_indices"], args.active_tokens, device)
-        x0 = feats[..., :slat_dim]
-        if x0.shape[-1] < slat_dim:
-            x0 = torch.cat([x0, x0.new_zeros(*x0.shape[:-1], slat_dim - x0.shape[-1])], dim=-1)
+        feats, indices, token_valid_mask = _pad_latents(
+            batch["trellis_slat_feats"], batch["trellis_slat_indices"], args.active_tokens, device
+        )
+        x0_raw = feats[..., :slat_dim]
+        if x0_raw.shape[-1] < slat_dim:
+            x0_raw = torch.cat([x0_raw, x0_raw.new_zeros(*x0_raw.shape[:-1], slat_dim - x0_raw.shape[-1])], dim=-1)
+        if trellis_pipeline is None:
+            raise RuntimeError("Real SLAT training requires a TRELLIS pipeline with its published latent normalization.")
+        x0 = normalize_slat(x0_raw, trellis_pipeline.slat_normalization)
         source = "trellis_native_slat_latents"
     else:
         raise KeyError("real_train requires trellis_slat_feats and trellis_slat_indices; synthetic SLAT latents are only allowed in --dry_run.")
@@ -465,20 +511,40 @@ def prepare_batch(
     x_t = (1 - t.view(B, 1, 1)) * x0 + (sigma_min + (1 - sigma_min) * t.view(B, 1, 1)) * noise
     batch.update(context)
     batch["slat_latent_tokens"] = x_t
+    batch["slat_clean_tokens"] = x0
+    batch["slat_raw_tokens"] = x0_raw
+    batch["slat_indices"] = indices
+    batch["flow_sigma_min"] = sigma_min
     batch["target_velocity"] = (1 - sigma_min) * noise - x0
     base = batch.get("trellis_slat_base_velocity")
     if base is None:
-        base = _compute_trellis_slat_base_velocity(batch, x_t, indices, t, trellis_pipeline, device)
+        base = _compute_trellis_slat_base_velocity(
+            batch, x_t, indices, token_valid_mask, t, trellis_pipeline, device,
+            use_multiview=bool(cfg.get("training", {}).get("multiview_teacher", True)),
+        )
     base, base_valid_mask, base_invalid_ratio = _sanitize_slat_base_velocity(base, expected_shape=x_t.shape, device=device, dtype=x_t.dtype)
     batch["v_slat_base"] = base
+    batch["slat_token_valid_mask"] = token_valid_mask
     batch["v_slat_base_valid_mask"] = base_valid_mask
     batch["v_slat_base_invalid_ratio"] = base_invalid_ratio
+    sigma = sigma_min + (1.0 - sigma_min) * t.view(B, 1, 1)
+    base_reference = ((1.0 - sigma_min) * x_t - sigma * base).detach()
+    # Match test time: the evidence aggregator receives a prediction from the
+    # frozen TRELLIS prior, never the clean target latent. Invalid teacher rows
+    # retain the observable noisy state and are excluded from teacher losses.
+    batch["slat_reference_tokens"] = torch.where(
+        base_valid_mask.bool(), base_reference, x_t.detach()
+    )
     batch["target_residual"] = (batch["target_velocity"] - batch["v_slat_base"]).detach()
     has_gt = batch.get("has_gt", batch.get("gt_available", True))
     has_gt = torch.as_tensor(has_gt, device=device, dtype=torch.float32).reshape(-1, 1, 1)
     if has_gt.shape[0] == 1 and B > 1:
         has_gt = has_gt.expand(B, -1, -1)
-    batch["slat_supervision_mask"] = has_gt.expand(B, x_t.shape[1], 1) * torch.isfinite(batch["target_residual"]).all(dim=-1, keepdim=True).float()
+    batch["slat_supervision_mask"] = (
+        has_gt.expand(B, x_t.shape[1], 1)
+        * torch.isfinite(batch["target_residual"]).all(dim=-1, keepdim=True).float()
+        * token_valid_mask
+    )
     batch["timestep"] = t
     batch["slat_target_source"] = source
     return batch
@@ -533,6 +599,8 @@ def build_real_loader(args: argparse.Namespace, ctx):
                 image_size=args.image_size,
                 slat_latent_model=args.meshfleet_slat_latent_model,
                 require_slat_latents=True,
+                require_voxels=True,
+                uid_manifest=args.train_manifest,
             )
         )
     if args.srn_root and Path(args.srn_root).exists():
@@ -548,29 +616,36 @@ def build_real_loader(args: argparse.Namespace, ctx):
 def _pad_latents(feats, indices, limit: int, device: torch.device):
     if isinstance(feats, list):
         B = len(feats)
-        L = min(limit, max(f.shape[0] for f in feats))
+        max_length = max(f.shape[0] for f in feats)
+        L = min(limit, max_length) if limit > 0 else max_length
         C = feats[0].shape[-1]
         out_feats = torch.zeros(B, L, C, device=device)
         out_idx = torch.zeros(B, L, 3, dtype=torch.long, device=device)
+        valid = torch.zeros(B, L, 1, dtype=torch.float32, device=device)
         for b, (f, idx) in enumerate(zip(feats, indices)):
             take = min(L, f.shape[0])
             out_feats[b, :take] = f[:take].to(device)
             out_idx[b, :take] = idx[:take].to(device)
-        return out_feats, out_idx
-    return feats[:, :limit].to(device), indices[:, :limit].to(device)
+            valid[b, :take] = 1.0
+        return out_feats, out_idx, valid
+    length = min(limit, feats.shape[1]) if limit > 0 else feats.shape[1]
+    valid = torch.ones(feats.shape[0], length, 1, dtype=torch.float32, device=device)
+    return feats[:, :length].to(device), indices[:, :length].to(device), valid
 
 
 def _pad_indices(indices, limit: int, device: torch.device):
     if isinstance(indices, list):
         B = len(indices)
-        L = min(limit, max(max(1, idx.shape[0]) for idx in indices))
+        max_length = max(max(1, idx.shape[0]) for idx in indices)
+        L = min(limit, max_length) if limit > 0 else max_length
         out = torch.zeros(B, L, 3, dtype=torch.long, device=device)
         for b, idx in enumerate(indices):
             take = min(L, idx.shape[0])
             if take:
                 out[b, :take] = idx[:take].to(device)
         return out
-    return indices[:, :limit].to(device)
+    length = min(limit, indices.shape[1]) if limit > 0 else indices.shape[1]
+    return indices[:, :length].to(device)
 
 
 def write_outputs(out_dir: Path, out: dict, summary: dict) -> None:
@@ -599,6 +674,15 @@ def _save_slat_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, ea
         optimizer=optimizer.state_dict(),
         step=step,
         config=cfg,
+        tensor_contract={
+            "version": SLAT_TENSOR_CONTRACT_VERSION,
+            "flow_state": "trellis_normalized_slat",
+            "decoder_state": "trellis_raw_vae_slat",
+            "control_variables": ["evidence_reliability", "correction_demand", "residual_variance"],
+            "teacher_velocity": "multiview_cfg_matched",
+            "sampler_correction": "cfg_invariant_unit_residual",
+            "decoded_supervision": bool(cfg.get("decoded_supervision", {}).get("enabled", False)),
+        },
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
     )
@@ -612,13 +696,38 @@ def _make_grad_scaler(*, enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _validate_checkpoint_tensor_contract(state: dict, path: str | Path) -> None:
+    contract = state.get("tensor_contract") if isinstance(state, dict) else None
+    version = contract.get("version") if isinstance(contract, dict) else None
+    if version != SLAT_TENSOR_CONTRACT_VERSION:
+        raise RuntimeError(
+            f"SLAT checkpoint {path} has tensor contract {version!r}; "
+            f"expected {SLAT_TENSOR_CONTRACT_VERSION!r}. Retrain instead of partially loading an incompatible model."
+        )
+
+
+def _validate_checkpoint_model_config(state: dict, model_cfg: dict, *, context: str) -> None:
+    checkpoint_cfg = state.get("config", {}).get("model", {}) if isinstance(state, dict) else {}
+    keys = (
+        "slat_dim", "resolution", "evidence_dim", "hidden_dim", "feature_dim", "num_heads",
+        "fusion_mode", "confidence_floor", "trust_region", "beta_mode", "beta_strength",
+        "factorized_control", "use_geovis_slat",
+    )
+    for key in keys:
+        if key in checkpoint_cfg and key in model_cfg and checkpoint_cfg[key] != model_cfg[key]:
+            raise RuntimeError(
+                f"{context} model mismatch for {key}: checkpoint={checkpoint_cfg[key]!r}, "
+                f"config={model_cfg[key]!r}"
+            )
+
+
 def main() -> None:
     parser = add_common_args(argparse.ArgumentParser())
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_views", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=64)
-    parser.add_argument("--active_tokens", type=int, default=512)
+    parser.add_argument("--active_tokens", type=int, default=0, help="Maximum SLAT tokens per object; 0 keeps every active voxel.")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--velocity_weight", type=float, default=1e-3)
@@ -629,8 +738,10 @@ def main() -> None:
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--init_checkpoint", type=str, default=None, help="Weights-only initialization; optimizer and step restart from zero.")
     parser.add_argument("--meshfleet_root", type=str, default=None)
     parser.add_argument("--meshfleet_split", type=str, default="train")
+    parser.add_argument("--train_manifest", type=str, default=None, help="UID manifest generated by inspect_meshfleet_dataset.py.")
     parser.add_argument("--meshfleet_category", type=str, default=None)
     parser.add_argument("--meshfleet_slat_latent_model", type=str, default="dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16")
     parser.add_argument("--srn_root", type=str, default=None)
@@ -785,42 +896,148 @@ def _patch_torch_hub_for_local_dinov2(local_repo: Path) -> None:
 
 
 @torch.no_grad()
-def _compute_trellis_slat_base_velocity(batch: dict, x_t: torch.Tensor, indices: torch.Tensor, t: torch.Tensor, pipeline, device: torch.device) -> torch.Tensor:
+def _compute_trellis_slat_base_velocity(
+    batch: dict,
+    x_t: torch.Tensor,
+    indices: torch.Tensor,
+    token_valid_mask: torch.Tensor,
+    t: torch.Tensor,
+    pipeline,
+    device: torch.device,
+    *,
+    use_multiview: bool = True,
+) -> torch.Tensor:
     if pipeline is None:
         raise KeyError("real_train requires trellis_slat_base_velocity or a real TRELLIS pipeline to compute frozen SLAT base velocity.")
     from trellis.modules import sparse as sp
 
     B, L, C = x_t.shape
-    batch_ids = torch.arange(B, device=device).view(B, 1, 1).expand(B, L, 1)
-    coords = torch.cat([batch_ids, indices.long()], dim=-1).reshape(B * L, 4).int().contiguous()
-    sparse = sp.SparseTensor(feats=x_t.reshape(B * L, C).contiguous(), coords=coords)
-    cond = _real_slat_condition(batch, device, pipeline)
-    v_sparse = pipeline.models["slat_flow_model"](sparse, t * 1000.0, cond)
-    if not hasattr(v_sparse, "feats"):
-        raise TypeError("TRELLIS slat_flow_model must return a SparseTensor with feats.")
-    feats = v_sparse.feats
+    if token_valid_mask.shape != (B, L, 1):
+        raise ValueError(
+            f"token_valid_mask must be [B,L,1], got {tuple(token_valid_mask.shape)} for {tuple(x_t.shape)}"
+        )
+    valid = token_valid_mask.squeeze(-1).bool()
+    sparse_feats, sparse_coords = [], []
+    for batch_index in range(B):
+        selected = valid[batch_index]
+        if not selected.any():
+            raise RuntimeError(f"Object {batch_index} has no valid SLAT tokens.")
+        sparse_feats.append(x_t[batch_index, selected])
+        batch_column = torch.full(
+            (int(selected.sum()), 1), batch_index, device=device, dtype=indices.dtype
+        )
+        sparse_coords.append(torch.cat([batch_column, indices[batch_index, selected]], dim=-1))
+    coords = torch.cat(sparse_coords, dim=0).int().contiguous()
+    sparse = sp.SparseTensor(feats=torch.cat(sparse_feats, dim=0).contiguous(), coords=coords)
+    conditions = _real_slat_conditions(batch, device, pipeline)
+    if not use_multiview:
+        conditions = conditions[:1]
+    predictions = [pipeline.models["slat_flow_model"](sparse, t * 1000.0, cond) for cond in conditions]
+    if not predictions or any(not hasattr(item, "feats") for item in predictions):
+        raise TypeError("TRELLIS slat_flow_model must return SparseTensor predictions with feats.")
+    if any(not torch.equal(item.coords, predictions[0].coords) for item in predictions[1:]):
+        raise RuntimeError("TRELLIS multi-view teacher returned inconsistent sparse coordinate ordering.")
+    # Match the positive branch of inference-time MultiDiffusion: every view
+    # predicts a velocity for the same sparse state, then velocities are averaged.
+    positive_feats = torch.stack([item.feats for item in predictions], dim=0).mean(dim=0)
+    cfg_strength, cfg_interval = _trellis_slat_cfg_parameters(pipeline)
+    if cfg_strength != 0.0:
+        negative = pipeline.models["slat_flow_model"](
+            sparse, t * 1000.0, torch.zeros_like(conditions[0])
+        )
+        if not hasattr(negative, "feats") or not torch.equal(negative.coords, predictions[0].coords):
+            raise RuntimeError("TRELLIS negative CFG teacher changed the sparse coordinate contract.")
+        cfg_active = ((t >= cfg_interval[0]) & (t <= cfg_interval[1])).to(positive_feats.dtype)
+        per_row_strength = cfg_active[predictions[0].coords[:, 0].long()].unsqueeze(-1) * cfg_strength
+        feats = positive_feats + per_row_strength * (positive_feats - negative.feats)
+    else:
+        feats = positive_feats
     if feats.ndim != 2:
         raise ValueError(f"TRELLIS slat_flow_model feats must be [B*L,C], got {tuple(feats.shape)}")
-    if feats.shape[0] != B * L:
-        raise ValueError(f"TRELLIS slat_flow_model returned {feats.shape[0]} tokens, expected {B * L}.")
+    if feats.shape[0] != int(valid.sum()):
+        raise ValueError(
+            f"TRELLIS slat_flow_model returned {feats.shape[0]} tokens, expected {int(valid.sum())} valid tokens."
+        )
     if feats.shape[1] < C:
         raise ValueError(f"TRELLIS slat_flow_model returned {feats.shape[1]} channels, expected at least {C}.")
-    return feats[:, :C].reshape(B, L, C).to(device=device, dtype=x_t.dtype).detach()
+    return _repad_sparse_prediction(
+        feats[:, :C], predictions[0].coords, indices, valid, dtype=x_t.dtype
+    ).detach()
+
+
+def _trellis_slat_cfg_parameters(pipeline) -> tuple[float, tuple[float, float]]:
+    """Read the exact CFG defaults/overrides used by TRELLIS' configured sampler."""
+    parameters = inspect.signature(pipeline.slat_sampler.sample).parameters
+    if "cfg_strength" not in parameters:
+        return 0.0, (0.0, 1.0)
+    overrides = dict(getattr(pipeline, "slat_sampler_params", {}) or {})
+    strength = float(overrides.get("cfg_strength", parameters["cfg_strength"].default))
+    interval_default = parameters["cfg_interval"].default if "cfg_interval" in parameters else (0.0, 1.0)
+    interval = overrides.get("cfg_interval", interval_default)
+    if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+        raise ValueError(f"TRELLIS SLAT cfg_interval must have two values, got {interval!r}")
+    interval_pair = (float(interval[0]), float(interval[1]))
+    if strength <= -1.0 or not 0.0 <= interval_pair[0] <= interval_pair[1] <= 1.0:
+        raise ValueError(f"Invalid TRELLIS SLAT CFG contract: strength={strength}, interval={interval_pair}")
+    return strength, interval_pair
+
+
+def _repad_sparse_prediction(
+    feats: torch.Tensor,
+    coords: torch.Tensor,
+    target_indices: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Repad teacher output by exact coordinate identity, even if sparse ops reorder rows."""
+    B, L = valid.shape
+    out = feats.new_zeros(B, L, feats.shape[-1], dtype=dtype)
+    for batch_index in range(B):
+        target_positions = torch.nonzero(valid[batch_index], as_tuple=False).flatten()
+        target = target_indices[batch_index, target_positions].long()
+        source_rows = torch.nonzero(coords[:, 0].long() == batch_index, as_tuple=False).flatten()
+        source = coords[source_rows, 1:].long()
+        if source.shape[0] != target.shape[0]:
+            raise RuntimeError(
+                f"TRELLIS teacher changed sparse token count for object {batch_index}: "
+                f"input={target.shape[0]}, output={source.shape[0]}."
+            )
+        resolution = int(torch.cat([source, target], dim=0).max().item()) + 1
+        source_keys = source[:, 0] * resolution * resolution + source[:, 1] * resolution + source[:, 2]
+        target_keys = target[:, 0] * resolution * resolution + target[:, 1] * resolution + target[:, 2]
+        sorted_keys, order = source_keys.sort()
+        lookup = torch.searchsorted(sorted_keys, target_keys)
+        if (lookup >= sorted_keys.numel()).any() or not torch.equal(sorted_keys[lookup], target_keys):
+            raise RuntimeError(f"TRELLIS teacher changed sparse coordinates for object {batch_index}.")
+        out[batch_index, target_positions] = feats[source_rows[order[lookup]]].to(dtype=dtype)
+    return out
 
 
 @torch.no_grad()
-def _real_slat_condition(batch: dict, device: torch.device, pipeline) -> torch.Tensor:
+def _real_slat_conditions(batch: dict, device: torch.device, pipeline) -> list[torch.Tensor]:
     for key in ("trellis_cond", "trellis_cond_tokens", "image_cond", "cond"):
         value = batch.get(key)
         if isinstance(value, torch.Tensor):
-            return value.to(device=device, dtype=torch.float32)
+            return [value.to(device=device, dtype=torch.float32)]
+    images = batch.get("images")
+    if isinstance(images, torch.Tensor) and images.ndim == 5:
+        return [
+            pipeline.encode_image(
+                F.interpolate(
+                    images[:, view].to(device=device, dtype=torch.float32),
+                    size=(518, 518), mode="bicubic", align_corners=False, antialias=True,
+                )
+            )
+            for view in range(images.shape[1])
+        ]
     cond_image = batch.get("trellis_cond_image")
     if isinstance(cond_image, torch.Tensor):
-        return pipeline.encode_image(cond_image.to(device=device, dtype=torch.float32))
+        return [pipeline.encode_image(cond_image.to(device=device, dtype=torch.float32))]
     images = batch.get("images")
     if isinstance(images, torch.Tensor):
         first_view = F.interpolate(images[:, 0].to(device=device, dtype=torch.float32), size=(518, 518), mode="bilinear", align_corners=False)
-        return pipeline.encode_image(first_view)
+        return [pipeline.encode_image(first_view)]
     raise KeyError("real_train requires TRELLIS condition image/tokens to compute frozen SLAT base velocity.")
 
 

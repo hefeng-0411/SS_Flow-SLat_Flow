@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+
+from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
+from geoss.eval import render_metrics
+from geoss.integration.vggt_geometry_wrapper import _expp1_confidence_to_probability
+from geoss.io.asset_io import trellis_export_gaussian_to_internal
+from geoss.metrics.geometry_metrics import geometry_metrics
+from geoss.losses.render_losses import render_level_losses
+from geoss.renderers.gsplat_renderer import SH_C0, _gaussian_tensors
+from scripts.eval_geovis_slat import _camera_overlap_count
+from scripts.evaluate_meshfleet_sequence import _aggregate, _tag_sample_rows
+from scripts.infer_geovis_slat import _inference_only_batch
+from scripts.infer_sparse_ray_geoss_ss import _context_only_batch
+
+
+def test_windowed_ssim_identity_and_perturbation():
+    image = torch.rand(2, 3, 32, 32)
+    assert torch.allclose(render_metrics._ssim(image, image), torch.tensor(1.0), atol=1e-6)
+    shifted = (image + 0.2).clamp(0, 1)
+    assert render_metrics._ssim(image, shifted) < 1.0
+
+
+def test_render_metrics_use_true_lpips_for_masked_and_full(monkeypatch):
+    calls = []
+
+    def fake_lpips(pred, gt):
+        calls.append((pred.clone(), gt.clone()))
+        return (pred - gt).square().mean()
+
+    monkeypatch.setattr(render_metrics, "_lpips", fake_lpips)
+    pred = torch.zeros(1, 3, 16, 16)
+    gt = torch.ones_like(pred)
+    mask = torch.zeros(1, 1, 16, 16)
+    mask[:, :, 4:12, 4:12] = 1
+    metrics = render_metrics.image_render_metrics(pred, gt, mask, mask)
+    assert len(calls) == 2
+    assert metrics["LPIPS"] == pytest.approx(1.0)
+    assert metrics["masked_LPIPS"] == pytest.approx(0.25)
+    assert "foreground_L1" in metrics
+    assert "DINO_similarity" not in metrics
+    assert "multi_view_consistency" not in metrics
+
+
+def test_geometry_metrics_are_symmetric_and_thresholded():
+    points = torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    identical = geometry_metrics(points, points, threshold=0.01)
+    assert identical["Chamfer Distance"] == pytest.approx(0.0)
+    assert identical["F-score"] == pytest.approx(1.0)
+    shifted = geometry_metrics(points + 0.1, points, threshold=0.05)
+    assert shifted["Chamfer Distance"] == pytest.approx(0.1, abs=1e-5)
+    assert shifted["F-score"] == pytest.approx(0.0)
+
+
+def test_camera_overlap_is_explicit():
+    cond = torch.eye(4).repeat(2, 1, 1)
+    cond[1, 0, 3] = 1.0
+    heldout = torch.eye(4).repeat(2, 1, 1)
+    heldout[0, 1, 3] = 2.0
+    heldout[1, 0, 3] = 1.0
+    assert _camera_overlap_count(cond, heldout) == 1
+
+
+def test_dataset_explicit_heldout_set_and_background_compositing(tmp_path: Path):
+    split = tmp_path / "test"
+    uid = "object"
+    for render_set, rgba in (("renders", (255, 0, 0, 0)), ("renders_eval_70", (255, 0, 0, 0))):
+        folder = split / render_set / uid
+        folder.mkdir(parents=True)
+        Image.new("RGBA", (8, 8), rgba).save(folder / "000.png")
+        transforms = {
+            "frames": [
+                {
+                    "file_path": "000.png",
+                    "camera_angle_x": 0.7,
+                    "transform_matrix": np.eye(4).tolist(),
+                }
+            ]
+        }
+        (folder / "transforms.json").write_text(json.dumps(transforms), encoding="utf-8")
+    voxels = split / "voxels"
+    voxels.mkdir(parents=True)
+    (voxels / f"{uid}.ply").write_text(
+        "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n",
+        encoding="utf-8",
+    )
+    dataset = MeshFleetTrellisDataset(
+        tmp_path,
+        split="test",
+        render_set="renders_eval_70",
+        num_views=1,
+        image_size=8,
+        background_color=(1.0, 1.0, 1.0),
+        repeat_views_if_insufficient=False,
+    )
+    sample = dataset[0]
+    assert sample["metadata"]["render_set"] == "renders_eval_70"
+    assert torch.allclose(sample["images"], torch.ones_like(sample["images"]))
+    assert sample["masks"].max() == 0
+
+
+def test_dataset_does_not_substitute_failed_uid(tmp_path: Path):
+    split = tmp_path / "test"
+    for uid, has_image in (("a_bad", False), ("b_good", True)):
+        folder = split / "renders" / uid
+        folder.mkdir(parents=True)
+        if has_image:
+            Image.new("RGBA", (8, 8), (0, 0, 0, 255)).save(folder / "000.png")
+        transforms = {
+            "frames": [
+                {
+                    "file_path": "000.png",
+                    "camera_angle_x": 0.7,
+                    "transform_matrix": np.eye(4).tolist(),
+                }
+            ]
+        }
+        (folder / "transforms.json").write_text(json.dumps(transforms), encoding="utf-8")
+    voxels = split / "voxels"
+    voxels.mkdir(parents=True)
+    for uid in ("a_bad", "b_good"):
+        (voxels / f"{uid}.ply").write_text(
+            "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n",
+            encoding="utf-8",
+        )
+    dataset = MeshFleetTrellisDataset(tmp_path, split="test", num_views=1, image_size=8)
+    with pytest.raises(FileNotFoundError, match="a_bad"):
+        _ = dataset[0]
+    assert dataset[1]["uid"] == "b_good"
+
+
+def test_trellis_export_rotation_is_exactly_inverted():
+    root_half = 2.0 ** -0.5
+    exported = {
+        "xyz": torch.tensor([[0.0, 0.0, 1.0]]),
+        "rotation": torch.tensor([[root_half, root_half, 0.0, 0.0]]),
+    }
+    internal = trellis_export_gaussian_to_internal(exported)
+    assert torch.allclose(internal["xyz"], torch.tensor([[0.0, 1.0, 0.0]]), atol=1e-6)
+    assert torch.allclose(internal["rotation"].abs(), torch.tensor([[1.0, 0.0, 0.0, 0.0]]), atol=1e-6)
+
+
+def test_vggt_expp1_confidence_keeps_uncertainty_ordering():
+    raw_expp1 = torch.tensor([1.0, 1.2, 2.0, 11.0])
+    probability = _expp1_confidence_to_probability(raw_expp1)
+    assert torch.all(probability[1:] > probability[:-1])
+    assert torch.allclose(probability, torch.tensor([0.0, 1 / 6, 0.5, 10 / 11]), atol=1e-6)
+
+
+def test_inference_boundary_removes_all_dataset_3d_supervision():
+    batch = {
+        "images": torch.zeros(1, 2, 3, 8, 8),
+        "K": torch.eye(3).view(1, 1, 3, 3),
+        "gt_occ": torch.ones(1, 8, 8, 8),
+        "mesh_path": ["ground_truth.glb"],
+        "ss_latent_grid": torch.ones(1, 8, 2, 2, 2),
+        "ss_latent_tokens": torch.ones(1, 8, 8),
+        "trellis_slat_feats": torch.ones(1, 4, 64),
+        "trellis_slat_indices": torch.ones(1, 4, 4),
+    }
+    context = _context_only_batch(batch)
+    slat_context = _inference_only_batch(batch)
+    assert "images" in context and "K" in context
+    for key in ("gt_occ", "mesh_path", "ss_latent_grid", "ss_latent_tokens", "trellis_slat_feats", "trellis_slat_indices"):
+        assert key not in context
+        assert key not in slat_context
+
+
+def test_official_aggregate_excludes_invalid_protocol_rows():
+    rows = [
+        {"index": 0, "ablation": "method", "status": "ok", "asset_PSNR": 99.0, "asset_official_metrics": False, "population_manifested": True},
+        {
+            "index": 1,
+            "ablation": "method",
+            "status": "ok",
+            "asset_PSNR": 20.0,
+            "asset_SSIM": 0.8,
+            "asset_LPIPS": 0.2,
+            "asset_CD": 0.1,
+            "asset_F-score": 0.9,
+            "asset_official_metrics": True,
+            "population_manifested": True,
+        },
+    ]
+    summary = _aggregate(rows, expected_indices=[0, 1], expected_ablations=["method"])["by_ablation"]["method"]
+    assert summary["official_num_objects"] == 1
+    assert summary["official_complete"] is False
+    assert summary["official_metrics"]["PSNR"]["mean"] == pytest.approx(20.0)
+
+
+def test_unmanifested_population_cannot_become_official():
+    rows = _tag_sample_rows(
+        [{
+            "ablation": "method",
+            "status": "ok",
+            "asset_PSNR": 20.0,
+            "asset_SSIM": 0.8,
+            "asset_LPIPS": 0.2,
+            "asset_CD": 0.1,
+            "asset_F-score": 0.9,
+            "asset_official_metrics": True,
+        }],
+        index=7,
+        gpu=None,
+        uid="exact_uid",
+        population_manifested=False,
+    )
+    assert rows[0]["uid"] == "exact_uid"
+    summary = _aggregate(rows, expected_indices=[7], expected_ablations=["method"])["by_ablation"]["method"]
+    assert summary["official_num_objects"] == 0
+    assert summary["official_complete"] is False
+
+
+def test_trellis_dc_sh_is_not_mistaken_for_rgb():
+    coeff = torch.tensor([[1.0, 0.0, -1.0]])
+    gaussian = {
+        "xyz": torch.zeros(1, 3),
+        "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "scaling": torch.ones(1, 3) * 0.01,
+        "opacity": torch.ones(1, 1) * 0.5,
+        "features_dc": coeff[:, None],
+    }
+    *_, rgb = _gaussian_tensors(gaussian)
+    assert torch.allclose(rgb, 0.5 + SH_C0 * coeff)
+
+
+def test_explicit_gaussian_rgb_is_not_reinterpreted_as_sh():
+    expected = torch.tensor([[0.1, 0.4, 0.9]])
+    gaussian = {
+        "xyz": torch.zeros(1, 3),
+        "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "scaling": torch.ones(1, 3) * 0.01,
+        "opacity": torch.ones(1, 1) * 0.5,
+        "colors": expected,
+    }
+    *_, rgb = _gaussian_tensors(gaussian)
+    assert torch.equal(rgb, expected)
+
+
+def test_export_parameterization_metadata_overrides_unsafe_range_heuristics():
+    gaussian = {
+        "xyz": torch.zeros(1, 3),
+        "rotation": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "scaling": torch.full((1, 3), 0.2),
+        "scaling_parameterization": "log",
+        "opacity": torch.full((1, 1), 0.2),
+        "opacity_parameterization": "logit",
+        "colors": torch.full((1, 3), 0.5),
+    }
+    _, _, scales, opacities, _ = _gaussian_tensors(gaussian)
+    assert torch.allclose(scales, torch.full((1, 3), float(torch.exp(torch.tensor(0.2)))))
+    assert torch.allclose(opacities, torch.full((1,), float(torch.sigmoid(torch.tensor(0.2)))))
+
+
+def test_ssim_render_loss_has_a_gradient():
+    prediction = torch.full((1, 3, 16, 16), 0.3, requires_grad=True)
+    target = torch.full_like(prediction, 0.7)
+    loss = render_level_losses(prediction, target)["L_ssim"]
+    loss.backward()
+    assert prediction.grad is not None
+    assert prediction.grad.abs().sum() > 0
+
+
+def test_foreground_rgb_loss_is_normalized_and_differentiable():
+    prediction = torch.zeros(1, 3, 8, 8, requires_grad=True)
+    target = torch.ones_like(prediction)
+    mask = torch.zeros(1, 1, 8, 8)
+    mask[:, :, 2:6, 2:6] = 1
+    loss = render_level_losses(prediction, target, target_mask=mask, rendered_alpha=mask)["L_rgb_foreground"]
+    assert torch.allclose(loss, torch.tensor(1.0))
+    loss.backward()
+    assert prediction.grad is not None
+    assert prediction.grad[:, :, 2:6, 2:6].abs().sum() > 0

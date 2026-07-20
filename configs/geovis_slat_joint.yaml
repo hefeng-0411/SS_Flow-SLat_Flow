@@ -9,6 +9,8 @@
     "trust_region": 0.12,
     "beta_mode": "cosine",
     "beta_strength": 0.75,
+    "fusion_mode": "aligned",
+    "confidence_floor": 0.05,
     "use_geovis_slat": true
   },
   "flow": {

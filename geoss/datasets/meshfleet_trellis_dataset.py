@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import struct
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -63,10 +63,15 @@ class MeshFleetTrellisDataset(Dataset):
         feature_model: str = "dinov2_vitl14_reg",
         occ_resolution: int = 64,
         prefer_cond_render: bool = False,
+        render_set: Optional[str] = None,
+        background_color: Sequence[float] = (0.0, 0.0, 0.0),
+        repeat_views_if_insufficient: bool = True,
+        uid_manifest: Optional[str | Sequence[str]] = None,
         require_ss_latents: bool = False,
         require_slat_latents: bool = False,
         require_features: bool = False,
         require_voxels: bool = False,
+        strict_uid_manifest: bool = True,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -78,25 +83,64 @@ class MeshFleetTrellisDataset(Dataset):
         self.feature_model = feature_model
         self.occ_resolution = occ_resolution
         self.prefer_cond_render = prefer_cond_render
+        self.render_set = render_set
+        if render_set is not None and render_set not in {
+            "renders",
+            "renders_cond",
+            "renders_eval_70",
+            "renders_eval_90",
+        }:
+            raise ValueError(f"Unsupported MeshFleet render_set={render_set!r}.")
+        if len(background_color) != 3 or any(float(v) < 0.0 or float(v) > 1.0 for v in background_color):
+            raise ValueError("background_color must contain three values in [0, 1].")
+        self.background_color = tuple(float(v) for v in background_color)
+        self.repeat_views_if_insufficient = bool(repeat_views_if_insufficient)
         self.require_ss_latents = bool(require_ss_latents)
         self.require_slat_latents = bool(require_slat_latents)
         self.require_features = bool(require_features)
         self.require_voxels = bool(require_voxels)
+        self.strict_uid_manifest = bool(strict_uid_manifest)
+        self.uid_manifest = _load_uid_manifest(uid_manifest)
+        self.discovery_skips: List[Dict[str, str]] = []
         self.samples = self._discover_samples()
+        if self.uid_manifest is not None:
+            allowed = set(self.uid_manifest)
+            self.samples = [sample for sample in self.samples if sample["uid"] in allowed]
+            if self.strict_uid_manifest:
+                discovered = {sample["uid"] for sample in self.samples}
+                missing = [uid for uid in self.uid_manifest if uid not in discovered]
+                if missing:
+                    raise KeyError(
+                        f"UID manifest contains {len(missing)} object(s) unavailable under split={self.split!r} "
+                        f"after required-modality filtering: {missing[:10]}"
+                    )
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def index_for_uid(self, uid: str) -> int:
+        """Resolve an object by identity instead of a layout-dependent index."""
+        matches = [index for index, sample in enumerate(self.samples) if sample["uid"] == uid]
+        if not matches:
+            raise KeyError(f"MeshFleet uid={uid!r} is unavailable under split={self.split!r}.")
+        if len(matches) > 1:
+            raise ValueError(
+                f"MeshFleet uid={uid!r} occurs {len(matches)} times under split={self.split!r}; "
+                "UID selection is ambiguous across category layouts."
+            )
+        return matches[0]
+
+    def get_by_uid(self, uid: str) -> Dict:
+        return self[self.index_for_uid(uid)]
+
     def __getitem__(self, idx: int) -> Dict:
-        last_error: Optional[Exception] = None
-        for offset in range(max(1, len(self.samples))):
-            sample = self.samples[(idx + offset) % len(self.samples)]
-            try:
-                return self._load_sample(sample)
-            except FileNotFoundError as exc:
-                last_error = exc
-                continue
-        raise FileNotFoundError(f"No loadable MeshFleet sample found after scanning {len(self.samples)} samples. Last error: {last_error}")
+        # Never remap a failed object to a later UID. Silent substitution makes
+        # per-object metrics and train/test leakage audits invalid.
+        sample = self.samples[idx]
+        try:
+            return self._load_sample(sample)
+        except Exception as exc:
+            raise type(exc)(f"Failed to load MeshFleet uid={sample['uid']!r} at dataset index {idx}: {exc}") from exc
 
     def _load_sample(self, sample: Dict) -> Dict:
         uid = sample["uid"]
@@ -108,12 +152,16 @@ class MeshFleetTrellisDataset(Dataset):
         available = _available_render_frames(render_dir, frames)
         if not available:
             raise FileNotFoundError(f"No valid render images for uid={uid} in {render_dir}; all missing frames are skipped")
-        chosen = self._choose_frames(available, self.num_views)
+        chosen = self._choose_frames(
+            available,
+            self.num_views,
+            repeat_if_insufficient=self.repeat_views_if_insufficient,
+        )
         images, masks, K_list, c2w_list = [], [], [], []
         missing_view_count = len(frames) - len(available)
         for frame, image_path in chosen:
             image = Image.open(image_path).convert("RGBA")
-            rgb, mask = _rgba_to_rgb_mask(image, self.image_size)
+            rgb, mask = _rgba_to_rgb_mask(image, self.image_size, self.background_color)
             camera_data = {**{k: v for k, v in transforms.items() if k != "frames"}, **frame}
             c2w, K = parse_objaverse_camera(
                 camera_data,
@@ -146,6 +194,10 @@ class MeshFleetTrellisDataset(Dataset):
                 "layout_root": str(sample["layout_root"]),
                 "split_root": str(sample["split_root"]),
                 "render_dir": str(render_dir),
+                "render_set": render_dir.parent.name,
+                "background_color": list(self.background_color),
+                "selected_frame_paths": [str(path) for _, path in chosen],
+                "selected_frame_ids": [str(frame.get("file_path") or frame.get("image_path") or frame.get("filename")) for frame, _ in chosen],
                 "paths": {key: str(value) for key, value in sample["paths"].items() if value is not None},
                 "num_frames_total": len(frames),
                 "num_frames_available": len(available),
@@ -153,6 +205,7 @@ class MeshFleetTrellisDataset(Dataset):
                 "missing_frames_skipped": missing_view_count,
                 "num_views_requested": self.num_views,
                 "num_views_returned": len(chosen),
+                "uid_manifest_filtered": self.uid_manifest is not None,
             },
             # Keep GT availability explicit: an object such as test_000025 can
             # still train its appearance branch without inventing geometry GT.
@@ -190,9 +243,23 @@ class MeshFleetTrellisDataset(Dataset):
         for split_name, split_root in split_roots:
             dataset_roots = self._discover_dataset_roots(split_root)
             for category, cat_root, layout_name in dataset_roots:
-                for uid in _discover_uids(cat_root):
-                    render_dir = _select_render_dir(cat_root, uid, prefer_cond_render=self.prefer_cond_render)
+                discovered_uids = _discover_uids(cat_root)
+                if self.uid_manifest is not None:
+                    allowed = set(self.uid_manifest)
+                    discovered_uids = [uid for uid in discovered_uids if uid in allowed]
+                for uid in discovered_uids:
+                    render_dir = _select_render_dir(
+                        cat_root,
+                        uid,
+                        prefer_cond_render=self.prefer_cond_render,
+                        render_set=self.render_set,
+                    )
                     if render_dir is None:
+                        self.discovery_skips.append({"uid": uid, "reason": "missing selected render directory"})
+                        continue
+                    render_error = _render_dir_discovery_error(render_dir)
+                    if render_error is not None:
+                        self.discovery_skips.append({"uid": uid, "reason": render_error})
                         continue
                     paths = _meshfleet_uid_paths(
                         cat_root,
@@ -285,9 +352,18 @@ class MeshFleetTrellisDataset(Dataset):
         return roots
 
     @staticmethod
-    def _choose_frames(frames: List[Tuple[Dict, Path]], num_views: int) -> List[Tuple[Dict, Path]]:
+    def _choose_frames(
+        frames: List[Tuple[Dict, Path]],
+        num_views: int,
+        *,
+        repeat_if_insufficient: bool = True,
+    ) -> List[Tuple[Dict, Path]]:
         if len(frames) == 0:
             raise ValueError("Cannot choose frames from an empty list")
+        if num_views <= 0:
+            return list(frames)
+        if not repeat_if_insufficient:
+            num_views = min(num_views, len(frames))
         indices = torch.linspace(0, len(frames) - 1, num_views).round().long().tolist()
         return [frames[i] for i in indices]
 
@@ -323,10 +399,17 @@ def read_ply_xyz(path: str | Path) -> torch.Tensor:
     return torch.tensor(data, dtype=torch.float32)
 
 
-def _rgba_to_rgb_mask(image: Image.Image, image_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def _rgba_to_rgb_mask(
+    image: Image.Image,
+    image_size: int,
+    background_color: Sequence[float] = (0.0, 0.0, 0.0),
+) -> Tuple[torch.Tensor, torch.Tensor]:
     image = image.resize((image_size, image_size), Image.Resampling.BICUBIC)
     arr = np.array(image).astype("float32") / 255.0
-    rgb = torch.from_numpy(arr[..., :3]).permute(2, 0, 1).contiguous()
+    alpha_np = np.clip(arr[..., 3:4], 0.0, 1.0)
+    background = np.asarray(background_color, dtype=np.float32).reshape(1, 1, 3)
+    composite = arr[..., :3] * alpha_np + background * (1.0 - alpha_np)
+    rgb = torch.from_numpy(composite).permute(2, 0, 1).contiguous()
     alpha = torch.from_numpy(arr[..., 3:4]).permute(2, 0, 1).contiguous()
     return rgb, alpha.clamp(0, 1)
 
@@ -345,6 +428,24 @@ def _load_condition_image(cond_render_dir: Optional[Path], fallback_image_path: 
     image = Image.open(image_path).convert("RGB").resize((518, 518), Image.Resampling.BICUBIC)
     arr = np.array(image).astype("float32") / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _load_uid_manifest(value: Optional[str | Sequence[str]]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return [str(uid) for uid in value]
+    path = Path(value)
+    if not path.is_file():
+        raise FileNotFoundError(f"MeshFleet UID manifest not found: {path}")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        uids = payload.get("uids") if isinstance(payload, dict) else payload
+    else:
+        uids = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not isinstance(uids, list) or not all(isinstance(uid, str) for uid in uids):
+        raise ValueError(f"UID manifest must contain a string list, got {type(uids).__name__} in {path}")
+    return uids
 
 
 def _first_existing(paths: List[Optional[Path]]) -> Optional[Path]:
@@ -422,7 +523,15 @@ def _discover_uids(root: Path) -> List[str]:
     return sorted(uids)
 
 
-def _select_render_dir(root: Path, uid: str, *, prefer_cond_render: bool) -> Optional[Path]:
+def _select_render_dir(
+    root: Path,
+    uid: str,
+    *,
+    prefer_cond_render: bool,
+    render_set: Optional[str] = None,
+) -> Optional[Path]:
+    if render_set is not None:
+        return _first_existing([root / render_set / uid])
     ordered = ["renders_cond", "renders"] if prefer_cond_render else ["renders", "renders_cond"]
     return _first_existing([root / name / uid for name in ordered])
 
@@ -431,9 +540,36 @@ def _available_render_frames(render_dir: Path, frames: List[Dict]) -> List[Tuple
     available: List[Tuple[Dict, Path]] = []
     for frame in frames:
         image_path = _resolve_frame_image_path(render_dir, frame)
-        if image_path is not None:
+        if image_path is not None and _frame_has_valid_camera(frame):
             available.append((frame, image_path))
     return available
+
+
+def _frame_has_valid_camera(frame: Dict) -> bool:
+    matrix = frame.get("transform_matrix") or frame.get("camera_to_world") or frame.get("c2w")
+    if matrix is None:
+        return False
+    try:
+        array = np.asarray(matrix, dtype=np.float64)
+    except (TypeError, ValueError):
+        return False
+    return array.shape == (4, 4) and bool(np.isfinite(array).all())
+
+
+def _render_dir_discovery_error(render_dir: Path) -> Optional[str]:
+    transforms_path = render_dir / "transforms.json"
+    if not transforms_path.is_file():
+        return f"missing {transforms_path}"
+    try:
+        transforms = json.loads(transforms_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"invalid {transforms_path}: {exc}"
+    frames = transforms.get("frames") or []
+    if not frames:
+        return f"no frames in {transforms_path}"
+    if not _available_render_frames(render_dir, frames):
+        return f"no usable image/camera frame in {render_dir}"
+    return None
 
 
 def _resolve_frame_image_path(render_dir: Path, frame: Dict) -> Optional[Path]:
