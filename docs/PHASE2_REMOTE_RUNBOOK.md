@@ -135,6 +135,16 @@ If the decoder/rasterizer exceeds VRAM, reduce only per-GPU batch size first;
 preserve all active tokens and use gradient accumulation. Record every OOM and
 the resulting batch schedule.
 
+The launcher intentionally omits `expandable_segments` from
+`PYTORCH_CUDA_ALLOC_CONF`. Some PyTorch/CUDA builds print that the feature is
+unsupported and then fail with `!block->expandable_segment_ INTERNAL ASSERT`
+when VGGT and TRELLIS coexist. This allocator setting does not affect model
+mathematics. Stage 2 retains only TRELLIS' sparse-structure flow and DINO image
+encoder on GPU; Stage 3 retains SLAT flow plus DINO; Stage 4 additionally keeps
+the Gaussian decoder required for decoded supervision. These are the exact
+pretrained modules used by each objective—no token, view, precision, or loss is
+removed.
+
 ## 4. Validation protocol
 
 For every checkpoint, evaluate the complete validation manifest with the same

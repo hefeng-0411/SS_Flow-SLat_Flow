@@ -17,6 +17,7 @@ from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
 from geoss.integration.trellis_ss_hook import GeoSSTrellisSSWrapper, ss_grid_to_tokens, tokens_to_ss_grid
+from geoss.integration.trellis_residency import configure_trellis_training_residency
 from geoss.losses.prior_preservation_loss import prior_preservation_loss
 from geoss.losses.velocity_loss import velocity_regularization_loss
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
@@ -84,10 +85,22 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
     base, trellis_pipeline = _load_trellis_or_mock(args, cfg, allow_mock=False)
-    spconv_status = _force_spconv_algo(base, args.spconv_algo)
-    base = base.to(device)
     if trellis_pipeline is not None:
-        trellis_pipeline.to(device)
+        trellis_residency = configure_trellis_training_residency(
+            trellis_pipeline,
+            required_models=("sparse_structure_flow_model", "image_cond_model"),
+            device=device,
+        )
+        base = trellis_pipeline.models["sparse_structure_flow_model"]
+    else:
+        base = base.to(device)
+        trellis_residency = {
+            "policy": "direct_sparse_structure_flow_model",
+            "required_models": ["sparse_structure_flow_model"],
+            "removed_models": [],
+            "device": str(device),
+        }
+    spconv_status = _force_spconv_algo(base, args.spconv_algo)
     base.eval()
     for p in base.parameters():
         p.requires_grad_(False)
@@ -291,6 +304,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "global_batch_size": args.batch_size * ctx.world_size,
             "adapter_grad_norms": grad_norms,
             "spconv": spconv_status,
+            "trellis_residency": trellis_residency,
             "memory_start": memory_start,
             "memory": memory_end,
             "adaptive_batch": {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()},

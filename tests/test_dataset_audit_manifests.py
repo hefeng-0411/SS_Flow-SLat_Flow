@@ -55,6 +55,30 @@ def test_auditor_separates_strict_stage_and_evaluation_manifests(tmp_path: Path)
     assert summary["manifests_valid"] is True
     assert summary["invalid_reason_counts"]["missing:features"] == 2
 
+    profile_output = tmp_path / "profile"
+    profile_script = Path(__file__).resolve().parents[1] / "scripts" / "profile_meshfleet_distribution.py"
+    profile = subprocess.run(
+        [
+            sys.executable,
+            str(profile_script),
+            "--data_root",
+            str(root),
+            "--output_dir",
+            str(profile_output),
+            "--splits",
+            "train,test",
+            "--images_per_set",
+            "1",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert profile.returncode == 0, profile.stdout + profile.stderr
+    profile_summary = json.loads((profile_output / "summary.json").read_text(encoding="utf-8"))
+    assert profile_summary["objects"] == 5
+    assert profile_summary["preprocessing_models"]["latents"] == "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16"
+
 
 def _uids(path: Path) -> list[str]:
     return json.loads(path.read_text(encoding="utf-8"))["uids"]

@@ -20,6 +20,7 @@ from geoss.datasets.objaverse_cars_rendered_dataset import ObjaverseCarsRendered
 from geoss.datasets.srn_cars_dataset import SRNCarsDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset, make_dry_run_batch
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
+from geoss.integration.trellis_residency import configure_trellis_training_residency
 from geoss.geometry.alignment import align_vggt_batch
 from geoss.slat.integration.ss_slat_context import build_ss_slat_context
 from geoss.slat.losses.appearance_feature_loss import appearance_feature_loss
@@ -68,7 +69,11 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     device = ctx.device
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
-    trellis_pipeline = _load_trellis_pipeline(args, device, ctx)
+    decoded_config = cfg.get("decoded_supervision") if isinstance(cfg.get("decoded_supervision"), dict) else {}
+    required_trellis_models = ["slat_flow_model", "image_cond_model"]
+    if bool(decoded_config.get("enabled", False)):
+        required_trellis_models.append("slat_decoder_gs")
+    trellis_pipeline = _load_trellis_pipeline(args, device, ctx, required_models=required_trellis_models)
     decoded_supervisor = DecodedAssetSupervisor(trellis_pipeline, cfg.get("decoded_supervision"))
     vggt_geometry = _load_vggt_geometry(args, device, ctx)
     model_cfg = dict(cfg.get("model", {}))
@@ -243,6 +248,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["optimizer_step_skipped"] = bool(terms.get("optimizer_step_skipped", False))
         last["global_grad_norm"] = terms.get("global_grad_norm")
         last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
+        last["trellis_residency"] = getattr(trellis_pipeline, "training_residency", None)
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
@@ -770,7 +776,13 @@ def main() -> None:
         cleanup_distributed()
 
 
-def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device, ctx):
+def _load_trellis_pipeline(
+    args: argparse.Namespace,
+    device: torch.device,
+    ctx,
+    *,
+    required_models: list[str],
+):
     if args.trellis_root:
         sys.path.insert(0, args.trellis_root)
     if not args.trellis_model_path:
@@ -779,7 +791,7 @@ def _load_trellis_pipeline(args: argparse.Namespace, device: torch.device, ctx):
 
     if ctx.distributed and not ctx.is_main:
         dist.barrier()
-    pipeline = _load_trellis_pipeline_impl(args, device)
+    pipeline = _load_trellis_pipeline_impl(args, device, required_models=required_models)
     if ctx.distributed and ctx.is_main:
         dist.barrier()
     return pipeline
@@ -801,24 +813,20 @@ def _load_vggt_geometry(args: argparse.Namespace, device: torch.device, ctx) -> 
     return geometry
 
 
-def _load_trellis_pipeline_impl(args: argparse.Namespace, device: torch.device):
+def _load_trellis_pipeline_impl(
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    required_models: list[str],
+):
     from trellis.pipelines import TrellisImageTo3DPipeline
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained(args.trellis_model_path)
-    pipeline.to(device)
-    for name in ("slat_flow_model", "image_cond_model"):
-        if name not in pipeline.models or pipeline.models[name] is None:
-            raise RuntimeError(f"TRELLIS pipeline is missing {name}, required for real SLAT residual training.")
-    for model in pipeline.models.values():
-        if model is None:
-            continue
-        if hasattr(model, "eval"):
-            model.eval()
-        if hasattr(model, "parameters"):
-            for p in model.parameters():
-                p.requires_grad_(False)
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    pipeline.training_residency = configure_trellis_training_residency(
+        pipeline,
+        required_models=required_models,
+        device=device,
+    )
     return pipeline
 
 

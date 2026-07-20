@@ -168,23 +168,23 @@ def _write_flat_sample(split_root: Path, uid: str = "flat_uid") -> None:
     }
     (render_dir / "transforms.json").write_text(json.dumps(transforms), encoding="utf-8")
     voxel_dir = split_root / "voxels"
-    voxel_dir.mkdir(parents=True)
+    voxel_dir.mkdir(parents=True, exist_ok=True)
     (voxel_dir / f"{uid}.ply").write_text(
         "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n",
         encoding="utf-8",
     )
     ss_dir = split_root / "ss_latents" / "ss_enc_conv3d_16l8_fp16"
-    ss_dir.mkdir(parents=True)
+    ss_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(ss_dir / f"{uid}.npz", mean=np.zeros((8, 16, 16, 16), dtype=np.float32))
     slat_dir = split_root / "latents" / "dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16"
-    slat_dir.mkdir(parents=True)
+    slat_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         slat_dir / f"{uid}.npz",
         feats=np.zeros((4, 8), dtype=np.float32),
         coords=np.array([[1, 1, 1], [2, 2, 2], [3, 3, 3], [4, 4, 4]], dtype=np.uint8),
     )
     feat_dir = split_root / "features" / "dinov2_vitl14_reg"
-    feat_dir.mkdir(parents=True)
+    feat_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         feat_dir / f"{uid}.npz",
         patchtokens=np.zeros((4, 16), dtype=np.float32),
