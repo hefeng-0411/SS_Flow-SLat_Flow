@@ -38,6 +38,12 @@ TRANSIENT_SETUP_PATTERNS = (
     "torch.hub",
 )
 
+ALLOCATOR_INCOMPATIBILITY_PATTERNS = (
+    "expandable_segments not supported on this platform",
+    "!block->expandable_segment_",
+    "expandable_segment_ internal assert failed",
+)
+
 
 DISTRIBUTED_ENV_KEYS = (
     "RANK",
@@ -104,7 +110,12 @@ def main() -> None:
     parser.add_argument("--trellis_model_path", type=str, default=None)
     parser.add_argument("--torch_hub_dir", type=str, default=None)
     parser.add_argument("--dinov2_repo", type=str, default=None)
-    parser.add_argument("--cuda_alloc_conf", type=str, default="expandable_segments:True,max_split_size_mb:512,garbage_collection_threshold:0.9")
+    parser.add_argument(
+        "--cuda_alloc_conf",
+        type=str,
+        default="max_split_size_mb:512,garbage_collection_threshold:0.9",
+        help="PyTorch allocator settings. Expandable segments are excluded by default because unsupported builds can assert.",
+    )
     parser.add_argument("--nccl_socket_ifname", type=str, default=None)
     parser.add_argument("--stage1_steps", type=int, default=100000)
     parser.add_argument("--stage2_steps", type=int, default=100000)
@@ -177,6 +188,7 @@ def main() -> None:
     stages = _slice_stages(stages, args.start_at, args.stop_after)
     if args.skip_slat_joint:
         stages = [stage for stage in stages if stage.name != "slat_joint"]
+    _validate_stage_manifests(stages)
     if any(stage.name == "slat_joint" for stage in stages) and not args.slat_joint_init_checkpoint:
         raise ValueError(
             "Stage 4 requires --slat_joint_init_checkpoint selected by decoded validation metrics; "
@@ -427,7 +439,30 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
 
 
 def _manifest_args(path: Optional[str]) -> list[str]:
-    return ["--train_manifest", path] if path else []
+    return ["--train_manifest", str(Path(path).expanduser().resolve())] if path else []
+
+
+def _validate_stage_manifests(stages: list[Stage]) -> None:
+    missing = []
+    for stage in stages:
+        try:
+            position = stage.extra_args.index("--train_manifest")
+        except ValueError:
+            continue
+        if position + 1 >= len(stage.extra_args):
+            missing.append((stage.name, "<missing argument value>"))
+            continue
+        path = Path(stage.extra_args[position + 1])
+        if not path.is_file():
+            missing.append((stage.name, str(path)))
+    if missing:
+        details = "\n".join(f"  {stage}: {path}" for stage, path in missing)
+        raise FileNotFoundError(
+            "Training UID manifest preflight failed before launching distributed workers:\n"
+            f"{details}\n"
+            "Run scripts/inspect_meshfleet_dataset.py with the intended --output_dir, then pass the generated "
+            "stage-specific manifest paths. Do not substitute an old v2 manifest."
+        )
 
 
 def _slice_stages(stages: list[Stage], start_at: str, stop_after: str) -> list[Stage]:
@@ -456,6 +491,8 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
         text = result.stdout or ""
         (probe_dir / "probe.log").parent.mkdir(parents=True, exist_ok=True)
         (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
+        if _recover_allocator_incompatibility(text, env, stage.name, batch_size):
+            continue
         if result.returncode == 0:
             if _probe_too_hot(text, args):
                 print(f"{stage.name}: per-GPU batch_size={batch_size} exceeded probe VRAM headroom, retrying with {batch_size // 2}", flush=True)
@@ -500,6 +537,9 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
         text = result.stdout or ""
         probe_dir.mkdir(parents=True, exist_ok=True)
         (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
+        if _recover_allocator_incompatibility(text, env, stage.name, batch_size):
+            tried.discard(batch_size)
+            continue
         if result.returncode == 0:
             if _probe_too_hot(text, args):
                 last_error = text[-12000:]
@@ -551,6 +591,14 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
         returncode, tail = _run_command_logged(command, env, launcher_log)
         if returncode == 0:
             return
+        if _recover_allocator_incompatibility(tail, env, stage.name, current):
+            print(
+                f"{stage.name}: relaunching the same per-GPU batch_size={current} with a compatible allocator; "
+                "model, precision, views, tokens, and supervision are unchanged.",
+                flush=True,
+            )
+            time.sleep(max(0.0, args.restart_sleep_seconds))
+            continue
         if _stage_is_complete(stage):
             print(f"{stage.name}: subprocess failed after writing a completed checkpoint; treating stage as complete.", flush=True)
             return
@@ -696,6 +744,27 @@ def _looks_like_transient_setup(text: str) -> bool:
     return any(pattern in lower for pattern in TRANSIENT_SETUP_PATTERNS)
 
 
+def _recover_allocator_incompatibility(text: str, env: dict, stage_name: str, batch_size: int) -> bool:
+    lower = text.lower()
+    if not any(pattern in lower for pattern in ALLOCATOR_INCOMPATIBILITY_PATTERNS):
+        return False
+    current = str(env.get("PYTORCH_CUDA_ALLOC_CONF", ""))
+    parts = [part.strip() for part in current.split(",") if part.strip()]
+    compatible = [part for part in parts if part.split(":", 1)[0].strip().lower() != "expandable_segments"]
+    if len(compatible) == len(parts):
+        return False
+    if compatible:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(compatible)
+    else:
+        env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    print(
+        f"{stage_name}: allocator compatibility fallback at per-GPU batch_size={batch_size}; "
+        f"removed unsupported expandable_segments (remaining={env.get('PYTORCH_CUDA_ALLOC_CONF', '<default>')}).",
+        flush=True,
+    )
+    return True
+
+
 def _probe_too_hot(text: str, args: argparse.Namespace) -> bool:
     ceiling = float(getattr(args, "probe_max_vram_util", 0.0) or 0.0)
     if ceiling <= 0.0:
@@ -711,6 +780,7 @@ def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[
         log.write("\n\n==== COMMAND ====\n")
         log.write(" ".join(command) + "\n")
         log.write(f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n")
+        log.write(f"PYTORCH_CUDA_ALLOC_CONF={env.get('PYTORCH_CUDA_ALLOC_CONF', '<default>')}\n")
         log.flush()
         process = subprocess.Popen(
             command,

@@ -54,7 +54,7 @@ def test_geometry_metrics_are_symmetric_and_thresholded():
     identical = geometry_metrics(points, points, threshold=0.01)
     assert identical["Chamfer Distance"] == pytest.approx(0.0)
     assert identical["F-score"] == pytest.approx(1.0)
-    shifted = geometry_metrics(points + 0.1, points, threshold=0.05)
+    shifted = geometry_metrics(points + torch.tensor([0.1, 0.0, 0.0]), points, threshold=0.05)
     assert shifted["Chamfer Distance"] == pytest.approx(0.1, abs=1e-5)
     assert shifted["F-score"] == pytest.approx(0.0)
 
@@ -106,7 +106,7 @@ def test_dataset_explicit_heldout_set_and_background_compositing(tmp_path: Path)
     assert sample["masks"].max() == 0
 
 
-def test_dataset_does_not_substitute_failed_uid(tmp_path: Path):
+def test_dataset_filters_unusable_render_without_substituting_uid(tmp_path: Path):
     split = tmp_path / "test"
     for uid, has_image in (("a_bad", False), ("b_good", True)):
         folder = split / "renders" / uid
@@ -131,9 +131,11 @@ def test_dataset_does_not_substitute_failed_uid(tmp_path: Path):
             encoding="utf-8",
         )
     dataset = MeshFleetTrellisDataset(tmp_path, split="test", num_views=1, image_size=8)
-    with pytest.raises(FileNotFoundError, match="a_bad"):
-        _ = dataset[0]
-    assert dataset[1]["uid"] == "b_good"
+    assert len(dataset) == 1
+    assert dataset[0]["uid"] == "b_good"
+    assert {item["uid"] for item in dataset.discovery_skips} == {"a_bad"}
+    with pytest.raises(KeyError, match="a_bad"):
+        dataset.get_by_uid("a_bad")
 
 
 def test_trellis_export_rotation_is_exactly_inverted():

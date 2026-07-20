@@ -26,6 +26,9 @@ def main() -> None:
     parser.add_argument("--uid_manifest", default=None)
     parser.add_argument("--images_per_set", type=int, default=8)
     parser.add_argument("--hash_meshes", action="store_true")
+    parser.add_argument("--ss_latent_model", default="ss_enc_conv3d_16l8_fp16")
+    parser.add_argument("--slat_latent_model", default="dinov2_vitl14_reg_slat_enc_swin8_B_64l8_fp16")
+    parser.add_argument("--feature_model", default="dinov2_vitl14_reg")
     args = parser.parse_args()
     root = Path(args.data_root).expanduser().resolve()
     output = Path(args.output_dir).expanduser().resolve()
@@ -35,7 +38,12 @@ def main() -> None:
     mesh_hash_to_uids: dict[str, list[str]] = defaultdict(list)
     for split in [item.strip() for item in args.splits.split(",") if item.strip()]:
         for category, layout in _dataset_roots(root / split):
-            maps = _modality_maps(layout)
+            maps = _modality_maps(
+                layout,
+                ss_latent_model=args.ss_latent_model,
+                slat_latent_model=args.slat_latent_model,
+                feature_model=args.feature_model,
+            )
             uids = sorted(set().union(*(set(mapping) for mapping in maps.values())))
             for uid in uids:
                 if allowed is not None and uid not in allowed:
@@ -53,6 +61,11 @@ def main() -> None:
         "data_root": str(root),
         "objects": len(rows),
         "splits": dict(Counter(row["split"] for row in rows)),
+        "preprocessing_models": {
+            "ss_latents": args.ss_latent_model,
+            "latents": args.slat_latent_model,
+            "features": args.feature_model,
+        },
         "numeric": _numeric_summary(rows),
         "shape_histograms": _shape_histograms(rows),
         "mesh_duplicate_groups": duplicates,
