@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from geoss.eval.render_metrics import _as_mask_nchw, _as_nchw, _ssim
+from geoss.losses.stable_bce import probability_binary_cross_entropy
 from geoss.utils.optional_deps import require_dependency
 
 
@@ -27,7 +28,10 @@ def render_level_losses(
     if rendered_alpha is not None and target_mask is not None:
         rendered_alpha = _as_mask_nchw(rendered_alpha).to(rendered_rgb)
         target_mask = _as_mask_nchw(target_mask).to(rendered_rgb)
-        losses["L_mask"] = F.binary_cross_entropy(rendered_alpha.clamp(1e-4, 1 - 1e-4), target_mask.float().clamp(0, 1))
+        losses["L_mask"] = probability_binary_cross_entropy(
+            rendered_alpha.clamp(1e-4, 1 - 1e-4),
+            target_mask.float().clamp(0, 1),
+        )
         foreground = target_mask.expand_as(rendered_rgb).clamp(0, 1)
         losses["L_rgb_foreground"] = (
             (rendered_rgb - target_rgb).abs() * foreground

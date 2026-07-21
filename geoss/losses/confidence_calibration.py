@@ -5,6 +5,8 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 
+from geoss.losses.stable_bce import probability_binary_cross_entropy
+
 
 def target_confidence_from_errors(
     *,
@@ -26,7 +28,7 @@ def confidence_calibration_loss(pred_confidence: torch.Tensor, target_confidence
     pred = pred_confidence.clamp(1e-4, 1.0 - 1e-4)
     target = target_confidence.to(device=pred.device, dtype=pred.dtype).clamp(0, 1).detach()
     if mode == "bce":
-        loss = F.binary_cross_entropy(pred, target)
+        loss = probability_binary_cross_entropy(pred, target)
     else:
         loss = (pred - target).square().mean()
     ece = expected_calibration_error(pred.detach(), target.detach())

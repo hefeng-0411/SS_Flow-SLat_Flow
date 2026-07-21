@@ -91,7 +91,8 @@ class GeoVisSLATAggregator(nn.Module):
             * visible_support.clamp(0, 1)
             * appearance_consistency
         ).clamp(0, 1)
-        correction_demand = torch.sigmoid(self.correction_demand_head(conf_input))
+        correction_demand_logits = self.correction_demand_head(conf_input)
+        correction_demand = torch.sigmoid(correction_demand_logits)
         residual_variance = torch.nn.functional.softplus(self.uncertainty_head(conf_input)) + 1e-4
 
         return {
@@ -99,6 +100,7 @@ class GeoVisSLATAggregator(nn.Module):
             "slat_confidence": evidence_reliability,
             "evidence_reliability": evidence_reliability,
             "correction_demand": correction_demand,
+            "correction_demand_logits": correction_demand_logits,
             "residual_variance": residual_variance,
             "view_weights": view_weights,
             "appearance_consistency": appearance_consistency,

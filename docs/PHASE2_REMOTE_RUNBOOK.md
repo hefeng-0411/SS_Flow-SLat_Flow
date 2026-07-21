@@ -145,6 +145,18 @@ the Gaussian decoder required for decoded supervision. These are the exact
 pretrained modules used by each objective—no token, view, precision, or loss is
 removed.
 
+Stage 3/4 run the demand-calibration and heteroscedastic residual objectives in
+FP32 inside the BF16 training region. The demand head exposes its pre-sigmoid
+logits to `binary_cross_entropy_with_logits`; rendered-alpha and ray losses,
+which genuinely have only probability inputs, use a narrowly scoped FP32 BCE.
+This keeps the mathematical objectives and all gradients while avoiding
+PyTorch's intentional `binary_cross_entropy is unsafe to autocast` failure.
+The sequential launcher also finds sibling `stage3_train_uids.json` and
+`stage4_train_uids.json` files when earlier stage manifests from the same audit
+directory are supplied. Explicit `--stage3_train_manifest` and
+`--stage4_train_manifest` arguments remain preferred for recorded production
+runs.
+
 ## 4. Validation protocol
 
 For every checkpoint, evaluate the complete validation manifest with the same

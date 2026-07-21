@@ -143,6 +143,7 @@ class GeoVisSLATAdapter(nn.Module):
             "slat_confidence": aggregated["slat_confidence"],
             "evidence_reliability": aggregated["evidence_reliability"],
             "correction_demand": aggregated["correction_demand"],
+            "correction_demand_logits": aggregated["correction_demand_logits"],
             "residual_variance": aggregated["residual_variance"],
             "delta_v_slat": velocity["delta_v_slat"],
             "v_slat_geo": velocity["v_slat_geo"],
