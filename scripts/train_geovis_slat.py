@@ -88,6 +88,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     model.enable_gradient_checkpointing(args.gradient_checkpointing)
     start_step = 0
     resume_state = None
+    initialization_runtime_overrides = {}
     if args.resume and Path(args.resume).exists():
         resume_state = torch.load(args.resume, map_location="cpu")
         _validate_checkpoint_tensor_contract(resume_state, args.resume)
@@ -100,7 +101,12 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             raise FileNotFoundError(f"SLAT initialization checkpoint not found: {init_path}")
         init_state = torch.load(init_path, map_location="cpu")
         _validate_checkpoint_tensor_contract(init_state, init_path)
-        _validate_checkpoint_model_config(init_state, model_cfg, context="Initialization")
+        initialization_runtime_overrides = _validate_checkpoint_model_config(
+            init_state,
+            model_cfg,
+            context="Initialization",
+            allow_runtime_control_overrides=True,
+        )
         model.load_state_dict(init_state.get("model", init_state), strict=True)
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -249,6 +255,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["global_grad_norm"] = terms.get("global_grad_norm")
         last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
         last["trellis_residency"] = getattr(trellis_pipeline, "training_residency", None)
+        last["initialization_runtime_control_overrides"] = initialization_runtime_overrides
         early_status = early_stopper.update(last)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
@@ -311,6 +318,7 @@ def compute_losses(
         effective_delta,
         target_residual,
         token_mask=supervision_mask,
+        correction_demand_logits=out.get("correction_demand_logits"),
     )
     return {
         "slat_flow": {
@@ -712,8 +720,20 @@ def _validate_checkpoint_tensor_contract(state: dict, path: str | Path) -> None:
         )
 
 
-def _validate_checkpoint_model_config(state: dict, model_cfg: dict, *, context: str) -> None:
+def _validate_checkpoint_model_config(
+    state: dict,
+    model_cfg: dict,
+    *,
+    context: str,
+    allow_runtime_control_overrides: bool = False,
+) -> dict:
     checkpoint_cfg = state.get("config", {}).get("model", {}) if isinstance(state, dict) else {}
+    # These scalars do not alter parameter names or shapes. Stage 4 deliberately
+    # changes them as part of decoded-asset fine-tuning, so a weights-only
+    # initialization may override them. A true resume still requires an exact
+    # match to prevent silently changing an interrupted experiment.
+    runtime_control_keys = {"confidence_floor", "trust_region"}
+    accepted_overrides = {}
     keys = (
         "slat_dim", "resolution", "evidence_dim", "hidden_dim", "feature_dim", "num_heads",
         "fusion_mode", "confidence_floor", "trust_region", "beta_mode", "beta_strength",
@@ -721,10 +741,17 @@ def _validate_checkpoint_model_config(state: dict, model_cfg: dict, *, context: 
     )
     for key in keys:
         if key in checkpoint_cfg and key in model_cfg and checkpoint_cfg[key] != model_cfg[key]:
+            if allow_runtime_control_overrides and key in runtime_control_keys:
+                accepted_overrides[key] = {
+                    "checkpoint": checkpoint_cfg[key],
+                    "current": model_cfg[key],
+                }
+                continue
             raise RuntimeError(
                 f"{context} model mismatch for {key}: checkpoint={checkpoint_cfg[key]!r}, "
                 f"config={model_cfg[key]!r}"
             )
+    return accepted_overrides
 
 
 def main() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import pytest
 from pathlib import Path
 import sys
 
@@ -93,6 +94,49 @@ def test_factorized_control_loss_trains_demand_and_uncertainty():
     terms = factorized_control_loss(demand, variance, prediction, target)
     terms["loss"].backward()
     assert demand.grad is not None and variance.grad is not None and prediction.grad is not None
+
+
+def test_factorized_control_logits_preserve_bce_objective_and_gradient():
+    logits = torch.tensor([[[-0.75], [0.25], [1.25]]], requires_grad=True)
+    demand = logits.sigmoid()
+    variance = torch.full_like(demand, 0.75, requires_grad=True)
+    prediction = torch.zeros(1, 3, 2, requires_grad=True)
+    target = torch.tensor([[[0.2, -0.1], [0.5, 0.3], [-0.4, 0.7]]])
+    probability_terms = factorized_control_loss(demand, variance, prediction, target)
+    logits_terms = factorized_control_loss(
+        demand,
+        variance,
+        prediction,
+        target,
+        correction_demand_logits=logits,
+    )
+    assert torch.allclose(
+        probability_terms["correction_demand_bce"],
+        logits_terms["correction_demand_bce"],
+        atol=1e-6,
+    )
+    logits_terms["loss"].backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast regression requires a CUDA device")
+def test_factorized_control_loss_is_cuda_autocast_safe():
+    device = torch.device("cuda")
+    logits = torch.zeros(1, 4, 1, device=device, requires_grad=True)
+    variance = torch.ones(1, 4, 1, device=device, requires_grad=True)
+    prediction = torch.zeros(1, 4, 8, device=device, requires_grad=True)
+    target = torch.ones_like(prediction)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        terms = factorized_control_loss(
+            logits.sigmoid(),
+            variance,
+            prediction,
+            target,
+            correction_demand_logits=logits,
+        )
+    assert terms["loss"].dtype == torch.float32
+    terms["loss"].backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
 
 
 def test_flow_velocity_inversion_recovers_clean_slat():

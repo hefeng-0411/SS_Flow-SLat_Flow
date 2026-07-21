@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
+
+from geoss.losses.stable_bce import probability_binary_cross_entropy
 
 
 def ray_level_geometry_loss(ray_debug: Dict[str, torch.Tensor], occ_score: torch.Tensor, free_score: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -26,12 +27,18 @@ def ray_level_geometry_loss(ray_debug: Dict[str, torch.Tensor], occ_score: torch
     weights = alpha_sorted * trans
     hit_prob = weights.sum(dim=1).clamp(1e-4, 1.0 - 1e-4)
     target_hit = (mask_samples * ray_valid).amax(dim=1).clamp(0, 1)
-    mask_loss = F.binary_cross_entropy(hit_prob, target_hit)
+    mask_loss = probability_binary_cross_entropy(hit_prob, target_hit)
     expected_depth = (weights * depth_sorted).sum(dim=1) / weights.sum(dim=1).clamp_min(1e-6)
     target_depth = surface_depth.masked_fill(ray_valid <= 0.5, 0).sum(dim=1) / ray_valid.sum(dim=1).clamp_min(1.0)
     depth_loss = (expected_depth - target_depth).abs().masked_select(target_hit > 0.5).mean() if (target_hit > 0.5).any() else expected_depth.new_zeros(())
-    free_loss = F.binary_cross_entropy((1.0 - alpha).clamp(1e-4, 1.0 - 1e-4), free.clamp(0, 1))
-    surface_loss = F.binary_cross_entropy(alpha.clamp(1e-4, 1.0 - 1e-4), occupied.clamp(0, 1))
+    free_loss = probability_binary_cross_entropy(
+        (1.0 - alpha).clamp(1e-4, 1.0 - 1e-4),
+        free.clamp(0, 1),
+    )
+    surface_loss = probability_binary_cross_entropy(
+        alpha.clamp(1e-4, 1.0 - 1e-4),
+        occupied.clamp(0, 1),
+    )
     loss = mask_loss + depth_loss + 0.5 * free_loss + 0.5 * surface_loss
     return {
         "loss": loss,

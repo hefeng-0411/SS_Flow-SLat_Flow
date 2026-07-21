@@ -8,10 +8,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-import torch.nn.functional as F
 
 from geoss.datasets.meshfleet_trellis_dataset import MeshFleetTrellisDataset
 from geoss.eval.render_metrics import _ssim
+from geoss.losses.stable_bce import probability_binary_cross_entropy
 from geoss.io.asset_io import (
     read_gaussian_ply,
     trellis_export_gaussian_to_internal,
@@ -121,7 +121,10 @@ def main() -> None:
         target_mask = masks[selection]
         rgb_l1 = (pred - target).abs().mean()
         ssim_loss = 1.0 - _ssim(pred.clamp(0, 1), target)
-        mask_loss = F.binary_cross_entropy(alpha.clamp(1e-5, 1 - 1e-5), target_mask)
+        mask_loss = probability_binary_cross_entropy(
+            alpha.clamp(1e-5, 1 - 1e-5),
+            target_mask,
+        )
         prior = (color_logits.sigmoid() - initial_colors).square().mean()
         prior = prior + 0.25 * (opacity_logits - initial_opacity).square().mean()
         if args.optimize_scaling:

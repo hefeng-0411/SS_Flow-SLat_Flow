@@ -5,6 +5,8 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 
+from geoss.losses.stable_bce import probability_binary_cross_entropy
+
 
 def visibility_confidence_loss(
     slat_confidence: torch.Tensor,
@@ -21,16 +23,16 @@ def visibility_confidence_loss(
         target = target * (1.0 - occlusion_score.mean(dim=2).clamp(0, 1))
     target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     pred = torch.nan_to_num(slat_confidence, nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-5, 1 - 1e-5)
-    # Probability-space BCE is explicitly unsafe under CUDA autocast.  Keep the
-    # existing sigmoid-output/checkpoint interface, but run this scalar in FP32
-    # so mixed-precision Stage 3 training remains numerically and API safe.
-    with torch.amp.autocast(device_type=pred.device.type, enabled=False):
-        per_token_bce = F.binary_cross_entropy(pred.float(), target.detach().float(), reduction="none")
-        if token_valid_mask is None:
-            bce = per_token_bce.mean()
-        else:
-            valid = token_valid_mask.to(device=pred.device, dtype=torch.float32)
-            bce = (per_token_bce * valid).sum() / valid.sum().clamp_min(1e-6)
+    per_token_bce = probability_binary_cross_entropy(
+        pred,
+        target.detach(),
+        reduction="none",
+    )
+    if token_valid_mask is None:
+        bce = per_token_bce.mean()
+    else:
+        valid = token_valid_mask.to(device=pred.device, dtype=per_token_bce.dtype)
+        bce = (per_token_bce * valid).sum() / valid.sum().clamp_min(1e-6)
     if token_valid_mask is None:
         valid_values = slat_confidence.reshape(-1)
     else:

@@ -5,6 +5,7 @@ from typing import Dict
 import torch
 import torch.nn.functional as F
 
+from geoss.losses.stable_bce import probability_binary_cross_entropy
 from geoss.utils.projection import project_points
 
 
@@ -34,6 +35,10 @@ def projection_consistency_loss(
     ).reshape(B, N, 1, M).permute(0, 1, 3, 2)
     mask_samples = torch.nan_to_num(mask_samples, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     pred = torch.nan_to_num(occ_prob[:, None].expand(B, N, M, 1), nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-4, 1 - 1e-4)
-    loss = F.binary_cross_entropy(pred.clamp(1e-4, 1 - 1e-4), mask_samples, reduction="none")
+    loss = probability_binary_cross_entropy(
+        pred.clamp(1e-4, 1 - 1e-4),
+        mask_samples,
+        reduction="none",
+    )
     loss = (loss * valid).sum() / valid.sum().clamp_min(1.0)
     return {"projection_consistency": loss, "loss": loss}

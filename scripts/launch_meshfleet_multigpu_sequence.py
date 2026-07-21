@@ -274,10 +274,24 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
     ]
     if args.meshfleet_category:
         common_data += ["--meshfleet_category", args.meshfleet_category]
-    stage1_manifest = _manifest_args(args.stage1_train_manifest or args.train_manifest)
-    stage2_manifest = _manifest_args(args.stage2_train_manifest or args.train_manifest)
-    stage3_manifest = _manifest_args(args.stage3_train_manifest or args.train_manifest)
-    stage4_manifest = _manifest_args(args.stage4_train_manifest or args.stage3_train_manifest or args.train_manifest)
+    stage1_manifest_path = args.stage1_train_manifest or args.train_manifest
+    stage2_manifest_path = args.stage2_train_manifest or args.train_manifest
+    stage3_manifest_path = _infer_stage_manifest(
+        explicit=args.stage3_train_manifest,
+        fallback=args.train_manifest,
+        infer_from=(args.stage2_train_manifest, args.stage1_train_manifest),
+        filename="stage3_train_uids.json",
+    )
+    stage4_manifest_path = _infer_stage_manifest(
+        explicit=args.stage4_train_manifest,
+        fallback=args.train_manifest,
+        infer_from=(args.stage3_train_manifest, args.stage2_train_manifest, args.stage1_train_manifest),
+        filename="stage4_train_uids.json",
+    )
+    stage1_manifest = _manifest_args(stage1_manifest_path)
+    stage2_manifest = _manifest_args(stage2_manifest_path)
+    stage3_manifest = _manifest_args(stage3_manifest_path)
+    stage4_manifest = _manifest_args(stage4_manifest_path)
     early_stop_args = []
     if not args.disable_early_stop:
         early_stop_args = [
@@ -440,6 +454,26 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
 
 def _manifest_args(path: Optional[str]) -> list[str]:
     return ["--train_manifest", str(Path(path).expanduser().resolve())] if path else []
+
+
+def _infer_stage_manifest(
+    *,
+    explicit: Optional[str],
+    fallback: Optional[str],
+    infer_from: tuple[Optional[str], ...],
+    filename: str,
+) -> Optional[str]:
+    """Find a sibling stage-aware audit manifest without weakening filtering."""
+    if explicit:
+        return explicit
+    for source in infer_from:
+        if not source:
+            continue
+        candidate = Path(source).expanduser().resolve().with_name(filename)
+        if candidate.is_file():
+            print(f"Auto-selected stage-aware manifest: {candidate}", flush=True)
+            return str(candidate)
+    return fallback
 
 
 def _validate_stage_manifests(stages: list[Stage]) -> None:

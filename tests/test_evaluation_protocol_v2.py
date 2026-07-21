@@ -280,3 +280,21 @@ def test_foreground_rgb_loss_is_normalized_and_differentiable():
     loss.backward()
     assert prediction.grad is not None
     assert prediction.grad[:, :, 2:6, 2:6].abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast regression requires a CUDA device")
+def test_decoded_mask_loss_is_cuda_autocast_safe():
+    prediction = torch.full((1, 3, 8, 8), 0.4, device="cuda", requires_grad=True)
+    target = torch.full_like(prediction, 0.6)
+    alpha_logits = torch.zeros(1, 1, 8, 8, device="cuda", requires_grad=True)
+    target_mask = torch.ones_like(alpha_logits)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        terms = render_level_losses(
+            prediction,
+            target,
+            rendered_alpha=alpha_logits.sigmoid(),
+            target_mask=target_mask,
+        )
+    terms["L_mask"].backward()
+    assert alpha_logits.grad is not None
+    assert torch.isfinite(alpha_logits.grad).all()
