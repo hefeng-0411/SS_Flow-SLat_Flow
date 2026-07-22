@@ -90,6 +90,7 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else run_root / "evaluation_suite"
     output_dir.mkdir(parents=True, exist_ok=True)
     _fill_checkpoint_defaults(args, run_root)
+    _validate_requested_checkpoints(args, run_root)
 
     dataset = MeshFleetTrellisDataset(
         args.data_root,
@@ -373,6 +374,44 @@ def _fill_checkpoint_defaults(args: argparse.Namespace, run_root: Path) -> None:
     for name, path in defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, str(path))
+
+
+def _validate_requested_checkpoints(args: argparse.Namespace, run_root: Path) -> None:
+    """Fail before spawning workers when an enabled ablation cannot run."""
+    requirements = (
+        ("geoss_checkpoint", bool(args.run_stage1 or args.run_stage2), "Stage 1/2"),
+        ("ss_checkpoint", bool(args.run_stage2), "Stage 2"),
+        ("slat_checkpoint", bool(args.run_stage3), "Stage 3"),
+        ("slat_joint_checkpoint", bool(args.run_stage4), "Stage 4"),
+    )
+    missing = []
+    for attribute, required, consumer in requirements:
+        if not required:
+            continue
+        configured = Path(str(getattr(args, attribute))).expanduser()
+        if not configured.is_file():
+            missing.append((attribute, consumer, configured))
+    if not missing:
+        return
+    defaults = {
+        "geoss_checkpoint": run_root / "stage1_geoss" / "geoss_adapter_best.pt",
+        "ss_checkpoint": run_root / "stage2_ss_velocity" / "ss_velocity_adapter_best.pt",
+        "slat_checkpoint": run_root / "stage3_geovis_slat" / "geovis_slat_adapter_best.pt",
+        "slat_joint_checkpoint": run_root / "stage4_geovis_slat_joint" / "geovis_slat_adapter_best.pt",
+    }
+    details = []
+    for attribute, consumer, configured in missing:
+        default = defaults[attribute]
+        hint = (
+            f"; run-root default exists at {default}—remove the explicit --{attribute} argument or use that path"
+            if default.is_file()
+            else f"; expected run-root default is {default}"
+        )
+        details.append(f"  {consumer} --{attribute}: {configured}{hint}")
+    raise FileNotFoundError(
+        "Evaluation checkpoint preflight failed before launching GPU workers:\n"
+        + "\n".join(details)
+    )
 
 
 def _run_original_trellis(args: argparse.Namespace, sample_root: Path, index: int, gpu: str | None = None) -> dict[str, Any]:

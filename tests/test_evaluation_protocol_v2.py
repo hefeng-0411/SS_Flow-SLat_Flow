@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -16,7 +17,11 @@ from geoss.metrics.geometry_metrics import geometry_metrics
 from geoss.losses.render_losses import render_level_losses
 from geoss.renderers.gsplat_renderer import SH_C0, _gaussian_tensors
 from scripts.eval_geovis_slat import _camera_overlap_count
-from scripts.evaluate_meshfleet_sequence import _aggregate, _tag_sample_rows
+from scripts.evaluate_meshfleet_sequence import (
+    _aggregate,
+    _tag_sample_rows,
+    _validate_requested_checkpoints,
+)
 from scripts.infer_geovis_slat import _inference_only_batch
 from scripts.infer_sparse_ray_geoss_ss import _context_only_batch
 
@@ -298,3 +303,25 @@ def test_decoded_mask_loss_is_cuda_autocast_safe():
     terms["L_mask"].backward()
     assert alpha_logits.grad is not None
     assert torch.isfinite(alpha_logits.grad).all()
+
+
+def test_evaluator_rejects_missing_enabled_stage_checkpoint_before_workers(tmp_path: Path):
+    run_root = tmp_path / "foundation"
+    valid_geoss = run_root / "stage1_geoss" / "geoss_adapter_best.pt"
+    valid_ss = run_root / "stage2_ss_velocity" / "ss_velocity_adapter_best.pt"
+    valid_geoss.parent.mkdir(parents=True)
+    valid_ss.parent.mkdir(parents=True)
+    valid_geoss.write_bytes(b"checkpoint")
+    valid_ss.write_bytes(b"checkpoint")
+    args = SimpleNamespace(
+        run_stage1=True,
+        run_stage2=True,
+        run_stage3=False,
+        run_stage4=True,
+        geoss_checkpoint=str(valid_geoss),
+        ss_checkpoint=str(valid_ss),
+        slat_checkpoint=str(run_root / "stage3_geovis_slat" / "geovis_slat_adapter_best.pt"),
+        slat_joint_checkpoint=str(tmp_path / "wrong" / "geovis_slat_adapter_best.pt"),
+    )
+    with pytest.raises(FileNotFoundError, match="slat_joint_checkpoint"):
+        _validate_requested_checkpoints(args, run_root)

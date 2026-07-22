@@ -320,7 +320,10 @@ def _adapter_aware_sampler(sampler, *, num_images: int, mode: str, context_key: 
         if cfg_active and cfg_interval is not None:
             cfg_active = bool(cfg_interval[0] <= t <= cfg_interval[1])
         positive_kwargs = dict(kwargs)
-        if cfg_active and context_key == "geovis_slat_context":
+        # CFG amplifies only the learned positive-branch residual.  Native
+        # TRELLIS baselines have no GeoVis context/wrapper, so adapter-only
+        # control kwargs must never leak into SLatFlowModel.forward().
+        if cfg_active and context_key == "geovis_slat_context" and adapter_context is not None:
             amplification = 1.0 + float(cfg_strength)
             if amplification <= 0:
                 raise ValueError(f"SLAT CFG residual amplification must be positive, got {amplification}.")
@@ -361,6 +364,11 @@ def _call_trellis_flow_model(model, x_t, t, cond, context_key: str, context, kwa
     if cond is not None and cond.shape[0] == 1 and batch_size > 1:
         cond = cond.repeat(batch_size, *([1] * (cond.ndim - 1)))
     model_kwargs = dict(kwargs)
+    if context_key == "geovis_slat_context" and context is None:
+        # Defensive boundary: this keyword belongs to
+        # GeoVisTrellisSLATWrapper, not native TRELLIS SLatFlowModel.  It may
+        # be present only on a context-bearing conditional adapter branch.
+        model_kwargs.pop("geovis_residual_scale", None)
     if context is not None:
         model_kwargs[context_key] = context
     return model(x_t, t_tensor, cond, **model_kwargs)
