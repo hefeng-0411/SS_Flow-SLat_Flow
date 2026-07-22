@@ -177,7 +177,7 @@ python scripts/evaluate_meshfleet_sequence.py \
   --run_original_trellis true --run_stage1 true --run_stage2 true \
   --run_stage3 false --run_stage4 true --run_refined_final true \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
-  --slat_joint_checkpoint outputs/phase2/final_decoded_asset/geovis_slat_adapter_best.pt \
+  --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
   --vggt_root /mnt/sda2/hef/Base/vggt \
@@ -209,7 +209,7 @@ python scripts/evaluate_meshfleet_sequence.py \
   --run_original_trellis true --run_stage1 true --run_stage2 true \
   --run_stage3 false --run_stage4 true --run_refined_final true \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
-  --slat_joint_checkpoint outputs/phase2/final_decoded_asset/geovis_slat_adapter_best.pt \
+  --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
   --vggt_root /mnt/sda2/hef/Base/vggt \
