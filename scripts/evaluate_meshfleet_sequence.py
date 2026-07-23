@@ -45,11 +45,11 @@ ASSET_STAGES = frozenset(
 VRAM_RESERVATION_KEYS = (*STAGE_ORDER, "asset_evaluation")
 
 DEFAULT_STAGE_VRAM_GB = {
-    "original_trellis": 18.0,
-    "stage1_geoss_context": 8.0,
-    "stage2_geoss_ss": 18.0,
-    "stage3_geovis_slat": 18.0,
-    "stage4_geovis_slat_joint": 18.0,
+    "original_trellis": 16.0,
+    "stage1_geoss_context": 13.0,
+    "stage2_geoss_ss": 16.0,
+    "stage3_geovis_slat": 16.0,
+    "stage4_geovis_slat_joint": 16.0,
     "final_conditioning_refined": 8.0,
     "asset_evaluation": 4.0,
 }
@@ -137,9 +137,20 @@ def main() -> None:
     parser.add_argument("--oom_retry_limit", type=int, default=2)
     parser.add_argument("--timeout_retry_limit", type=int, default=1)
     parser.add_argument("--worker_timeout_seconds", type=float, default=3600.0, help="Hard timeout for one inference/render subprocess; 0 disables.")
-    parser.add_argument("--worker_stall_timeout_seconds", type=float, default=900.0, help="Terminate a child whose log makes no progress for this duration; 0 disables.")
+    parser.add_argument(
+        "--worker_stall_timeout_seconds",
+        type=float,
+        default=300.0,
+        help="Terminate a child with neither log growth nor CPU progress for this duration; 0 disables.",
+    )
     parser.add_argument("--worker_terminate_grace_seconds", type=float, default=15.0)
     parser.add_argument("--worker_monitor_interval_seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--worker_cpu_threads",
+        type=int,
+        default=4,
+        help="CPU threads per inference/render process; bounds OpenMP oversubscription.",
+    )
     parser.add_argument("--worker_admission_warmup_seconds", type=float, default=30.0, help="Reserve estimated VRAM while a newly launched worker is still loading models.")
     parser.add_argument("--scheduler_poll_seconds", type=float, default=2.0)
     parser.add_argument("--render_eval", type=str2bool, default=True)
@@ -153,6 +164,7 @@ def main() -> None:
     parser.add_argument("--overwrite", type=str2bool, default=False)
     args = parser.parse_args()
     args._stage_vram_estimates = _parse_stage_vram_estimates(args.stage_vram_gb, args.eval_worker_vram_gb)
+    _validate_parallel_launch(args)
 
     run_root = Path(args.run_root)
     output_dir = Path(args.output_dir) if args.output_dir else run_root / "evaluation_suite"
@@ -258,6 +270,22 @@ def main() -> None:
         },
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    effective_launch = {
+        "parallel_requested": bool(args.parallel),
+        "scheduler_mode": args.scheduler_mode,
+        "physical_gpus": _visible_gpus(args),
+        "stage_vram_gb": args._stage_vram_estimates,
+        "max_workers_per_gpu": args.max_workers_per_gpu,
+        "min_free_vram_gb": args.min_free_vram_gb,
+        "worker_cpu_threads": args.worker_cpu_threads,
+        "overwrite": bool(args.overwrite),
+        "argv": sys.argv,
+    }
+    (output_dir / "effective_launch.json").write_text(
+        json.dumps(effective_launch, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({"effective_launch": effective_launch}, indent=2), flush=True)
 
     if args.parallel and _visible_gpus(args):
         rows = _run_parallel(args, output_dir, indices)
@@ -341,6 +369,7 @@ def _run_parallel_stage_major(
                 stage=stage_name,
                 capacities=capacities,
                 estimated_vram_gb=_stage_vram_estimate(stage_name, args),
+                gpu_snapshot=_gpu_admission_snapshot(gpus, capacities),
             )
             stage_rows = _run_parallel_stage(
                 args,
@@ -367,6 +396,7 @@ def _run_parallel_stage_major(
                         stage=stage_name,
                         capacities=eval_capacities,
                         estimated_vram_gb=_stage_vram_estimate("asset_evaluation", args),
+                        gpu_snapshot=_gpu_admission_snapshot(gpus, eval_capacities),
                     )
                     asset_rows = _run_parallel_stage(
                         args,
@@ -549,6 +579,9 @@ def _fill_stage_gpu_slots(
             capacity_key,
             args,
             growth_blocked,
+            progress_path=progress_path,
+            reported_stage=stage_name,
+            phase=phase,
         )
         running = {
             gpu: sum(1 for _, active_gpu, _ in futures.values() if active_gpu == gpu)
@@ -595,6 +628,10 @@ def _refresh_stage_capacities(
     stage_name: str,
     args: argparse.Namespace,
     growth_blocked: set[str],
+    *,
+    progress_path: Path | None = None,
+    reported_stage: str | None = None,
+    phase: str = "inference",
 ) -> None:
     if not args.auto_workers_per_gpu:
         return
@@ -604,6 +641,7 @@ def _refresh_stage_capacities(
     warmup = max(0.0, float(args.worker_admission_warmup_seconds))
     now = time.monotonic()
     for gpu in capacities:
+        previous_capacity = capacities[gpu]
         running_jobs = [
             started
             for _, active_gpu, started in futures.values()
@@ -625,6 +663,20 @@ def _refresh_stage_capacities(
         additional = int(math.floor(effective_free / estimate))
         target = min(maximum, running + max(0, additional))
         capacities[gpu] = max(running, target)
+        if progress_path is not None and capacities[gpu] != previous_capacity:
+            _scheduler_event(
+                progress_path,
+                event="capacity_update",
+                stage=reported_stage or stage_name,
+                phase=phase,
+                gpu=gpu,
+                old_capacity=previous_capacity,
+                new_capacity=capacities[gpu],
+                running=running,
+                free_vram_gb=free_gb,
+                reserved_vram_gb=reserve,
+                worker_estimate_gb=estimate,
+            )
 
 
 def _run_parallel_sample_major(args: argparse.Namespace, output_dir: Path, indices: list[int]) -> list[dict[str, Any]]:
@@ -1097,7 +1149,7 @@ def _run_refined_final(
             log.write("==== COMMAND ====\n" + " ".join(command) + "\n\n")
             started = time.perf_counter()
             process_result = _run_with_peak_vram(
-                command, log, _child_env(gpu), gpu, runtime_args=args
+                command, log, _child_env(gpu, args), gpu, runtime_args=args
             )
             returncode = process_result.returncode
             peak_vram_gb = process_result.peak_vram_gb
@@ -1222,7 +1274,7 @@ def _run_and_collect(
             log.write(f"CUDA_VISIBLE_DEVICES={gpu if gpu is not None else os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n\n")
             started = time.perf_counter()
             process_result = _run_with_peak_vram(
-                command, log, _child_env(gpu), gpu, runtime_args=runtime_args
+                command, log, _child_env(gpu, runtime_args), gpu, runtime_args=runtime_args
             )
             returncode = process_result.returncode
             peak_vram_gb = process_result.peak_vram_gb
@@ -1318,7 +1370,7 @@ def _eval_assets(ablation: str, out_dir: Path, args: argparse.Namespace | None, 
         log.write("==== COMMAND ====\n" + " ".join(command) + "\n\n")
         log.write(f"CUDA_VISIBLE_DEVICES={gpu if gpu is not None else os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n\n")
         process_result = _run_with_peak_vram(
-            command, log, _child_env(gpu), gpu, runtime_args=args
+            command, log, _child_env(gpu, args), gpu, runtime_args=args
         )
     if process_result.returncode != 0:
         return {
@@ -1537,11 +1589,36 @@ def _scheduler_event(path: Path, *, event: str, **payload: Any) -> None:
     with _SCHEDULER_LOG_LOCK:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if event in {
+            "scheduler_start",
+            "stage_start",
+            "asset_evaluation_start",
+            "capacity_update",
+            "oom_retry",
+            "timeout_retry",
+            "stage_complete",
+        }:
+            print(f"[EVAL-SCHEDULER] {json.dumps(record, sort_keys=True)}", flush=True)
 
 
 def _visible_gpus(args: argparse.Namespace) -> list[str]:
     raw = args.gpus or os.environ.get("CUDA_VISIBLE_DEVICES", "")
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _validate_parallel_launch(args: argparse.Namespace) -> None:
+    gpus = _visible_gpus(args)
+    if args.parallel and str(args.device).startswith("cuda") and not gpus:
+        raise ValueError(
+            "--parallel true requires an explicit --gpus list (for example --gpus 0,1). "
+            "The evaluator no longer silently falls back to one sequential CUDA device; "
+            "check for a broken Bash continuation such as a backslash followed by spaces."
+        )
+    if len(gpus) != len(set(gpus)):
+        raise ValueError(f"--gpus contains duplicate CUDA ids: {gpus}")
+    invalid = [gpu for gpu in gpus if not gpu.isdigit()]
+    if invalid:
+        raise ValueError(f"--gpus must contain physical integer CUDA ids, got {invalid}")
 
 
 def _initial_workers_for_gpu(gpu: str, args: argparse.Namespace) -> int:
@@ -1594,6 +1671,58 @@ def _query_gpu_memory_gb(gpu: str) -> tuple[float | None, float | None]:
         return None, None
 
 
+def _gpu_admission_snapshot(
+    gpus: list[str],
+    capacities: dict[str, int],
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for gpu in gpus:
+        free_gb, total_gb = _query_gpu_memory_gb(gpu)
+        snapshot[gpu] = {
+            "free_vram_gb": free_gb,
+            "total_vram_gb": total_gb,
+            "admitted_workers": capacities.get(gpu, 0),
+            "compute_processes": _query_gpu_compute_processes(gpu),
+        }
+    return snapshot
+
+
+def _query_gpu_compute_processes(gpu: str) -> list[dict[str, Any]]:
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={gpu}",
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3:
+            continue
+        try:
+            rows.append(
+                {
+                    "pid": int(parts[0]),
+                    "process_name": parts[1],
+                    "used_vram_gb": float(parts[2]) / 1024.0,
+                }
+            )
+        except ValueError:
+            continue
+    return rows
+
+
 def _run_with_peak_vram(
     command: list[str],
     log,
@@ -1604,7 +1733,7 @@ def _run_with_peak_vram(
 ) -> ProcessRunResult:
     """Supervise one child process group with progress and VRAM accounting."""
     hard_timeout = max(0.0, float(getattr(runtime_args, "worker_timeout_seconds", 3600.0)))
-    stall_timeout = max(0.0, float(getattr(runtime_args, "worker_stall_timeout_seconds", 900.0)))
+    stall_timeout = max(0.0, float(getattr(runtime_args, "worker_stall_timeout_seconds", 300.0)))
     grace = max(0.0, float(getattr(runtime_args, "worker_terminate_grace_seconds", 15.0)))
     interval = max(0.2, float(getattr(runtime_args, "worker_monitor_interval_seconds", 2.0)))
     popen_kwargs: dict[str, Any] = {
@@ -1663,6 +1792,7 @@ def _run_with_peak_vram(
         if proc.poll() is None:
             _terminate_process_tree(proc, grace)
         returncode = int(proc.wait())
+        _terminate_lingering_process_group(proc.pid, grace, log=log)
         used = _query_process_gpu_memory_gb(gpu, proc.pid)
         if used is not None:
             peak = max(peak, used)
@@ -1765,6 +1895,7 @@ def _unregister_active_child(pid: int) -> None:
 
 def _terminate_process_tree(proc: subprocess.Popen, grace_seconds: float) -> None:
     if proc.poll() is not None:
+        _terminate_lingering_process_group(proc.pid, grace_seconds)
         return
     if os.name == "posix":
         try:
@@ -1809,6 +1940,72 @@ def _terminate_process_tree(proc: subprocess.Popen, grace_seconds: float) -> Non
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _terminate_lingering_process_group(
+    process_group: int,
+    grace_seconds: float,
+    *,
+    log=None,
+) -> None:
+    """Reap CUDA-owning descendants even when their original leader exited.
+
+    Every evaluator child is started in a private POSIX session whose process
+    group id equals the leader pid. Waiting only for that leader can leave
+    compiler, renderer, or multiprocessing descendants holding CUDA contexts.
+    """
+    if os.name != "posix" or process_group <= 0:
+        return
+    natural_exit_deadline = time.monotonic() + min(2.0, max(0.0, grace_seconds))
+    members = _live_process_group_members(process_group)
+    while members and time.monotonic() < natural_exit_deadline:
+        time.sleep(0.1)
+        members = _live_process_group_members(process_group)
+    if not members:
+        return
+    if log is not None:
+        log.write(
+            f"\n[EVALUATOR] reaping lingering process-group descendants "
+            f"pgid={process_group} pids={members}\n"
+        )
+        log.flush()
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + max(0.1, grace_seconds)
+    while _live_process_group_members(process_group) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if _live_process_group_members(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _live_process_group_members(process_group: int) -> list[int]:
+    if os.name != "posix":
+        return []
+    members: list[int] = []
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            if os.getpgid(pid) != process_group:
+                continue
+            raw = (entry / "stat").read_text(encoding="utf-8")
+            fields_after_command = raw[raw.rfind(")") + 2 :].split()
+            state = fields_after_command[0]
+        except (OSError, ProcessLookupError, IndexError):
+            continue
+        if state != "Z":
+            members.append(pid)
+    return sorted(members)
 
 
 def _terminate_all_active_children(grace_seconds: float = 5.0) -> None:
@@ -1901,7 +2098,7 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _verified_stale_eval_worker(pid: int, recorded_command: Any) -> bool:
-    if os.name != "posix" or not _pid_is_alive(pid) or not isinstance(recorded_command, list):
+    if os.name != "posix" or not isinstance(recorded_command, list):
         return False
     approved_scripts = {
         "infer_sparse_ray_geoss_ss.py",
@@ -1915,6 +2112,13 @@ def _verified_stale_eval_worker(pid: int, recorded_command: Any) -> bool:
     )
     if recorded_script is None:
         return False
+    members = _live_process_group_members(pid)
+    if not members:
+        return False
+    # If the private-session leader already exited, its still-live group
+    # members are precisely the orphan descendants recorded by this evaluator.
+    if not _pid_is_alive(pid) or pid not in members:
+        return True
     try:
         live_tokens = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
@@ -1933,9 +2137,9 @@ def _terminate_stale_process_group(pid: int) -> None:
     except (OSError, ProcessLookupError):
         return
     deadline = time.monotonic() + 5.0
-    while _pid_is_alive(pid) and time.monotonic() < deadline:
+    while _live_process_group_members(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
-    if _pid_is_alive(pid):
+    if _live_process_group_members(pid):
         try:
             os.killpg(pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
@@ -1976,7 +2180,10 @@ def _uid_for_index(args: argparse.Namespace, index: int) -> str:
     return str(mapping[index])
 
 
-def _child_env(gpu: str | None) -> dict[str, str]:
+def _child_env(
+    gpu: str | None,
+    runtime_args: argparse.Namespace | None = None,
+) -> dict[str, str]:
     env = dict(os.environ)
     if gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -1986,6 +2193,10 @@ def _child_env(gpu: str | None) -> dict[str, str]:
     env.pop("NCCL_ASYNC_ERROR_HANDLING", None)
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512,garbage_collection_threshold:0.9")
+    cpu_threads = max(1, int(getattr(runtime_args, "worker_cpu_threads", 4)))
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        env[name] = str(cpu_threads)
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
     return env
 
 
