@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import sys
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,6 +22,10 @@ from geoss.renderers.gsplat_renderer import SH_C0, _gaussian_tensors
 from scripts.eval_geovis_slat import _camera_overlap_count
 from scripts.evaluate_meshfleet_sequence import (
     _aggregate,
+    _merge_asset_evaluation_rows,
+    _parse_stage_vram_estimates,
+    _run_with_peak_vram,
+    _stage_capacities,
     _tag_sample_rows,
     _validate_requested_checkpoints,
 )
@@ -325,3 +332,78 @@ def test_evaluator_rejects_missing_enabled_stage_checkpoint_before_workers(tmp_p
     )
     with pytest.raises(FileNotFoundError, match="slat_joint_checkpoint"):
         _validate_requested_checkpoints(args, run_root)
+
+
+def test_stage_scheduler_uses_per_gpu_free_memory_and_stage_reservation(monkeypatch):
+    free = {"0": (72.0, 80.0), "1": (40.0, 80.0)}
+    monkeypatch.setattr(
+        "scripts.evaluate_meshfleet_sequence._query_gpu_memory_gb",
+        lambda gpu: free[gpu],
+    )
+    args = SimpleNamespace(
+        auto_workers_per_gpu=True,
+        max_workers_per_gpu=6,
+        workers_per_gpu=1,
+        min_free_vram_gb=8.0,
+        eval_worker_vram_gb=18.0,
+        _stage_vram_estimates=_parse_stage_vram_estimates(
+            "stage4_geovis_slat_joint=18", 18.0
+        ),
+    )
+    capacities = _stage_capacities(
+        "stage4_geovis_slat_joint",
+        ["0", "1"],
+        args,
+    )
+    assert capacities == {"0": 3, "1": 1}
+
+
+def test_split_asset_evaluation_preserves_inference_gpu_and_failure():
+    inference = [{
+        "ablation": "stage4_geovis_slat_joint",
+        "index": 7,
+        "uid": "sample",
+        "gpu": "0",
+        "population_manifested": True,
+        "status": "ok",
+        "peak_vram_gb": 13.0,
+    }]
+    asset = [{
+        "ablation": "stage4_geovis_slat_joint",
+        "index": 7,
+        "uid": "sample",
+        "gpu": "1",
+        "population_manifested": True,
+        "status": "failed",
+        "asset_eval_status": "failed",
+        "asset_eval_error": "render timeout",
+    }]
+    merged = _merge_asset_evaluation_rows(inference, asset)
+    assert merged[0]["gpu"] == "0"
+    assert merged[0]["asset_eval_gpu"] == "1"
+    assert merged[0]["peak_vram_gb"] == pytest.approx(13.0)
+    assert merged[0]["asset_eval_status"] == "failed"
+    assert merged[0]["status"] == "failed"
+
+
+def test_supervised_worker_hard_timeout_reaps_process_group(tmp_path: Path):
+    log_path = tmp_path / "worker.log"
+    runtime = SimpleNamespace(
+        worker_timeout_seconds=0.25,
+        worker_stall_timeout_seconds=0.0,
+        worker_terminate_grace_seconds=0.1,
+        worker_monitor_interval_seconds=0.05,
+    )
+    started = time.monotonic()
+    with log_path.open("w", encoding="utf-8") as log:
+        result = _run_with_peak_vram(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            log,
+            dict(os.environ),
+            None,
+            runtime_args=runtime,
+        )
+    assert result.returncode != 0
+    assert result.timed_out is True
+    assert result.termination_reason == "hard_timeout_after_0.25_seconds"
+    assert time.monotonic() - started < 5.0

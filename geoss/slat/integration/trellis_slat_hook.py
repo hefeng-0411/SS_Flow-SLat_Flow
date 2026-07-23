@@ -94,7 +94,10 @@ class GeoVisTrellisSLATWrapper(nn.Module):
             t,
             v_base_tokens,
             use_geovis_slat=True,
-            token_valid_mask=valid_mask.unsqueeze(-1).to(slat_latent_tokens.dtype),
+            # pad_sparse_tensor_tokens already returns the canonical [B,L,1]
+            # mask. Adding another singleton dimension breaks the adapter's
+            # strict token contract only on native sparse TRELLIS inference.
+            token_valid_mask=valid_mask.to(slat_latent_tokens.dtype),
             correction_demand=context.get("correction_demand"),
             residual_variance=context.get("residual_variance"),
         )

@@ -175,14 +175,19 @@ python scripts/evaluate_meshfleet_sequence.py \
   --geometry_samples 100000 --geometry_seed 20260720 \
   --fscore_threshold 0.01 --save_visuals true \
   --run_original_trellis true --run_stage1 true --run_stage2 true \
-  --run_stage3 false --run_stage4 true --run_refined_final true \
+  --run_stage3 true --run_stage4 true --run_refined_final true \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
   --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
   --vggt_root /mnt/sda2/hef/Base/vggt \
   --trellis_root /mnt/sda2/hef/Base/TRELLIS \
-  --gpus 0,1,2,3 --parallel true --overwrite true
+  --gpus 0,1,2,3 --parallel true \
+  --scheduler_mode stage_major --auto_workers_per_gpu true \
+  --max_workers_per_gpu 6 --min_free_vram_gb 8 \
+  --stage_vram_gb "original_trellis=18,stage1_geoss_context=8,stage2_geoss_ss=18,stage3_geovis_slat=18,stage4_geovis_slat_joint=18,final_conditioning_refined=8,asset_evaluation=4" \
+  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 900 \
+  --overwrite false
 ```
 
 Selection uses `summary.json -> by_ablation -> official_metrics`, requires
@@ -190,6 +195,23 @@ Selection uses `summary.json -> by_ablation -> official_metrics`, requires
 failure count, runtime, VRAM, and saved visuals. Do not select on latent loss.
 The sampler keeps the learned SLAT residual invariant to TRELLIS CFG strength;
 training reads the same CFG strength/interval from the loaded pipeline.
+
+The default evaluator is stage-major: it completes one homogeneous ablation
+stage across the manifest before advancing, instead of pinning an entire
+multi-stage sample to one GPU. Decoded-asset inference and render/metric
+evaluation are separate homogeneous scheduler phases, so several lightweight
+render workers cannot strand a GPU while the other GPU retains all heavyweight
+TRELLIS workers. Per-stage VRAM reservations determine initial
+admission, live free-memory checks grow concurrency after CUDA allocations
+become visible, and normalized load selects the next GPU. Every child runs in a
+supervised process group with a hard timeout, log/CPU-progress stall timeout, TERM/KILL
+escalation, and a persisted worker registry. `scheduler_progress.jsonl` records
+30-second heartbeats and every admission/completion/retry. A second evaluator
+cannot use the same output directory concurrently; after an abnormal parent
+exit, the next run reaps only registry-verified orphan worker groups. Use
+`--overwrite false` to resume completed artifacts and asset metrics without
+recomputing them. Tune the per-stage estimates only from measured
+`peak_vram_gb` values, retaining the configured free-memory reserve.
 
 ## 5. Final test, once
 
@@ -207,14 +229,19 @@ python scripts/evaluate_meshfleet_sequence.py \
   --geometry_samples 100000 --geometry_seed 20260720 \
   --fscore_threshold 0.01 --save_visuals true \
   --run_original_trellis true --run_stage1 true --run_stage2 true \
-  --run_stage3 false --run_stage4 true --run_refined_final true \
+  --run_stage3 true --run_stage4 true --run_refined_final true \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
   --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
   --vggt_root /mnt/sda2/hef/Base/vggt \
   --trellis_root /mnt/sda2/hef/Base/TRELLIS \
-  --gpus 0,1,2,3 --parallel true --overwrite true
+  --gpus 0,1,2,3 --parallel true \
+  --scheduler_mode stage_major --auto_workers_per_gpu true \
+  --max_workers_per_gpu 6 --min_free_vram_gb 8 \
+  --stage_vram_gb "original_trellis=18,stage1_geoss_context=8,stage2_geoss_ss=18,stage3_geovis_slat=18,stage4_geovis_slat_joint=18,final_conditioning_refined=8,asset_evaluation=4" \
+  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 900 \
+  --overwrite true
 ```
 
 Do not compare against the supplied target until conditioning views, LPIPS
