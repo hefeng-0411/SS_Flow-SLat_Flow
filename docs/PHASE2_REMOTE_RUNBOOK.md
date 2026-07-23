@@ -163,6 +163,18 @@ For every checkpoint, evaluate the complete validation manifest with the same
 command template. The example below evaluates the final decoded model; substitute
 the appropriate config/checkpoint/output identifier for each ablation.
 
+For the standard two-GPU validation run, prefer the checked launcher so a
+backslash followed by whitespace cannot truncate the scheduler arguments:
+
+```bash
+bash scripts/run_phase2_validation_evaluation.sh
+```
+
+Override its defaults with environment variables, for example
+`PHYSICAL_GPUS=0,1,2,3 MAX_WORKERS_PER_GPU=6 bash
+scripts/run_phase2_validation_evaluation.sh`. The evaluator writes and prints
+`effective_launch.json`; confirm its physical GPU list before trusting the run.
+
 ```bash
 python scripts/evaluate_meshfleet_sequence.py \
   --data_root /mnt/sda2/hef/Base/dataset \
@@ -185,8 +197,9 @@ python scripts/evaluate_meshfleet_sequence.py \
   --gpus 0,1,2,3 --parallel true \
   --scheduler_mode stage_major --auto_workers_per_gpu true \
   --max_workers_per_gpu 6 --min_free_vram_gb 8 \
-  --stage_vram_gb "original_trellis=18,stage1_geoss_context=8,stage2_geoss_ss=18,stage3_geovis_slat=18,stage4_geovis_slat_joint=18,final_conditioning_refined=8,asset_evaluation=4" \
-  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 900 \
+  --stage_vram_gb "original_trellis=16,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
+  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 300 \
+  --worker_cpu_threads 4 \
   --overwrite false
 ```
 
@@ -239,8 +252,9 @@ python scripts/evaluate_meshfleet_sequence.py \
   --gpus 0,1,2,3 --parallel true \
   --scheduler_mode stage_major --auto_workers_per_gpu true \
   --max_workers_per_gpu 6 --min_free_vram_gb 8 \
-  --stage_vram_gb "original_trellis=18,stage1_geoss_context=8,stage2_geoss_ss=18,stage3_geovis_slat=18,stage4_geovis_slat_joint=18,final_conditioning_refined=8,asset_evaluation=4" \
-  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 900 \
+  --stage_vram_gb "original_trellis=16,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
+  --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 300 \
+  --worker_cpu_threads 4 \
   --overwrite true
 ```
 

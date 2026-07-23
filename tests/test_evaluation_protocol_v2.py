@@ -27,6 +27,7 @@ from scripts.evaluate_meshfleet_sequence import (
     _run_with_peak_vram,
     _stage_capacities,
     _tag_sample_rows,
+    _validate_parallel_launch,
     _validate_requested_checkpoints,
 )
 from scripts.infer_geovis_slat import _inference_only_batch
@@ -358,6 +359,13 @@ def test_stage_scheduler_uses_per_gpu_free_memory_and_stage_reservation(monkeypa
     assert capacities == {"0": 3, "1": 1}
 
 
+def test_parallel_cuda_launch_requires_visible_gpu_list(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    args = SimpleNamespace(parallel=True, device="cuda", gpus=None)
+    with pytest.raises(ValueError, match="--gpus"):
+        _validate_parallel_launch(args)
+
+
 def test_split_asset_evaluation_preserves_inference_gpu_and_failure():
     inference = [{
         "ablation": "stage4_geovis_slat_joint",
@@ -407,3 +415,29 @@ def test_supervised_worker_hard_timeout_reaps_process_group(tmp_path: Path):
     assert result.timed_out is True
     assert result.termination_reason == "hard_timeout_after_0.25_seconds"
     assert time.monotonic() - started < 5.0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cleanup contract")
+def test_supervisor_reaps_descendant_after_normal_leader_exit(tmp_path: Path):
+    log_path = tmp_path / "descendant.log"
+    runtime = SimpleNamespace(
+        worker_timeout_seconds=10.0,
+        worker_stall_timeout_seconds=0.0,
+        worker_terminate_grace_seconds=0.1,
+        worker_monitor_interval_seconds=0.05,
+    )
+    code = (
+        "import subprocess,sys;"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        "print('leader exiting', flush=True)"
+    )
+    with log_path.open("w", encoding="utf-8") as log:
+        result = _run_with_peak_vram(
+            [sys.executable, "-c", code],
+            log,
+            dict(os.environ),
+            None,
+            runtime_args=runtime,
+        )
+    assert result.returncode == 0
+    assert "reaping lingering process-group descendants" in log_path.read_text(encoding="utf-8")
