@@ -15,7 +15,7 @@ LEGACY_PROXY_KEYS = ("render_DINO_similarity", "render_multi_view_consistency")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Aggregate legacy and protocol-v2 MeshFleet evaluation results.")
+    parser = argparse.ArgumentParser(description="Aggregate legacy and protocol-v2/v3 MeshFleet evaluation results.")
     parser.add_argument("--input_dir", default="outputs/evaluation_suite_metrics")
     parser.add_argument("--output_dir", default="outputs/evaluation_suite_analysis")
     parser.add_argument("--baseline", default="original_trellis")
@@ -45,7 +45,7 @@ def main() -> None:
     worst_views = sorted(view_rows, key=lambda row: row.get("PSNR", math.inf))[: max(0, args.worst_views)]
     invalid_reasons = _integrity_findings(records)
     result = {
-        "analysis_version": "evaluation_suite_audit_v2",
+        "analysis_version": "evaluation_suite_audit_v3",
         "input_dir": str(input_dir),
         "record_count": len(records),
         "object_count": len(all_uids),
@@ -55,7 +55,11 @@ def main() -> None:
         "view_index_summary": view_index_summary,
         "worst_views": worst_views,
         "integrity_findings": invalid_reasons,
-        "legacy_results_are_official": False,
+        "official_v3_record_count": sum(
+            record.get("declared_protocol") == "meshfleet_heldout_v3"
+            and record.get("declared_official") is True
+            for record in records
+        ),
     }
     (output_dir / "analysis.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     _write_records(output_dir / "per_object.csv", records)
@@ -86,7 +90,18 @@ def _read_records(root: Path) -> List[Dict[str, Any]]:
             "has_legacy_proxies": any(key in payload for key in LEGACY_PROXY_KEYS),
             "view_metrics": payload.get("render_view_metrics", []),
         }
-        for metric in (*OFFICIAL_APPEARANCE, "Mask_IoU", "Boundary_F_score", "masked_PSNR", "masked_SSIM", "masked_LPIPS"):
+        for metric in (
+            *OFFICIAL_APPEARANCE,
+            "Mask_IoU",
+            "Boundary_F_score",
+            "masked_PSNR",
+            "masked_SSIM",
+            "masked_LPIPS",
+            "foreground_crop_PSNR",
+            "foreground_crop_SSIM",
+            "foreground_crop_LPIPS",
+            "foreground_L1",
+        ):
             value = payload.get(f"render_{metric}", payload.get(metric))
             if _is_number(value):
                 record[metric] = float(value)
@@ -109,11 +124,29 @@ def _method_summary(records: List[Dict[str, Any]], expected_uids: List[str]) -> 
         "geometry_n": sum(bool(record.get("has_geometry")) for record in records),
         "declared_official_n": sum(record.get("declared_official") is True for record in records),
     }
-    for metric in (*OFFICIAL_APPEARANCE, "CD", "F-score", "Mask_IoU", "Boundary_F_score"):
+    for metric in (
+        *OFFICIAL_APPEARANCE,
+        "CD",
+        "F-score",
+        "Mask_IoU",
+        "Boundary_F_score",
+        "foreground_crop_PSNR",
+        "foreground_crop_SSIM",
+        "foreground_crop_LPIPS",
+        "foreground_L1",
+    ):
         values = [record[metric] for record in records if _is_number(record.get(metric))]
         if values:
             summary[metric] = _distribution(values)
-            direction = 1 if metric in {"PSNR", "SSIM", "F-score", "Mask_IoU", "Boundary_F_score"} else -1
+            direction = 1 if metric in {
+                "PSNR",
+                "SSIM",
+                "F-score",
+                "Mask_IoU",
+                "Boundary_F_score",
+                "foreground_crop_PSNR",
+                "foreground_crop_SSIM",
+            } else -1
             worst = min((record for record in records if _is_number(record.get(metric))), key=lambda row: direction * row[metric])
             summary[f"worst_{metric}"] = {"uid": worst["uid"], "value": worst[metric]}
     return summary
@@ -166,8 +199,12 @@ def _integrity_findings(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not record.get("has_geometry"):
             reasons.append("CD and F-score are absent")
         protocol = str(record.get("declared_protocol") or "")
-        if protocol != "meshfleet_heldout_v2":
-            reasons.append("not produced by leakage-checked held-out protocol v2")
+        if protocol == "meshfleet_heldout_v2":
+            reasons.append(
+                "protocol v2 predates explicit no-GT-mesh/no-GT-voxel/no-evaluation-view provenance"
+            )
+        elif protocol != "meshfleet_heldout_v3":
+            reasons.append("not produced by leakage-checked held-out protocol v3")
         if reasons:
             findings.append({"uid": record["uid"], "method": record["method"], "reasons": reasons})
     return findings
@@ -205,11 +242,20 @@ def _write_records(path: Path, records: List[Dict[str, Any]]) -> None:
 
 
 def _markdown_report(result: Dict[str, Any]) -> str:
+    if result.get("official_v3_record_count", 0):
+        protocol_note = (
+            f"{result['official_v3_record_count']} record(s) declare complete "
+            "MeshFleet held-out protocol v3 metrics. Other records remain diagnostic."
+        )
+    else:
+        protocol_note = (
+            "No record satisfies the current held-out protocol v3. Legacy files "
+            "remain diagnostic rather than target-comparable."
+        )
     lines = [
         "# Evaluation suite audit",
         "",
-        "These are legacy diagnostic results, not official target-comparable metrics. The files use conditioning views, "
-        "nonstandard SSIM/LPIPS proxies, omit CD/F-score, and predate the TRELLIS export-frame correction.",
+        protocol_note,
         "",
         "| Method | N | PSNR mean | SSIM mean | LPIPS mean | Geometry N |",
         "|---|---:|---:|---:|---:|---:|",

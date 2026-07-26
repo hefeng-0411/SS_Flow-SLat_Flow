@@ -113,6 +113,28 @@ def test_stage1_batch_sanitizer_drops_sparse_structure_latents():
         assert "gt_occ" in clean
 
 
+def test_inference_only_loading_never_materializes_3d_targets():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_flat_sample(root / "test", uid="conditioning_only")
+        dataset = MeshFleetTrellisDataset(
+            root,
+            split="test",
+            num_views=1,
+            image_size=16,
+            load_3d_modalities=False,
+        )
+        sample = dataset.get_by_uid("conditioning_only")
+        assert sample["mesh_path"] is None
+        assert sample["has_gt"].item() == 0
+        assert "gt_occ" not in sample
+        assert "gt_sparse_xyz" not in sample
+        assert "ss_latent_grid" not in sample
+        assert "trellis_slat_feats" not in sample
+        assert "trellis_patchtokens" not in sample
+        assert set(sample["metadata"]["paths"]) <= {"render_dir", "cond_render_dir"}
+
+
 def test_exact_uid_lookup_remains_correct_after_required_modality_filtering():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

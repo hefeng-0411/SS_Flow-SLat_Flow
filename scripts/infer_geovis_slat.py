@@ -164,6 +164,9 @@ def main() -> None:
             "adapter_checkpoint": checkpoint_status,
             "geovis_context": str(out_dir / "geovis_slat_context.pt") if args.save_context or batch is not None else args.geovis_context,
             "test_time_ground_truth_latents_used": False if batch is not None else None,
+            "test_time_ground_truth_mesh_used": False if batch is not None else None,
+            "test_time_ground_truth_voxels_used": False if batch is not None else None,
+            "evaluation_views_used": False if batch is not None else None,
             "inference_context_source": batch.get("inference_context_source") if batch is not None else "external_context",
         }
         if batch is not None:
@@ -239,6 +242,7 @@ def _load_meshfleet_batch(args: argparse.Namespace) -> dict:
         slat_latent_model=args.meshfleet_slat_latent_model,
         require_slat_latents=False,
         uid_manifest=[args.meshfleet_uid] if args.meshfleet_uid else None,
+        load_3d_modalities=False,
     )
     if len(dataset) == 0:
         raise FileNotFoundError(f"No MeshFleet samples found at root={args.meshfleet_root}, split={args.meshfleet_split}.")

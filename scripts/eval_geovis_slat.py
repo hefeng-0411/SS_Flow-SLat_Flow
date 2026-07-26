@@ -71,7 +71,7 @@ def main() -> None:
             "decoder_enabled": False,
             "render_eval_enabled": bool(args.render_eval),
             "official_metrics": False,
-            "evaluation_protocol": "meshfleet_heldout_v2",
+            "evaluation_protocol": "meshfleet_heldout_v3",
         }
     else:
         run_modes = {
@@ -178,6 +178,7 @@ def _evaluate_gaussian_renders(args: argparse.Namespace, out_dir: Path) -> dict:
         background_color=args.background_color,
         repeat_views_if_insufficient=False,
         uid_manifest=[args.meshfleet_uid] if args.meshfleet_uid else None,
+        load_3d_modalities=False,
     )
     if not len(dataset):
         raise FileNotFoundError(f"No renderable MeshFleet samples under {args.meshfleet_root} ({args.meshfleet_split}).")
@@ -197,6 +198,7 @@ def _evaluate_gaussian_renders(args: argparse.Namespace, out_dir: Path) -> dict:
         background_color=args.background_color,
         repeat_views_if_insufficient=False,
         uid_manifest=[sample["uid"]],
+        load_3d_modalities=False,
     )
     cond_sample = conditioning.get_by_uid(sample["uid"])
     if cond_sample["uid"] != sample["uid"]:
@@ -212,7 +214,15 @@ def _evaluate_gaussian_renders(args: argparse.Namespace, out_dir: Path) -> dict:
         provenance_path = Path(args.inference_metrics)
         if provenance_path.is_file():
             inference_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-            leakage_free = inference_provenance.get("test_time_ground_truth_latents_used") is False
+            leakage_free = all(
+                inference_provenance.get(field) is False
+                for field in (
+                    "test_time_ground_truth_latents_used",
+                    "test_time_ground_truth_mesh_used",
+                    "test_time_ground_truth_voxels_used",
+                    "evaluation_views_used",
+                )
+            )
     gaussian_cpu = trellis_export_gaussian_to_internal(read_gaussian_ply(args.gaussian_ply, real_mode=True))
     gaussian = {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in gaussian_cpu.items()}
     images = sample["images"].to(device=device, dtype=torch.float32)
@@ -257,6 +267,9 @@ def _evaluate_gaussian_renders(args: argparse.Namespace, out_dir: Path) -> dict:
             "background_color": [float(v) for v in args.background_color],
             "appearance_protocol_valid": bool(overlap == 0 and args.eval_view_set.startswith("renders_eval_") and leakage_free),
             "test_time_ground_truth_latents_used": inference_provenance.get("test_time_ground_truth_latents_used"),
+            "test_time_ground_truth_mesh_used": inference_provenance.get("test_time_ground_truth_mesh_used"),
+            "test_time_ground_truth_voxels_used": inference_provenance.get("test_time_ground_truth_voxels_used"),
+            "evaluation_views_used": inference_provenance.get("evaluation_views_used"),
             "inference_context_source": inference_provenance.get("inference_context_source"),
             "render_metric_protocol": {
                 "color_space": "sRGB [0,1]",
@@ -264,8 +277,20 @@ def _evaluate_gaussian_renders(args: argparse.Namespace, out_dir: Path) -> dict:
                 "PSNR": "per-view RGB MSE then object mean",
                 "SSIM": "11x11 Gaussian window sigma=1.5",
                 "LPIPS": "lpips.LPIPS(net='vgg') on [-1,1]",
+                "foreground_crop": (
+                    "tight GT-alpha bounding rectangle with 5% padding, "
+                    "identically resized to 128x128 before PSNR/SSIM/LPIPS"
+                ),
+                "masked_metrics": (
+                    "legacy zero-masked metrics retained for compatibility; "
+                    "foreground_crop metrics are preferred for selection"
+                ),
                 "view_role": "held-out cameras only",
-                "leakage_check": "conditioning/evaluation cameras disjoint and inference provenance contains no GT 3D latents",
+                "leakage_check": (
+                    "conditioning/evaluation cameras disjoint and inference "
+                    "provenance explicitly rejects GT latents, mesh, voxels, "
+                    "and evaluation views"
+                ),
             },
         }
     )
@@ -285,6 +310,7 @@ def _meshfleet_gt_mesh(args: argparse.Namespace) -> Optional[Path]:
         background_color=args.background_color,
         repeat_views_if_insufficient=False,
         uid_manifest=[args.meshfleet_uid] if args.meshfleet_uid else None,
+        load_3d_modalities=False,
     )
     if args.meshfleet_uid:
         index = dataset.index_for_uid(args.meshfleet_uid)

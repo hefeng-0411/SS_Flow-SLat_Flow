@@ -2,6 +2,7 @@
 open3d
 trimesh[easy]
 plyfile
+scikit-image
 point-cloud-utils
 pymeshlab
 PyMCubes

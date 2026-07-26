@@ -37,17 +37,77 @@ def image_render_metrics(pred_rgb: torch.Tensor, gt_rgb: torch.Tensor, pred_mask
         masked_mse = (pred - gt).square().masked_select(mask.expand_as(pred)).mean().clamp_min(1e-8) if mask.any() else mse
         pred_fg = pred * gm
         gt_fg = gt * gm
+        crop_metrics = _foreground_crop_metrics(pred, gt, gm)
         metrics.update(
             {
                 "masked_PSNR": float((-10.0 * torch.log10(masked_mse)).detach().cpu()),
                 "masked_SSIM": float(_ssim(pred_fg, gt_fg).detach().cpu()),
                 "masked_LPIPS": float(_lpips(pred_fg, gt_fg).detach().cpu()),
+                **crop_metrics,
                 "foreground_L1": float((pred - gt).abs().masked_select(mask.expand_as(pred)).mean().detach().cpu()) if mask.any() else 0.0,
                 "Mask_IoU": float((((pm > 0.5) & (gm > 0.5)).sum() / (((pm > 0.5) | (gm > 0.5)).sum().clamp_min(1))).detach().cpu()),
                 "Boundary_F_score": float(_boundary_fscore(pm, gm).detach().cpu()),
             }
         )
     return metrics
+
+
+def _foreground_crop_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    gt_mask: torch.Tensor,
+    *,
+    output_size: int = 128,
+    padding_fraction: float = 0.05,
+) -> Dict[str, float]:
+    """Metrics on tight per-image foreground crops, resized identically.
+
+    This complements legacy masked SSIM/LPIPS, whose zeroed background can
+    dominate when the object occupies a small fraction of the frame.
+    """
+    psnr_values = []
+    ssim_values = []
+    lpips_values = []
+    for index in range(pred.shape[0]):
+        foreground = torch.nonzero(gt_mask[index, 0] > 0.5, as_tuple=False)
+        if foreground.numel() == 0:
+            continue
+        y_min, x_min = foreground.amin(dim=0)
+        y_max, x_max = foreground.amax(dim=0)
+        height = int(y_max - y_min + 1)
+        width = int(x_max - x_min + 1)
+        pad = max(1, int(round(float(max(height, width)) * padding_fraction)))
+        y0 = max(0, int(y_min) - pad)
+        y1 = min(pred.shape[-2], int(y_max) + pad + 1)
+        x0 = max(0, int(x_min) - pad)
+        x1 = min(pred.shape[-1], int(x_max) + pad + 1)
+        pred_crop = F.interpolate(
+            pred[index : index + 1, :, y0:y1, x0:x1],
+            size=(output_size, output_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        gt_crop = F.interpolate(
+            gt[index : index + 1, :, y0:y1, x0:x1],
+            size=(output_size, output_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        mse = (pred_crop - gt_crop).square().mean().clamp_min(1e-8)
+        psnr_values.append(-10.0 * torch.log10(mse))
+        ssim_values.append(_ssim(pred_crop, gt_crop))
+        lpips_values.append(_lpips(pred_crop, gt_crop))
+    if not psnr_values:
+        return {
+            "foreground_crop_PSNR": 0.0,
+            "foreground_crop_SSIM": 0.0,
+            "foreground_crop_LPIPS": 0.0,
+        }
+    return {
+        "foreground_crop_PSNR": float(torch.stack(psnr_values).mean().detach().cpu()),
+        "foreground_crop_SSIM": float(torch.stack(ssim_values).mean().detach().cpu()),
+        "foreground_crop_LPIPS": float(torch.stack(lpips_values).mean().detach().cpu()),
+    }
 
 
 def _as_nchw(images: torch.Tensor) -> torch.Tensor:

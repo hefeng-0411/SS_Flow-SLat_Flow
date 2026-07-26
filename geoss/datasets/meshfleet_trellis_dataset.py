@@ -72,6 +72,7 @@ class MeshFleetTrellisDataset(Dataset):
         require_features: bool = False,
         require_voxels: bool = False,
         strict_uid_manifest: bool = True,
+        load_3d_modalities: bool = True,
     ) -> None:
         self.root = Path(root)
         self.split = split
@@ -100,6 +101,7 @@ class MeshFleetTrellisDataset(Dataset):
         self.require_features = bool(require_features)
         self.require_voxels = bool(require_voxels)
         self.strict_uid_manifest = bool(strict_uid_manifest)
+        self.load_3d_modalities = bool(load_3d_modalities)
         self.uid_manifest = _load_uid_manifest(uid_manifest)
         self.discovery_skips: List[Dict[str, str]] = []
         self.samples = self._discover_samples()
@@ -184,7 +186,11 @@ class MeshFleetTrellisDataset(Dataset):
             "category": sample["category"],
             "dataset_name": "meshfleet_trellis",
             "split": sample["split"],
-            "mesh_path": str(sample["mesh_path"]) if sample.get("mesh_path") else None,
+            "mesh_path": (
+                str(sample["mesh_path"])
+                if self.load_3d_modalities and sample.get("mesh_path")
+                else None
+            ),
             "metadata": {
                 "aabb": transforms.get("aabb"),
                 "scale": transforms.get("scale"),
@@ -198,7 +204,15 @@ class MeshFleetTrellisDataset(Dataset):
                 "background_color": list(self.background_color),
                 "selected_frame_paths": [str(path) for _, path in chosen],
                 "selected_frame_ids": [str(frame.get("file_path") or frame.get("image_path") or frame.get("filename")) for frame, _ in chosen],
-                "paths": {key: str(value) for key, value in sample["paths"].items() if value is not None},
+                "paths": {
+                    key: str(value)
+                    for key, value in sample["paths"].items()
+                    if value is not None
+                    and (
+                        self.load_3d_modalities
+                        or key in {"render_dir", "cond_render_dir"}
+                    )
+                },
                 "num_frames_total": len(frames),
                 "num_frames_available": len(available),
                 "num_frames_missing": missing_view_count,
@@ -209,27 +223,30 @@ class MeshFleetTrellisDataset(Dataset):
             },
             # Keep GT availability explicit: an object such as test_000025 can
             # still train its appearance branch without inventing geometry GT.
-            "has_gt": torch.tensor(sample.get("voxel_path") is not None, dtype=torch.float32),
+            "has_gt": torch.tensor(
+                self.load_3d_modalities and sample.get("voxel_path") is not None,
+                dtype=torch.float32,
+            ),
         }
         cond_image = _load_condition_image(sample.get("cond_render_dir"), chosen[0][1])
         if cond_image is not None:
             pack["trellis_cond_image"] = cond_image
-        if sample.get("voxel_path"):
+        if self.load_3d_modalities and sample.get("voxel_path"):
             points = read_ply_xyz(sample["voxel_path"])
             points_canonical, voxel_meta = _meshfleet_voxels_to_canonical(points)
             pack["gt_occ"] = points_to_occupancy(points_canonical, resolution=self.occ_resolution)
             pack["gt_sparse_indices"] = anchor_to_occ_index(points_canonical, self.occ_resolution)
             pack["gt_sparse_xyz"] = points_canonical
             pack["metadata"]["voxel_coordinate"] = voxel_meta
-        if sample.get("ss_latent_path"):
+        if self.load_3d_modalities and sample.get("ss_latent_path"):
             latent = np.load(sample["ss_latent_path"])
             pack["ss_latent_grid"] = torch.tensor(latent["mean"]).float()
             pack["ss_latent_tokens"] = pack["ss_latent_grid"].flatten(1).transpose(0, 1).contiguous()
-        if sample.get("slat_latent_path"):
+        if self.load_3d_modalities and sample.get("slat_latent_path"):
             latent = np.load(sample["slat_latent_path"])
             pack["trellis_slat_feats"] = torch.tensor(latent["feats"]).float()
             pack["trellis_slat_indices"] = torch.tensor(latent["coords"]).long()
-        if sample.get("feature_path"):
+        if self.load_3d_modalities and sample.get("feature_path"):
             feats = np.load(sample["feature_path"])
             if "patchtokens" in feats:
                 pack["trellis_patchtokens"] = torch.tensor(feats["patchtokens"]).float()

@@ -1,13 +1,13 @@
 # Phase II remote training and evaluation runbook
 
-All commands run from `/mnt/sda2/hef/Base/SS_Flow`. They assume four GPUs; change
+All commands run from `/mnt/sda2/hef/Base/SS_Flow-SLat_Flow_v2`. They assume four GPUs; change
 `--nproc_per_node` and batch limits to match the server. Test evaluation is the
 last command and must not be run until validation selects a frozen method.
 
 ## 1. Environment and dataset gate
 
 ```bash
-cd /mnt/sda2/hef/Base/SS_Flow
+cd /mnt/sda2/hef/Base/SS_Flow-SLat_Flow_v2
 python -m pip install -r requirements/all.txt
 python - <<'PY'
 import torch
@@ -15,16 +15,25 @@ print(torch.__version__, torch.cuda.get_device_name(0), torch.cuda.device_count(
 PY
 
 python scripts/inspect_meshfleet_dataset.py \
-  --data_root /mnt/sda2/hef/Base/dataset \
+  --data_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --output_dir outputs/phase2/dataset_audit \
   --splits train,test --validation_percent 10 --split_seed 20260720 \
   --min_train_views 8 --min_eval_views 12 \
   --hash_files --validate_payloads --strict --strict_scope manifests
 
 python scripts/profile_meshfleet_distribution.py \
-  --data_root /mnt/sda2/hef/Base/dataset \
+  --data_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --output_dir outputs/phase2/dataset_profile \
   --splits train,test --images_per_set 8 --hash_meshes
+
+python -m pytest -q \
+  tests/test_dataset_audit_manifests.py \
+  tests/test_meshfleet_trellis_dataset.py \
+  tests/test_evaluation_protocol_v2.py \
+  tests/test_trellis_mask_aware_crop.py \
+  tests/test_visual_hull_reconstruction.py \
+  tests/test_vggt_depth_fusion.py \
+  tests/test_safe_gaussian_refinement.py
 ```
 
 `all_discovered_valid=false` is expected when the raw corpus contains incomplete
@@ -37,14 +46,16 @@ manifests instead of deleting objects. `train_uids.json`,
 `validation_uids.json`, and `test_uids.json` are the conservative, fully
 complete manifests. `test_evaluation_uids.json` is the broader protocol-valid
 population whose inference inputs and evaluation GT exist even if an unused
-training cache is absent; choose one population before experiments and never
-change it after seeing model results.
+training cache is absent. The checked launchers freeze the matching
+`validation_evaluation_uids.json` population, and final test uses
+`test_evaluation_uids.json`; never change either population after seeing model
+results.
 
 ## 2. Reproduce the corrected SS foundation
 
 ```bash
 python scripts/launch_meshfleet_multigpu_sequence.py \
-  --data_root /mnt/sda2/hef/Base/dataset \
+  --data_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --output_root outputs/phase2/foundation \
   --stage1_train_manifest outputs/phase2/dataset_audit/stage1_train_uids.json \
   --stage2_train_manifest outputs/phase2/dataset_audit/stage2_train_uids.json \
@@ -63,7 +74,7 @@ Shared arguments:
 
 ```bash
 COMMON_ARGS="--device cuda \
-  --meshfleet_root /mnt/sda2/hef/Base/dataset \
+  --meshfleet_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --meshfleet_split train \
   --train_manifest outputs/phase2/dataset_audit/stage3_train_uids.json \
   --num_views 8 --image_size 256 --active_tokens 0 \
@@ -108,7 +119,7 @@ only intended difference:
 ```bash
 FACTOR_CKPT=outputs/phase2/ablation_factorized_control/geovis_slat_adapter_step_XXXXXXXX.pt
 DECODE_ARGS="--device cuda \
-  --meshfleet_root /mnt/sda2/hef/Base/dataset \
+  --meshfleet_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --meshfleet_split train \
   --train_manifest outputs/phase2/dataset_audit/stage4_train_uids.json \
   --num_views 8 --image_size 256 --active_tokens 0 \
@@ -163,6 +174,40 @@ For every checkpoint, evaluate the complete validation manifest with the same
 command template. The example below evaluates the final decoded model; substitute
 the appropriate config/checkpoint/output identifier for each ablation.
 
+Before spending more compute on the legacy trainable stages, run the
+foundational intervention. It compares the unchanged Original TRELLIS asset
+against (a) native multi-image TRELLIS with the mask-aware crop used by its
+pretraining pipeline, (b) a conditioning-silhouette visual hull, and (c) that
+same hull with conservative, confidence-filtered VGGT free-space carving. The
+two explicit-geometry candidates copy the Original TRELLIS Gaussian
+byte-for-byte, so their PSNR/SSIM/LPIPS must match the baseline up to evaluator
+determinism. Any geometry gain is therefore causal and cannot be attributed to
+appearance or a different UID population.
+
+Run a two-object smoke test first:
+
+```bash
+MAX_SAMPLES=2 OVERWRITE=true \
+  bash scripts/run_foundational_geometry_ablation.sh
+```
+
+Require all four methods to finish, inspect each
+`vggt_depth_fused/metrics.json` for valid camera alignment and nonzero depth
+support, and run the tensor tests in Section 1. Then run the frozen complete
+validation population:
+
+```bash
+MAX_SAMPLES=0 OVERWRITE=false \
+  bash scripts/run_foundational_geometry_ablation.sh
+```
+
+Read paired effects from
+`summary.json -> paired_vs_original_trellis`. Metric effects use an
+improvement-positive convention (PSNR/SSIM/F-score candidate minus baseline;
+LPIPS/CD baseline minus candidate) and include paired CI95, median, win rate,
+worst regression, and an exact sign test. A candidate is ineligible when
+`official_complete=false`; never compare unmatched successful subsets.
+
 For the standard two-GPU validation run, prefer the checked launcher so a
 backslash followed by whitespace cannot truncate the scheduler arguments:
 
@@ -177,18 +222,26 @@ scripts/run_phase2_validation_evaluation.sh`. The evaluator writes and prints
 
 ```bash
 python scripts/evaluate_meshfleet_sequence.py \
-  --data_root /mnt/sda2/hef/Base/dataset \
+  --data_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --run_root outputs/phase2/foundation \
   --output_dir outputs/phase2/validation_final_decoded_asset \
   --split train \
-  --uid_manifest outputs/phase2/dataset_audit/validation_uids.json \
+  --uid_manifest outputs/phase2/dataset_audit/validation_evaluation_uids.json \
   --max_samples 0 --num_views 8 --eval_num_views 12 --image_size 256 \
+  --foundation_conditioning_image_size 518 \
+  --trellis_multi_image_mode multidiffusion \
+  --trellis_ss_steps 12 --trellis_ss_cfg_strength 7.5 \
+  --trellis_slat_steps 12 --trellis_slat_cfg_strength 3.0 \
+  --trellis_candidate_seeds 42 \
   --conditioning_view_set renders --eval_view_set renders_eval_70 \
   --geometry_samples 100000 --geometry_seed 20260720 \
   --fscore_threshold 0.01 --save_visuals true \
-  --run_original_trellis true --run_stage1 true --run_stage2 true \
+  --run_original_trellis true --run_trellis_mask_cropped true --run_stage1 true --run_stage2 true \
+  --run_direct_visual_hull true --run_vggt_depth_fused true \
   --run_stage3 true --run_stage4 true --run_refined_final true \
+  --refinement_source_stage original_trellis \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
+  --slat_checkpoint outputs/phase2/foundation/stage3_geovis_slat/geovis_slat_adapter_best.pt \
   --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
@@ -197,7 +250,7 @@ python scripts/evaluate_meshfleet_sequence.py \
   --gpus 0,1,2,3 --parallel true \
   --scheduler_mode stage_major --auto_workers_per_gpu true \
   --max_workers_per_gpu 6 --min_free_vram_gb 8 \
-  --stage_vram_gb "original_trellis=16,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
+  --stage_vram_gb "original_trellis=14,trellis_mask_cropped=14,direct_visual_hull=4,vggt_depth_fused=18,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
   --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 300 \
   --worker_cpu_threads 4 \
   --overwrite false
@@ -208,6 +261,15 @@ Selection uses `summary.json -> by_ablation -> official_metrics`, requires
 failure count, runtime, VRAM, and saved visuals. Do not select on latent loss.
 The sampler keeps the learned SLAT residual invariant to TRELLIS CFG strength;
 training reads the same CFG strength/interval from the loaded pipeline.
+
+`final_conditioning_refined` now uses the conservative v2 refiner. It partitions
+only conditioning views into disjoint optimization and selection subsets,
+constrains color changes to a bounded residual, and freezes opacity by default.
+A candidate is accepted only when selection-view objective improves without
+foreground-L1, SSIM, or mask regression. Otherwise the source Gaussian is
+copied byte-for-byte. After the complete asset ablation, rerun validation with
+`REFINEMENT_SOURCE_STAGE=<winning stage>` through the checked launcher; do not
+choose that source from test metrics.
 
 The default evaluator is stage-major: it completes one homogeneous ablation
 stage across the manifest before advancing, instead of pinning an entire
@@ -232,18 +294,26 @@ Freeze the winning validation config/checkpoints and run:
 
 ```bash
 python scripts/evaluate_meshfleet_sequence.py \
-  --data_root /mnt/sda2/hef/Base/dataset \
+  --data_root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   --run_root outputs/phase2/foundation \
   --output_dir outputs/phase2/final_test \
   --split test \
-  --uid_manifest outputs/phase2/dataset_audit/test_uids.json \
+  --uid_manifest outputs/phase2/dataset_audit/test_evaluation_uids.json \
   --max_samples 0 --num_views 8 --eval_num_views 12 --image_size 256 \
+  --foundation_conditioning_image_size 518 \
+  --trellis_multi_image_mode multidiffusion \
+  --trellis_ss_steps 12 --trellis_ss_cfg_strength 7.5 \
+  --trellis_slat_steps 12 --trellis_slat_cfg_strength 3.0 \
+  --trellis_candidate_seeds 42 \
   --conditioning_view_set renders --eval_view_set renders_eval_70 \
   --geometry_samples 100000 --geometry_seed 20260720 \
   --fscore_threshold 0.01 --save_visuals true \
-  --run_original_trellis true --run_stage1 true --run_stage2 true \
+  --run_original_trellis true --run_trellis_mask_cropped true --run_stage1 true --run_stage2 true \
+  --run_direct_visual_hull true --run_vggt_depth_fused true \
   --run_stage3 true --run_stage4 true --run_refined_final true \
+  --refinement_source_stage original_trellis \
   --config_slat_joint configs/phase2_decoded_asset.yaml \
+  --slat_checkpoint outputs/phase2/foundation/stage3_geovis_slat/geovis_slat_adapter_best.pt \
   --slat_joint_checkpoint outputs/phase2/foundation/stage4_geovis_slat_joint/geovis_slat_adapter_best.pt \
   --geoss_checkpoint outputs/phase2/foundation/stage1_geoss/geoss_adapter_best.pt \
   --ss_checkpoint outputs/phase2/foundation/stage2_ss_velocity/ss_velocity_adapter_best.pt \
@@ -252,7 +322,7 @@ python scripts/evaluate_meshfleet_sequence.py \
   --gpus 0,1,2,3 --parallel true \
   --scheduler_mode stage_major --auto_workers_per_gpu true \
   --max_workers_per_gpu 6 --min_free_vram_gb 8 \
-  --stage_vram_gb "original_trellis=16,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
+  --stage_vram_gb "original_trellis=14,trellis_mask_cropped=14,direct_visual_hull=4,vggt_depth_fused=18,stage1_geoss_context=13,stage2_geoss_ss=16,stage3_geovis_slat=16,stage4_geovis_slat_joint=16,final_conditioning_refined=8,asset_evaluation=4" \
   --worker_timeout_seconds 3600 --worker_stall_timeout_seconds 300 \
   --worker_cpu_threads 4 \
   --overwrite true
@@ -261,3 +331,7 @@ python scripts/evaluate_meshfleet_sequence.py \
 Do not compare against the supplied target until conditioning views, LPIPS
 backbone, background, resolution, CD convention, normalization, and F-score
 threshold have been confirmed identical.
+
+Replace the final-test `--refinement_source_stage` value with the source frozen
+by validation. The literal `original_trellis` above is the safe default and
+does not assert that any experimental geometry or latent stage has won.
