@@ -45,6 +45,8 @@ def main() -> None:
     parser.add_argument("--render_eval", type=str2bool, default=True)
     parser.add_argument("--save_context", type=str2bool, default=True)
     parser.add_argument("--disable_ss_adapter", type=str2bool, default=False)
+    parser.add_argument("--trellis_mask_aware_crop", type=str2bool, default=False)
+    parser.add_argument("--trellis_crop_padding", type=float, default=1.2)
     parser.add_argument("--real_infer", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -91,7 +93,14 @@ def main() -> None:
             raise ValueError(f"Expected one multi-view object [1,N,3,H,W], got {type(images)!r} {getattr(images, 'shape', None)}")
         cond_input = images[0]
         decode_context = None if args.disable_ss_adapter else {k: v.to(args.device) for k, v in geoss_context.items()}
-        decoded = pipe.run(cond_input, geoss_context=decode_context, formats=("gaussian", "mesh"))
+        decoded = pipe.run(
+            cond_input,
+            masks=batch.get("masks"),
+            mask_aware_crop=args.trellis_mask_aware_crop,
+            crop_padding=args.trellis_crop_padding,
+            geoss_context=decode_context,
+            formats=("gaussian", "mesh"),
+        )
         saved_assets = pipe.save_outputs(decoded, output_dir, export_textured_glb=args.export_textured_glb)
     else:
         run_modes = {"vggt_mode": "mock", "trellis_mode": "mock", "data_mode": "synthetic", "decoder_enabled": False, "render_eval_enabled": False, "official_metrics": False}
@@ -121,9 +130,18 @@ def main() -> None:
         **run_modes,
         "decode_enabled": bool(args.decode),
         "ss_adapter_enabled": bool(args.decode and not args.disable_ss_adapter),
+        "trellis_mask_aware_crop": bool(args.decode and args.trellis_mask_aware_crop),
+        "trellis_crop_padding": (
+            float(args.trellis_crop_padding)
+            if args.decode and args.trellis_mask_aware_crop
+            else None
+        ),
         "geoss_context": str(output_dir / "geoss_context.pt") if args.save_context else None,
         "saved_assets": saved_assets,
         "test_time_ground_truth_latents_used": False if not args.dry_run else None,
+        "test_time_ground_truth_mesh_used": False if not args.dry_run else None,
+        "test_time_ground_truth_voxels_used": False if not args.dry_run else None,
+        "evaluation_views_used": False if not args.dry_run else None,
         "inference_context_source": "conditioning_images_cameras_and_vggt_only" if not args.dry_run else "synthetic_dry_run",
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -140,6 +158,7 @@ def _load_real_batch(args: argparse.Namespace) -> dict:
             image_size=args.image_size,
             occ_resolution=args.meshfleet_occ_resolution,
             uid_manifest=[args.meshfleet_uid] if args.meshfleet_uid else None,
+            load_3d_modalities=False,
         )
         if len(dataset) == 0:
             raise FileNotFoundError(

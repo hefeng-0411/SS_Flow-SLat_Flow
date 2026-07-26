@@ -35,9 +35,10 @@ the sample order between inference, conditioning refinement, held-out rendering,
 and GT-mesh lookup. Cached output directories contain `sample_identity.json` and
 cannot be reused for a different UID unless the run is explicitly overwritten.
 
-For the strictest comparison, use `test_uids.json`. If the benchmark definition
-does not require cached training-only features/latents at test time, it is more
-scientifically complete to freeze `test_evaluation_uids.json` before model
-selection. Do not exclude a UID because the model fails on it: any failure for a
-manifested UID remains in completeness accounting and makes
-`official_complete=false`.
+The checked held-out v3 protocol uses `validation_evaluation_uids.json` and
+`test_evaluation_uids.json`, because cached training-only features/latents are
+not legal inference inputs and therefore cannot be a valid reason to remove a
+test object. `test_uids.json` remains available as the stricter all-cache-present
+subset, but must not be substituted after results are observed. Do not exclude
+a UID because the model fails on it: any failure for a manifested UID remains
+in completeness accounting and makes `official_complete=false`.

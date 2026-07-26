@@ -2,7 +2,7 @@
   "protocol_version": "meshfleet_dataset_audit_v3",
   "data_root": "D:\\VsCode\\MVG\\Base\\MeshFleet_TRELLIS",
   "split_seed": 20260720,
-  "validation_percent": 10.0,
+  "validation_percent": 50.0,
   "payload_validation_enabled": true,
   "required_modalities": [
     "renders",
@@ -21,9 +21,11 @@
     "features": "dinov2_vitl14_reg"
   },
   "counts": {
+    "train": 0,
     "test": 1
   },
   "strict_valid_counts": {
+    "train": 0,
     "test": 1
   },
   "train_manifest_count": 0,
@@ -40,9 +42,19 @@
   "invalid_object_count": 0,
   "invalid_object_count_by_split": {},
   "invalid_reason_counts": {},
+  "render_issue_counts": {
+    "warning:renders_cond:missing_image": 23
+  },
   "train_test_overlap_count": 0,
   "train_test_overlap_uids": [],
-  "discovery_failures": [],
+  "ambiguous_uid_count": 0,
+  "ambiguous_uids": [],
+  "discovery_failures": [
+    {
+      "split": "train",
+      "error": "No flat/category MeshFleet layout under D:\\VsCode\\MVG\\Base\\MeshFleet_TRELLIS\\train"
+    }
+  ],
   "modality_coverage": {
     "features": {
       "count": 1,
@@ -81,7 +93,7 @@
       "fraction": 1.0
     }
   },
-  "all_discovered_valid": true,
-  "manifests_valid": true,
-  "valid": true
+  "all_discovered_valid": false,
+  "manifests_valid": false,
+  "valid": false
 }

@@ -54,9 +54,10 @@ def test_render_metrics_use_true_lpips_for_masked_and_full(monkeypatch):
     mask = torch.zeros(1, 1, 16, 16)
     mask[:, :, 4:12, 4:12] = 1
     metrics = render_metrics.image_render_metrics(pred, gt, mask, mask)
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert metrics["LPIPS"] == pytest.approx(1.0)
     assert metrics["masked_LPIPS"] == pytest.approx(0.25)
+    assert metrics["foreground_crop_LPIPS"] == pytest.approx(1.0)
     assert "foreground_L1" in metrics
     assert "DINO_similarity" not in metrics
     assert "multi_view_consistency" not in metrics
@@ -201,6 +202,7 @@ def test_official_aggregate_excludes_invalid_protocol_rows():
             "asset_CD": 0.1,
             "asset_F-score": 0.9,
             "asset_official_metrics": True,
+            "asset_evaluation_protocol": "meshfleet_heldout_v3",
             "population_manifested": True,
         },
     ]
@@ -221,6 +223,7 @@ def test_unmanifested_population_cannot_become_official():
             "asset_CD": 0.1,
             "asset_F-score": 0.9,
             "asset_official_metrics": True,
+            "asset_evaluation_protocol": "meshfleet_heldout_v3",
         }],
         index=7,
         gpu=None,
@@ -231,6 +234,57 @@ def test_unmanifested_population_cannot_become_official():
     summary = _aggregate(rows, expected_indices=[7], expected_ablations=["method"])["by_ablation"]["method"]
     assert summary["official_num_objects"] == 0
     assert summary["official_complete"] is False
+
+
+def test_paired_aggregate_uses_identical_uids_and_improvement_directions():
+    rows = []
+    for index, baseline_psnr, baseline_cd in ((0, 20.0, 0.20), (1, 22.0, 0.10)):
+        rows.append(
+            {
+                "index": index,
+                "ablation": "original_trellis",
+                "status": "ok",
+                "asset_PSNR": baseline_psnr,
+                "asset_CD": baseline_cd,
+                "asset_official_metrics": True,
+                "asset_evaluation_protocol": "meshfleet_heldout_v3",
+                "population_manifested": True,
+            }
+        )
+    rows.extend(
+        [
+            {
+                "index": 0,
+                "ablation": "candidate",
+                "status": "ok",
+                "asset_PSNR": 21.0,
+                "asset_CD": 0.15,
+                "asset_official_metrics": True,
+                "asset_evaluation_protocol": "meshfleet_heldout_v3",
+                "population_manifested": True,
+            },
+            {
+                # Invalid-protocol rows must not enter a paired effect.
+                "index": 1,
+                "ablation": "candidate",
+                "status": "ok",
+                "asset_PSNR": 99.0,
+                "asset_CD": 0.0,
+                "asset_official_metrics": False,
+                "population_manifested": True,
+            },
+        ]
+    )
+    paired = _aggregate(
+        rows,
+        expected_indices=[0, 1],
+        expected_ablations=["original_trellis", "candidate"],
+    )["paired_vs_original_trellis"]["candidate"]
+    assert paired["paired_indices"] == [0]
+    assert paired["metrics"]["PSNR"]["paired_improvement"]["mean"] == pytest.approx(1.0)
+    assert paired["metrics"]["CD"]["paired_improvement"]["mean"] == pytest.approx(0.05)
+    assert paired["metrics"]["CD"]["candidate_minus_baseline_mean"] == pytest.approx(-0.05)
+    assert paired["metrics"]["PSNR"]["win_rate"] == pytest.approx(1.0)
 
 
 def test_trellis_dc_sh_is_not_mistaken_for_rgb():

@@ -3,7 +3,7 @@
   "uids": [],
   "count": 0,
   "split_seed": 20260720,
-  "validation_percent": 10.0,
+  "validation_percent": 50.0,
   "audit_protocol_version": "meshfleet_dataset_audit_v3",
   "eligibility_policy": "stage3_train",
   "payload_validation_enabled": true,

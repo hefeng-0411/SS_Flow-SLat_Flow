@@ -89,6 +89,9 @@ class RealTrellisGeoPipeline:
         self,
         images: List,
         *,
+        masks: Optional[torch.Tensor] = None,
+        mask_aware_crop: bool = False,
+        crop_padding: float = 1.2,
         geoss_context: Optional[Dict[str, torch.Tensor]] = None,
         geovis_slat_context: Optional[Dict[str, torch.Tensor]] = None,
         coords_override: Optional[torch.Tensor] = None,
@@ -99,7 +102,13 @@ class RealTrellisGeoPipeline:
         multi_image_mode: str = "multidiffusion",
         preprocess_images: bool = True,
     ) -> Dict[str, object]:
-        images = self._prepare_conditioning_images(images, preprocess=preprocess_images)
+        images = self._prepare_conditioning_images(
+            images,
+            preprocess=preprocess_images,
+            masks=masks,
+            mask_aware_crop=mask_aware_crop,
+            crop_padding=crop_padding,
+        )
         cond = self.pipeline.get_cond(images)
         num_images = int(cond["cond"].shape[0])
         if num_images > 1:
@@ -111,6 +120,7 @@ class RealTrellisGeoPipeline:
         slat_params = slat_sampler_params or {}
         if coords_override is not None:
             coords = self._validate_coords(coords_override)
+            ss_latent_grid = None
         else:
             ss_context = _adapter_aware_sampler(
                 self.pipeline.sparse_structure_sampler,
@@ -119,7 +129,11 @@ class RealTrellisGeoPipeline:
                 context_key="geoss_context",
             ) if num_images > 1 or geoss_context is not None else contextlib.nullcontext()
             with ss_context:
-                coords = self.sample_sparse_structure(cond, geoss_context=geoss_context, sampler_params=ss_params)
+                ss_latent_grid, coords = self.sample_sparse_structure_latent(
+                    cond,
+                    geoss_context=geoss_context,
+                    sampler_params=ss_params,
+                )
         slat_context = _adapter_aware_sampler(
             self.pipeline.slat_sampler,
             num_images=num_images,
@@ -130,14 +144,28 @@ class RealTrellisGeoPipeline:
             slat = self.sample_slat(cond, coords, geovis_slat_context=geovis_slat_context, sampler_params=slat_params)
         decoded = self.pipeline.decode_slat(slat, list(formats))
         decoded["coords"] = coords
+        if ss_latent_grid is not None:
+            # Conditioning-generated structure prior for explicit downstream
+            # posterior completion.  This is not a dataset/ground-truth latent.
+            decoded["ss_latent_grid"] = ss_latent_grid
         decoded["slat"] = slat
         decoded["conditioning_metadata"] = {
             "num_images": num_images,
             "multi_image_mode": multi_image_mode if num_images > 1 else "single_image",
+            "mask_aware_crop": bool(mask_aware_crop),
+            "crop_padding": float(crop_padding) if mask_aware_crop else None,
         }
         return decoded
 
-    def _prepare_conditioning_images(self, images, *, preprocess: bool):
+    def _prepare_conditioning_images(
+        self,
+        images,
+        *,
+        preprocess: bool,
+        masks: Optional[torch.Tensor] = None,
+        mask_aware_crop: bool = False,
+        crop_padding: float = 1.2,
+    ):
         if isinstance(images, torch.Tensor):
             if images.ndim == 5:
                 if images.shape[0] != 1:
@@ -145,8 +173,17 @@ class RealTrellisGeoPipeline:
                 images = images[0]
             if images.ndim != 4 or images.shape[1] != 3:
                 raise ValueError(f"TRELLIS conditioning tensor must be [N,3,H,W], got {tuple(images.shape)}")
-            images = images.to(device=self.device, dtype=torch.float32)
-            if images.shape[-2:] != (518, 518):
+            images = images.to(device=self.device, dtype=torch.float32).clamp(0.0, 1.0)
+            if mask_aware_crop:
+                if masks is None:
+                    raise ValueError("mask_aware_crop requires conditioning masks.")
+                images = mask_aware_trellis_crop(
+                    images,
+                    masks,
+                    output_size=518,
+                    padding=crop_padding,
+                )
+            elif images.shape[-2:] != (518, 518):
                 images = torch.nn.functional.interpolate(
                     images, size=(518, 518), mode="bicubic", align_corners=False, antialias=True
                 ).clamp(0.0, 1.0)
@@ -160,7 +197,151 @@ class RealTrellisGeoPipeline:
             raise ValueError(f"Stage-2 sparse coordinates must be non-empty [N,4], got {tuple(coords.shape)}")
         return coords.to(device=self.device, dtype=torch.int32).contiguous()
 
+    @torch.no_grad()
+    def generate_sparse_structure_prior(
+        self,
+        images,
+        *,
+        masks: Optional[torch.Tensor] = None,
+        mask_aware_crop: bool = True,
+        crop_padding: float = 1.2,
+        seed: int = 42,
+        sampler_params: Optional[dict] = None,
+        multi_image_mode: str = "multidiffusion",
+    ) -> Dict[str, torch.Tensor]:
+        """Generate the conditioning-only TRELLIS structure prior without SLAT decoding."""
+        prepared = self._prepare_conditioning_images(
+            images,
+            preprocess=True,
+            masks=masks,
+            mask_aware_crop=mask_aware_crop,
+            crop_padding=crop_padding,
+        )
+        cond = self.pipeline.get_cond(prepared)
+        num_images = int(cond["cond"].shape[0])
+        if num_images > 1:
+            if multi_image_mode not in {"multidiffusion", "stochastic"}:
+                raise ValueError(f"Unsupported multi_image_mode={multi_image_mode!r}")
+            cond["neg_cond"] = cond["neg_cond"][:1]
+        torch.manual_seed(seed)
+        context = (
+            _adapter_aware_sampler(
+                self.pipeline.sparse_structure_sampler,
+                num_images=num_images,
+                mode=multi_image_mode,
+                context_key="geoss_context",
+            )
+            if num_images > 1
+            else contextlib.nullcontext()
+        )
+        with context:
+            latent, coords = self.sample_sparse_structure_latent(
+                cond,
+                geoss_context=None,
+                sampler_params=sampler_params or {},
+            )
+        return {
+            "ss_latent_grid": latent,
+            "coords": coords,
+            "num_conditioning_images": torch.tensor(num_images, device=latent.device),
+        }
+
+    @torch.no_grad()
+    def generate_completion_prior(
+        self,
+        images,
+        *,
+        masks: Optional[torch.Tensor] = None,
+        mask_aware_crop: bool = True,
+        crop_padding: float = 1.2,
+        seed: int = 42,
+        ss_sampler_params: Optional[dict] = None,
+        slat_sampler_params: Optional[dict] = None,
+        multi_image_mode: str = "multidiffusion",
+    ) -> Dict[str, torch.Tensor]:
+        """Generate conditioning-only SS geometry and SLAT appearance.
+
+        No TRELLIS decoder is invoked and no dataset latent is consumed.  The
+        returned sparse SLAT is a completion prior for RAPC appearance; RAPC's
+        geometry prior remains exclusively the generated SS latent.
+        """
+
+        prepared = self._prepare_conditioning_images(
+            images,
+            preprocess=True,
+            masks=masks,
+            mask_aware_crop=mask_aware_crop,
+            crop_padding=crop_padding,
+        )
+        cond = self.pipeline.get_cond(prepared)
+        num_images = int(cond["cond"].shape[0])
+        if num_images > 1:
+            if multi_image_mode not in {"multidiffusion", "stochastic"}:
+                raise ValueError(f"Unsupported multi_image_mode={multi_image_mode!r}")
+            cond["neg_cond"] = cond["neg_cond"][:1]
+        torch.manual_seed(seed)
+        ss_context = (
+            _adapter_aware_sampler(
+                self.pipeline.sparse_structure_sampler,
+                num_images=num_images,
+                mode=multi_image_mode,
+                context_key="geoss_context",
+            )
+            if num_images > 1
+            else contextlib.nullcontext()
+        )
+        with ss_context:
+            ss_latent, coords = self.sample_sparse_structure_latent(
+                cond,
+                geoss_context=None,
+                sampler_params=ss_sampler_params or {},
+            )
+        slat_context = (
+            _adapter_aware_sampler(
+                self.pipeline.slat_sampler,
+                num_images=num_images,
+                mode=multi_image_mode,
+                context_key="geovis_slat_context",
+            )
+            if num_images > 1
+            else contextlib.nullcontext()
+        )
+        with slat_context:
+            slat = self.sample_slat(
+                cond,
+                coords,
+                geovis_slat_context=None,
+                sampler_params=slat_sampler_params or {},
+            )
+        features = slat.feats if hasattr(slat, "feats") else slat
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("TRELLIS completion SLAT must expose tensor features")
+        return {
+            "ss_latent_grid": ss_latent,
+            "coords": coords,
+            "slat_feats": features,
+            "num_conditioning_images": torch.tensor(
+                num_images,
+                device=ss_latent.device,
+            ),
+        }
+
     def sample_sparse_structure(self, cond: dict, *, geoss_context: Optional[Dict[str, torch.Tensor]], sampler_params: dict) -> torch.Tensor:
+        _, coords = self.sample_sparse_structure_latent(
+            cond,
+            geoss_context=geoss_context,
+            sampler_params=sampler_params,
+        )
+        return coords
+
+    def sample_sparse_structure_latent(
+        self,
+        cond: dict,
+        *,
+        geoss_context: Optional[Dict[str, torch.Tensor]],
+        sampler_params: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the generated SS latent and decoded active coordinates."""
         flow_model = self.pipeline.models["sparse_structure_flow_model"]
         reso = flow_model.resolution
         noise = torch.randn(1, flow_model.in_channels, reso, reso, reso, device=self.device)
@@ -173,7 +354,7 @@ class RealTrellisGeoPipeline:
         coords = torch.argwhere(decoder(z_s) > 0)[:, [0, 2, 3, 4]].int()
         if coords.numel() == 0:
             raise RuntimeError("TRELLIS sparse structure decoder produced zero active voxels.")
-        return coords
+        return z_s, coords
 
     def sample_slat(self, cond: dict, coords: torch.Tensor, *, geovis_slat_context: Optional[Dict[str, torch.Tensor]], sampler_params: dict):
         from trellis.modules import sparse as sp
@@ -285,6 +466,77 @@ def _flow_in_channels(flow_model: object, *, name: str) -> int:
             f"got {value!r} from {type(flow_model).__name__}."
         )
     return value
+
+
+def mask_aware_trellis_crop(
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    output_size: int = 518,
+    padding: float = 1.2,
+    threshold: float = 0.8,
+) -> torch.Tensor:
+    """Match TRELLIS alpha preprocessing for already-composited tensor views.
+
+    Each foreground bbox becomes a padded square before resizing. Sampling
+    outside the source image is black, matching PIL's out-of-bounds crop.
+    """
+    if images.ndim != 4 or images.shape[1] != 3:
+        raise ValueError(f"images must be [N,3,H,W], got {tuple(images.shape)}")
+    if masks.ndim == 5:
+        if masks.shape[0] != 1:
+            raise ValueError("mask-aware TRELLIS crop accepts one object at a time.")
+        masks = masks[0]
+    if masks.ndim == 3:
+        masks = masks[:, None]
+    if masks.ndim != 4 or masks.shape[0] != images.shape[0] or masks.shape[1] != 1:
+        raise ValueError(
+            f"masks must be [N,1,H,W] for images {tuple(images.shape)}, got {tuple(masks.shape)}"
+        )
+    if output_size < 1 or padding <= 0.0:
+        raise ValueError("output_size and padding must be positive")
+    if masks.shape[-2:] != images.shape[-2:]:
+        masks = torch.nn.functional.interpolate(
+            masks.float(),
+            size=images.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    masks = masks.to(device=images.device, dtype=torch.float32)
+    height, width = images.shape[-2:]
+    axis = torch.linspace(
+        -0.5,
+        0.5,
+        int(output_size),
+        device=images.device,
+        dtype=torch.float32,
+    )
+    yy, xx = torch.meshgrid(axis, axis, indexing="ij")
+    cropped = []
+    for view in range(images.shape[0]):
+        foreground = torch.nonzero(masks[view, 0] > float(threshold), as_tuple=False)
+        if foreground.numel() == 0:
+            raise RuntimeError(f"Conditioning mask {view} has no foreground for TRELLIS crop.")
+        y_min, x_min = foreground.amin(dim=0).float()
+        y_max, x_max = foreground.amax(dim=0).float()
+        center_x = 0.5 * (x_min + x_max)
+        center_y = 0.5 * (y_min + y_max)
+        side = torch.maximum(x_max - x_min, y_max - y_min).clamp_min(1.0)
+        side = side * float(padding)
+        source_x = center_x + xx * side
+        source_y = center_y + yy * side
+        grid_x = 2.0 * source_x / max(1, width - 1) - 1.0
+        grid_y = 2.0 * source_y / max(1, height - 1) - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1)[None]
+        crop = torch.nn.functional.grid_sample(
+            images[view : view + 1],
+            grid,
+            mode="bicubic",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        cropped.append(crop.clamp(0.0, 1.0))
+    return torch.cat(cropped, dim=0)
 
 
 @contextlib.contextmanager

@@ -27,6 +27,9 @@ from geoss.utils.config import str2bool
 
 STAGE_ORDER = (
     "original_trellis",
+    "trellis_mask_cropped",
+    "direct_visual_hull",
+    "vggt_depth_fused",
     "stage1_geoss_context",
     "stage2_geoss_ss",
     "stage3_geovis_slat",
@@ -36,6 +39,9 @@ STAGE_ORDER = (
 ASSET_STAGES = frozenset(
     {
         "original_trellis",
+        "trellis_mask_cropped",
+        "direct_visual_hull",
+        "vggt_depth_fused",
         "stage2_geoss_ss",
         "stage3_geovis_slat",
         "stage4_geovis_slat_joint",
@@ -45,7 +51,10 @@ ASSET_STAGES = frozenset(
 VRAM_RESERVATION_KEYS = (*STAGE_ORDER, "asset_evaluation")
 
 DEFAULT_STAGE_VRAM_GB = {
-    "original_trellis": 16.0,
+    "original_trellis": 14.0,
+    "trellis_mask_cropped": 14.0,
+    "direct_visual_hull": 4.0,
+    "vggt_depth_fused": 18.0,
     "stage1_geoss_context": 13.0,
     "stage2_geoss_ss": 16.0,
     "stage3_geovis_slat": 16.0,
@@ -96,20 +105,52 @@ def main() -> None:
     parser.add_argument("--num_views", type=int, default=8)
     parser.add_argument("--eval_num_views", type=int, default=12)
     parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument(
+        "--foundation_conditioning_image_size",
+        type=int,
+        default=518,
+        help=(
+            "Conditioning resolution for native TRELLIS, visual hull, and VGGT "
+            "fusion. TRELLIS/VGGT image towers are native at 518; held-out "
+            "--image_size remains independently fixed for metric rendering."
+        ),
+    )
     parser.add_argument("--occ_resolution", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--config_geoss", type=str, default="configs/sparse_ray_geoss.yaml")
     parser.add_argument("--config_slat", type=str, default="configs/geovis_slat.yaml")
     parser.add_argument("--config_slat_joint", type=str, default="configs/phase2_decoded_asset.yaml")
     parser.add_argument("--vggt_root", type=str, default=None)
+    parser.add_argument("--vggt_checkpoint", type=str, default=None)
     parser.add_argument("--vggt_pretrained", type=str, default="facebook/VGGT-1B")
     parser.add_argument("--trellis_root", type=str, default=None)
     parser.add_argument("--trellis_model_path", type=str, default="microsoft/TRELLIS-image-large")
+    parser.add_argument(
+        "--trellis_multi_image_mode",
+        choices=("multidiffusion", "stochastic"),
+        default="multidiffusion",
+    )
+    parser.add_argument("--trellis_ss_steps", type=int, default=12)
+    parser.add_argument("--trellis_ss_cfg_strength", type=float, default=7.5)
+    parser.add_argument("--trellis_slat_steps", type=int, default=12)
+    parser.add_argument("--trellis_slat_cfg_strength", type=float, default=3.0)
+    parser.add_argument(
+        "--trellis_candidate_seeds",
+        type=str,
+        default="42",
+        help=(
+            "Comma-separated native TRELLIS candidates selected only by "
+            "conditioning-view render consistency."
+        ),
+    )
     parser.add_argument("--geoss_checkpoint", type=str, default=None)
     parser.add_argument("--ss_checkpoint", type=str, default=None)
     parser.add_argument("--slat_checkpoint", type=str, default=None)
     parser.add_argument("--slat_joint_checkpoint", type=str, default=None)
     parser.add_argument("--run_original_trellis", type=str2bool, default=True)
+    parser.add_argument("--run_trellis_mask_cropped", type=str2bool, default=False)
+    parser.add_argument("--run_direct_visual_hull", type=str2bool, default=False)
+    parser.add_argument("--run_vggt_depth_fused", type=str2bool, default=False)
     parser.add_argument("--run_stage1", type=str2bool, default=True)
     parser.add_argument("--run_stage2", type=str2bool, default=True)
     parser.add_argument("--run_stage3", type=str2bool, default=True)
@@ -117,6 +158,42 @@ def main() -> None:
     parser.add_argument("--run_refined_final", type=str2bool, default=True)
     parser.add_argument("--refinement_steps", type=int, default=150)
     parser.add_argument("--refinement_views_per_step", type=int, default=2)
+    parser.add_argument(
+        "--refinement_source_stage",
+        choices=(
+            "original_trellis",
+            "trellis_mask_cropped",
+            "direct_visual_hull",
+            "vggt_depth_fused",
+            "stage2_geoss_ss",
+            "stage3_geovis_slat",
+            "stage4_geovis_slat_joint",
+        ),
+        default="original_trellis",
+        help=(
+            "Decoded asset refined using conditioning views only. The v2 safe "
+            "refiner reverts byte-identically when disjoint conditioning-view "
+            "validation does not improve."
+        ),
+    )
+    parser.add_argument("--refinement_validation_views", type=int, default=2)
+    parser.add_argument("--refinement_validation_every", type=int, default=10)
+    parser.add_argument("--refinement_validation_patience", type=int, default=5)
+    parser.add_argument("--refinement_min_relative_improvement", type=float, default=0.002)
+    parser.add_argument("--refinement_validation_tolerance", type=float, default=1e-4)
+    parser.add_argument("--refinement_max_color_delta", type=float, default=0.08)
+    parser.add_argument("--refinement_optimize_opacity", type=str2bool, default=False)
+    parser.add_argument("--refinement_max_opacity_logit_delta", type=float, default=0.25)
+    parser.add_argument("--trellis_crop_padding", type=float, default=1.2)
+    parser.add_argument("--visual_hull_resolution", type=int, default=160)
+    parser.add_argument("--visual_hull_min_view_fraction", type=float, default=1.0)
+    parser.add_argument("--visual_hull_mask_dilation_pixels", type=int, default=2)
+    parser.add_argument("--vggt_fusion_confidence_threshold", type=float, default=0.15)
+    parser.add_argument("--vggt_fusion_free_space_margin", type=float, default=0.0125)
+    parser.add_argument("--vggt_fusion_min_depth_views", type=int, default=2)
+    parser.add_argument("--vggt_fusion_min_not_free_fraction", type=float, default=0.75)
+    parser.add_argument("--vggt_fusion_reprojection_sigma_pixels", type=float, default=4.0)
+    parser.add_argument("--vggt_fusion_max_reprojection_error_pixels", type=float, default=12.0)
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated physical CUDA ids for parallel evaluation, e.g. 4,5,6,7.")
     parser.add_argument("--parallel", type=str2bool, default=True)
     parser.add_argument("--scheduler_mode", choices=("stage_major", "sample_major"), default="stage_major")
@@ -165,6 +242,7 @@ def main() -> None:
     args = parser.parse_args()
     args._stage_vram_estimates = _parse_stage_vram_estimates(args.stage_vram_gb, args.eval_worker_vram_gb)
     _validate_parallel_launch(args)
+    _validate_stage_dependencies(args)
 
     run_root = Path(args.run_root)
     output_dir = Path(args.output_dir) if args.output_dir else run_root / "evaluation_suite"
@@ -180,8 +258,10 @@ def main() -> None:
         num_views=args.num_views,
         image_size=args.image_size,
         occ_resolution=args.occ_resolution,
-        render_set="renders",
+        render_set=args.conditioning_view_set,
         background_color=args.render_background_color,
+        repeat_views_if_insufficient=False,
+        load_3d_modalities=False,
     )
     if len(dataset) == 0:
         raise FileNotFoundError(f"No MeshFleet samples found under {args.data_root} split={args.split}.")
@@ -238,16 +318,75 @@ def main() -> None:
         "evaluated_uids": [dataset.samples[index]["uid"] for index in indices],
         "uid_manifest": uid_manifest_provenance,
         "protocol": {
-            "version": "meshfleet_heldout_v2",
+            "version": "meshfleet_heldout_v3",
             "conditioning_view_set": args.conditioning_view_set,
             "conditioning_num_views": args.num_views,
             "evaluation_view_set": args.eval_view_set,
             "evaluation_num_views": args.eval_num_views,
-            "image_size": args.image_size,
+            "evaluation_image_size": args.image_size,
+            "foundation_conditioning_image_size": (
+                args.foundation_conditioning_image_size
+            ),
+            "legacy_adapter_conditioning_image_size": args.image_size,
             "background_color": list(args.render_background_color),
             "geometry_samples": args.geometry_samples,
             "geometry_seed": args.geometry_seed,
             "fscore_threshold": args.fscore_threshold,
+            "trellis_mask_cropped": {
+                "enabled": bool(args.run_trellis_mask_cropped),
+                "padding": args.trellis_crop_padding,
+                "inputs": "conditioning_rgb_and_alpha_masks_only",
+            },
+            "visual_hull": {
+                "enabled": bool(args.run_direct_visual_hull),
+                "resolution": args.visual_hull_resolution,
+                "min_view_fraction": args.visual_hull_min_view_fraction,
+                "mask_dilation_pixels": args.visual_hull_mask_dilation_pixels,
+                "appearance_source": "original_trellis_unchanged",
+                "geometry_inputs": "conditioning_masks_and_cameras_only",
+            },
+            "vggt_depth_fusion": {
+                "enabled": bool(args.run_vggt_depth_fused),
+                "confidence_threshold": args.vggt_fusion_confidence_threshold,
+                "free_space_margin": args.vggt_fusion_free_space_margin,
+                "min_depth_views": args.vggt_fusion_min_depth_views,
+                "min_not_free_fraction": args.vggt_fusion_min_not_free_fraction,
+                "reprojection_sigma_pixels": args.vggt_fusion_reprojection_sigma_pixels,
+                "max_reprojection_error_pixels": args.vggt_fusion_max_reprojection_error_pixels,
+                "appearance_source": "original_trellis_unchanged",
+                "geometry_inputs": (
+                    "conditioning_masks_cameras_and_confidence_filtered_aligned_vggt_pointmap"
+                ),
+            },
+            "conditioning_refinement": {
+                "enabled": bool(args.run_refined_final),
+                "source_stage": args.refinement_source_stage,
+                "optimization_views": args.num_views - args.refinement_validation_views,
+                "selection_views": args.refinement_validation_views,
+                "selection_view_source": args.conditioning_view_set,
+                "heldout_evaluation_views_used": False,
+                "max_color_delta": args.refinement_max_color_delta,
+                "optimize_opacity": bool(args.refinement_optimize_opacity),
+                "fallback": "byte_identical_source_asset",
+            },
+        },
+        "foundation_models": {
+            "trellis_root": args.trellis_root,
+            "trellis_model_path": args.trellis_model_path,
+            "trellis_multi_image_mode": args.trellis_multi_image_mode,
+            "trellis_ss_sampler": {
+                "steps": args.trellis_ss_steps,
+                "cfg_strength": args.trellis_ss_cfg_strength,
+            },
+            "trellis_slat_sampler": {
+                "steps": args.trellis_slat_steps,
+                "cfg_strength": args.trellis_slat_cfg_strength,
+            },
+            "trellis_candidate_seeds": args.trellis_candidate_seeds,
+            "trellis_candidate_selection_uses_evaluation_views": False,
+            "vggt_root": args.vggt_root,
+            "vggt_pretrained": args.vggt_pretrained,
+            "vggt_checkpoint": args.vggt_checkpoint,
         },
         "checkpoints": {
             "geoss": args.geoss_checkpoint,
@@ -310,6 +449,9 @@ def main() -> None:
         name
         for name, enabled in (
             ("original_trellis", args.run_original_trellis),
+            ("trellis_mask_cropped", args.run_trellis_mask_cropped),
+            ("direct_visual_hull", args.run_direct_visual_hull),
+            ("vggt_depth_fused", args.run_vggt_depth_fused),
             ("stage1_geoss_context", args.run_stage1),
             ("stage2_geoss_ss", args.run_stage2),
             ("stage3_geovis_slat", args.run_stage3),
@@ -746,6 +888,9 @@ def _fill_gpu_slots(
 def _enabled_stage_names(args: argparse.Namespace) -> list[str]:
     flags = {
         "original_trellis": args.run_original_trellis,
+        "trellis_mask_cropped": args.run_trellis_mask_cropped,
+        "direct_visual_hull": args.run_direct_visual_hull,
+        "vggt_depth_fused": args.run_vggt_depth_fused,
         "stage1_geoss_context": args.run_stage1,
         "stage2_geoss_ss": args.run_stage2,
         "stage3_geovis_slat": args.run_stage3,
@@ -773,6 +918,30 @@ def _run_stage_task(
     stage2_dir = sample_root / "stage2_geoss_ss"
     if stage_name == "original_trellis":
         return _run_original_trellis(local_args, sample_root, index, gpu, evaluate_assets=False)
+    if stage_name == "trellis_mask_cropped":
+        return _run_trellis_mask_cropped(
+            local_args,
+            sample_root,
+            index,
+            gpu,
+            evaluate_assets=False,
+        )
+    if stage_name == "direct_visual_hull":
+        return _run_direct_visual_hull(
+            local_args,
+            sample_root,
+            index,
+            gpu,
+            evaluate_assets=False,
+        )
+    if stage_name == "vggt_depth_fused":
+        return _run_vggt_depth_fused(
+            local_args,
+            sample_root,
+            index,
+            gpu,
+            evaluate_assets=False,
+        )
     if stage_name == "stage1_geoss_context":
         return _run_stage1(local_args, sample_root, index, gpu)
     if stage_name == "stage2_geoss_ss":
@@ -889,6 +1058,18 @@ def _run_sample(args: argparse.Namespace, output_dir: Path, index: int, gpu: str
         rows.append(_run_original_trellis(local_args, sample_root, index, gpu))
         if _is_oom_row(rows[-1]):
             return _tag_sample_rows(rows, index, gpu, uid, bool(args.uid_manifest))
+    if local_args.run_trellis_mask_cropped:
+        rows.append(_run_trellis_mask_cropped(local_args, sample_root, index, gpu))
+        if _is_oom_row(rows[-1]):
+            return _tag_sample_rows(rows, index, gpu, uid, bool(args.uid_manifest))
+    if local_args.run_direct_visual_hull:
+        rows.append(_run_direct_visual_hull(local_args, sample_root, index, gpu))
+        if _is_oom_row(rows[-1]):
+            return _tag_sample_rows(rows, index, gpu, uid, bool(args.uid_manifest))
+    if local_args.run_vggt_depth_fused:
+        rows.append(_run_vggt_depth_fused(local_args, sample_root, index, gpu))
+        if _is_oom_row(rows[-1]):
+            return _tag_sample_rows(rows, index, gpu, uid, bool(args.uid_manifest))
     stage2_dir = sample_root / "stage2_geoss_ss"
     if local_args.run_stage1:
         rows.append(_run_stage1(local_args, sample_root, index, gpu))
@@ -991,6 +1172,60 @@ def _validate_requested_checkpoints(args: argparse.Namespace, run_root: Path) ->
     )
 
 
+def _validate_stage_dependencies(args: argparse.Namespace) -> None:
+    if args.image_size < 1 or args.foundation_conditioning_image_size < 1:
+        raise ValueError("Evaluation and foundation conditioning image sizes must be positive.")
+    if args.trellis_ss_steps < 1 or args.trellis_slat_steps < 1:
+        raise ValueError("TRELLIS sampler steps must be positive.")
+    if not math.isfinite(args.trellis_ss_cfg_strength) or not math.isfinite(
+        args.trellis_slat_cfg_strength
+    ):
+        raise ValueError("TRELLIS CFG strengths must be finite.")
+    try:
+        candidate_seeds = [
+            int(item.strip())
+            for item in args.trellis_candidate_seeds.split(",")
+            if item.strip()
+        ]
+    except ValueError as exc:
+        raise ValueError("--trellis_candidate_seeds must be comma-separated integers.") from exc
+    if not candidate_seeds:
+        raise ValueError("--trellis_candidate_seeds must contain at least one seed.")
+    if (
+        args.run_refined_final
+        and not 1 <= args.refinement_validation_views < args.num_views
+    ):
+        raise ValueError(
+            "--refinement_validation_views must be in [1, num_views-1] so "
+            "refinement optimization and selection use disjoint conditioning views."
+        )
+    appearance_dependents = []
+    if args.run_direct_visual_hull:
+        appearance_dependents.append("direct_visual_hull")
+    if args.run_vggt_depth_fused:
+        appearance_dependents.append("vggt_depth_fused")
+    if appearance_dependents and not args.run_original_trellis:
+        raise ValueError(
+            f"{appearance_dependents} require --run_original_trellis true because "
+            "their Gaussian appearance must be copied from that paired baseline."
+        )
+    if args.run_refined_final:
+        enabled_by_stage = {
+            "original_trellis": args.run_original_trellis,
+            "trellis_mask_cropped": args.run_trellis_mask_cropped,
+            "direct_visual_hull": args.run_direct_visual_hull,
+            "vggt_depth_fused": args.run_vggt_depth_fused,
+            "stage2_geoss_ss": args.run_stage2,
+            "stage3_geovis_slat": args.run_stage3,
+            "stage4_geovis_slat_joint": args.run_stage4,
+        }
+        if not enabled_by_stage[args.refinement_source_stage]:
+            raise ValueError(
+                "--run_refined_final true requires its selected source stage to "
+                f"be enabled; source={args.refinement_source_stage!r}."
+            )
+
+
 def _run_original_trellis(
     args: argparse.Namespace,
     sample_root: Path,
@@ -1000,10 +1235,238 @@ def _run_original_trellis(
     evaluate_assets: bool = True,
 ) -> dict[str, Any]:
     out_dir = sample_root / "original_trellis"
-    command = _geoss_command(args, out_dir, index, decode=True, disable_ss_adapter=True)
+    command = _native_trellis_command(
+        args,
+        out_dir,
+        index,
+        mask_aware_crop=False,
+    )
     return _run_and_collect(
         "original_trellis", command, out_dir, args.overwrite,
         evaluate_assets=evaluate_assets, eval_args=args, runtime_args=args, gpu=gpu,
+    )
+
+
+def _run_trellis_mask_cropped(
+    args: argparse.Namespace,
+    sample_root: Path,
+    index: int,
+    gpu: str | None = None,
+    *,
+    evaluate_assets: bool = True,
+) -> dict[str, Any]:
+    out_dir = sample_root / "trellis_mask_cropped"
+    command = _native_trellis_command(
+        args,
+        out_dir,
+        index,
+        mask_aware_crop=True,
+    )
+    return _run_and_collect(
+        "trellis_mask_cropped",
+        command,
+        out_dir,
+        args.overwrite,
+        evaluate_assets=evaluate_assets,
+        eval_args=args,
+        runtime_args=args,
+        gpu=gpu,
+    )
+
+
+def _native_trellis_command(
+    args: argparse.Namespace,
+    out_dir: Path,
+    index: int,
+    *,
+    mask_aware_crop: bool,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "scripts/infer_native_trellis_multiview.py",
+        "--output_dir",
+        str(out_dir),
+        "--meshfleet_root",
+        args.data_root,
+        "--meshfleet_split",
+        args.split,
+        "--meshfleet_index",
+        str(index),
+        "--meshfleet_uid",
+        _uid_for_index(args, index),
+        "--conditioning_view_set",
+        args.conditioning_view_set,
+        "--num_views",
+        str(args.num_views),
+        "--image_size",
+        str(args.foundation_conditioning_image_size),
+        "--trellis_model_path",
+        str(args.trellis_model_path),
+        "--multi_image_mode",
+        args.trellis_multi_image_mode,
+        "--ss_steps",
+        str(args.trellis_ss_steps),
+        "--ss_cfg_strength",
+        str(args.trellis_ss_cfg_strength),
+        "--slat_steps",
+        str(args.trellis_slat_steps),
+        "--slat_cfg_strength",
+        str(args.trellis_slat_cfg_strength),
+        "--candidate_seeds",
+        args.trellis_candidate_seeds,
+        "--mask_aware_crop",
+        str(bool(mask_aware_crop)).lower(),
+        "--crop_padding",
+        str(args.trellis_crop_padding),
+        "--device",
+        args.device,
+    ]
+    if args.trellis_root:
+        command += ["--trellis_root", str(args.trellis_root)]
+    if args.category:
+        command += ["--meshfleet_category", args.category]
+    return command
+
+
+def _run_direct_visual_hull(
+    args: argparse.Namespace,
+    sample_root: Path,
+    index: int,
+    gpu: str | None = None,
+    *,
+    evaluate_assets: bool = True,
+) -> dict[str, Any]:
+    source_gaussian = sample_root / "original_trellis" / "asset_gaussian.ply"
+    out_dir = sample_root / "direct_visual_hull"
+    if not source_gaussian.is_file():
+        return {
+            "ablation": "direct_visual_hull",
+            "status": "failed",
+            "dependency_missing": True,
+            "error": f"Missing Original TRELLIS appearance source: {source_gaussian}",
+            "run_path": str(out_dir),
+        }
+    command = [
+        sys.executable,
+        "scripts/reconstruct_visual_hull_asset.py",
+        "--output_dir",
+        str(out_dir),
+        "--source_gaussian",
+        str(source_gaussian),
+        "--meshfleet_root",
+        args.data_root,
+        "--meshfleet_split",
+        args.split,
+        "--meshfleet_index",
+        str(index),
+        "--meshfleet_uid",
+        _uid_for_index(args, index),
+        "--conditioning_view_set",
+        args.conditioning_view_set,
+        "--num_views",
+        str(args.num_views),
+        "--image_size",
+        str(args.foundation_conditioning_image_size),
+        "--resolution",
+        str(args.visual_hull_resolution),
+        "--min_view_fraction",
+        str(args.visual_hull_min_view_fraction),
+        "--mask_dilation_pixels",
+        str(args.visual_hull_mask_dilation_pixels),
+        "--device",
+        args.device,
+    ]
+    if args.category:
+        command += ["--meshfleet_category", args.category]
+    return _run_and_collect(
+        "direct_visual_hull",
+        command,
+        out_dir,
+        args.overwrite,
+        evaluate_assets=evaluate_assets,
+        eval_args=args,
+        runtime_args=args,
+        gpu=gpu,
+    )
+
+
+def _run_vggt_depth_fused(
+    args: argparse.Namespace,
+    sample_root: Path,
+    index: int,
+    gpu: str | None = None,
+    *,
+    evaluate_assets: bool = True,
+) -> dict[str, Any]:
+    source_gaussian = sample_root / "original_trellis" / "asset_gaussian.ply"
+    out_dir = sample_root / "vggt_depth_fused"
+    if not source_gaussian.is_file():
+        return {
+            "ablation": "vggt_depth_fused",
+            "status": "failed",
+            "dependency_missing": True,
+            "error": f"Missing Original TRELLIS appearance source: {source_gaussian}",
+            "run_path": str(out_dir),
+        }
+    command = [
+        sys.executable,
+        "scripts/reconstruct_vggt_depth_fused_asset.py",
+        "--output_dir",
+        str(out_dir),
+        "--source_gaussian",
+        str(source_gaussian),
+        "--meshfleet_root",
+        args.data_root,
+        "--meshfleet_split",
+        args.split,
+        "--meshfleet_index",
+        str(index),
+        "--meshfleet_uid",
+        _uid_for_index(args, index),
+        "--conditioning_view_set",
+        args.conditioning_view_set,
+        "--num_views",
+        str(args.num_views),
+        "--image_size",
+        str(args.foundation_conditioning_image_size),
+        "--resolution",
+        str(args.visual_hull_resolution),
+        "--hull_min_view_fraction",
+        str(args.visual_hull_min_view_fraction),
+        "--mask_dilation_pixels",
+        str(args.visual_hull_mask_dilation_pixels),
+        "--confidence_threshold",
+        str(args.vggt_fusion_confidence_threshold),
+        "--free_space_margin",
+        str(args.vggt_fusion_free_space_margin),
+        "--min_depth_views",
+        str(args.vggt_fusion_min_depth_views),
+        "--min_not_free_fraction",
+        str(args.vggt_fusion_min_not_free_fraction),
+        "--reprojection_sigma_pixels",
+        str(args.vggt_fusion_reprojection_sigma_pixels),
+        "--max_reprojection_error_pixels",
+        str(args.vggt_fusion_max_reprojection_error_pixels),
+        "--vggt_pretrained",
+        str(args.vggt_pretrained),
+        "--device",
+        args.device,
+    ]
+    if args.vggt_root:
+        command += ["--vggt_root", str(args.vggt_root)]
+    if args.vggt_checkpoint:
+        command += ["--vggt_checkpoint", str(args.vggt_checkpoint)]
+    if args.category:
+        command += ["--meshfleet_category", args.category]
+    return _run_and_collect(
+        "vggt_depth_fused",
+        command,
+        out_dir,
+        args.overwrite,
+        evaluate_assets=evaluate_assets,
+        eval_args=args,
+        runtime_args=args,
+        gpu=gpu,
     )
 
 
@@ -1091,6 +1554,8 @@ def _run_slat_stage(
         command += ["--trellis_root", str(args.trellis_root)]
     if args.vggt_root:
         command += ["--vggt_root", str(args.vggt_root)]
+    if args.vggt_checkpoint:
+        command += ["--vggt_checkpoint", str(args.vggt_checkpoint)]
     if args.vggt_pretrained:
         command += ["--vggt_pretrained", str(args.vggt_pretrained)]
     if args.category:
@@ -1109,7 +1574,7 @@ def _run_refined_final(
     *,
     evaluate_assets: bool = True,
 ) -> dict[str, Any]:
-    source_dir = sample_root / "stage4_geovis_slat_joint"
+    source_dir = sample_root / args.refinement_source_stage
     source_gaussian = source_dir / "asset_gaussian.ply"
     source_mesh = source_dir / "asset_mesh_internal.ply"
     out_dir = sample_root / "final_conditioning_refined"
@@ -1120,7 +1585,10 @@ def _run_refined_final(
         return {
             "ablation": "final_conditioning_refined",
             "status": "failed",
-            "error": f"Missing Stage-4 Gaussian: {source_gaussian}",
+            "error": (
+                f"Missing refinement source Gaussian from "
+                f"{args.refinement_source_stage}: {source_gaussian}"
+            ),
             "run_path": str(out_dir),
         }
     command = [
@@ -1138,6 +1606,14 @@ def _run_refined_final(
         "--background_color", *(str(value) for value in args.render_background_color),
         "--steps", str(args.refinement_steps),
         "--views_per_step", str(args.refinement_views_per_step),
+        "--validation_views", str(args.refinement_validation_views),
+        "--validation_every", str(args.refinement_validation_every),
+        "--validation_patience", str(args.refinement_validation_patience),
+        "--min_relative_improvement", str(args.refinement_min_relative_improvement),
+        "--validation_tolerance", str(args.refinement_validation_tolerance),
+        "--max_color_delta", str(args.refinement_max_color_delta),
+        "--optimize_opacity", str(bool(args.refinement_optimize_opacity)).lower(),
+        "--max_opacity_logit_delta", str(args.refinement_max_opacity_logit_delta),
         "--device", args.device,
     ]
     if args.category:
@@ -1177,10 +1653,25 @@ def _run_refined_final(
         "run_path": str(out_dir),
         "log": str(log_path),
         "refinement_protocol": report.get("protocol"),
+        "refinement_source_stage": args.refinement_source_stage,
         "refinement_steps": report.get("steps"),
+        "refinement_executed_steps": report.get("executed_steps"),
+        "refinement_selection_status": report.get("selection_status"),
+        "refinement_selected_step": report.get("selected_step"),
+        "refinement_source_sha256": report.get("source_sha256"),
+        "refinement_output_sha256": report.get("output_sha256"),
+        "refinement_output_byte_identical_to_source": report.get(
+            "output_byte_identical_to_source"
+        ),
         "evaluation_views_used_for_refinement": report.get("evaluation_views_used"),
+        "evaluation_views_used": False,
         "test_time_ground_truth_latents_used": False,
-        "inference_context_source": "stage4_prediction_plus_conditioning_images_only",
+        "test_time_ground_truth_mesh_used": False,
+        "test_time_ground_truth_voxels_used": False,
+        "inference_context_source": (
+            f"{args.refinement_source_stage}_prediction_plus_disjoint_"
+            "conditioning_optimization_and_selection_views_only"
+        ),
     }
     if latency_seconds is not None:
         metrics.update({"latency_seconds": latency_seconds, "peak_vram_gb": peak_vram_gb})
@@ -1203,6 +1694,7 @@ def _geoss_command(
     *,
     decode: bool,
     disable_ss_adapter: bool = False,
+    mask_aware_crop: bool = False,
     geoss_checkpoint: str | None = None,
     ss_checkpoint: str | None = None,
 ) -> list[str]:
@@ -1239,6 +1731,10 @@ def _geoss_command(
         str(bool(args.render_eval)).lower(),
         "--disable_ss_adapter",
         str(bool(disable_ss_adapter)).lower(),
+        "--trellis_mask_aware_crop",
+        str(bool(mask_aware_crop)).lower(),
+        "--trellis_crop_padding",
+        str(args.trellis_crop_padding),
         "--real_infer",
     ]
     if args.vggt_root:
@@ -1319,14 +1815,15 @@ def _eval_assets(ablation: str, out_dir: Path, args: argparse.Namespace | None, 
     cached_metrics_path = eval_dir / "geovis_slat_metrics.json"
     if args is not None and not args.overwrite and cached_metrics_path.is_file():
         cached = _read_json(cached_metrics_path)
-        selected = {
-            f"asset_{key}": value
-            for key, value in cached.items()
-            if isinstance(value, (int, float, str, bool, list)) or value is None
-        }
-        selected["asset_eval_status"] = "ok"
-        selected["asset_eval_cache_hit"] = True
-        return selected
+        if cached.get("evaluation_protocol") == "meshfleet_heldout_v3":
+            selected = {
+                f"asset_{key}": value
+                for key, value in cached.items()
+                if isinstance(value, (int, float, str, bool, list)) or value is None
+            }
+            selected["asset_eval_status"] = "ok"
+            selected["asset_eval_cache_hit"] = True
+            return selected
     command = [
         sys.executable,
         "scripts/eval_geovis_slat.py",
@@ -1440,7 +1937,10 @@ def _aggregate(
         "by_ablation": {},
         "expected_object_count": len(expected_indices),
         "aggregation_policy": "failed or missing objects are reported and never silently dropped",
-        "official_metric_policy": "PSNR/SSIM/LPIPS/CD/F-score aggregate only rows whose evaluator marks asset_official_metrics=true",
+        "official_metric_policy": (
+            "PSNR/SSIM/LPIPS/CD/F-score aggregate only manifested rows whose "
+            "v3 evaluator marks asset_official_metrics=true"
+        ),
     }
     for ablation in ablations:
         subset = [row for row in rows if row.get("ablation") == ablation]
@@ -1459,7 +1959,9 @@ def _aggregate(
             metrics[name] = _distribution_stats(values, mean=mean, std=std)
         official_rows = [
             row for row in ok
-            if row.get("asset_official_metrics") is True and row.get("population_manifested") is True
+            if row.get("asset_official_metrics") is True
+            and row.get("asset_evaluation_protocol") == "meshfleet_heldout_v3"
+            and row.get("population_manifested") is True
         ]
         official_metrics = {}
         for name in ("asset_PSNR", "asset_SSIM", "asset_LPIPS", "asset_CD", "asset_F-score"):
@@ -1481,7 +1983,114 @@ def _aggregate(
             "official_complete": len(official_rows) == len(expected_indices) and not missing_indices,
             "official_metrics": official_metrics,
         }
+    out["paired_vs_original_trellis"] = _paired_official_comparisons(
+        rows,
+        baseline="original_trellis",
+        candidates=[name for name in ablations if name != "original_trellis"],
+    )
     return out
+
+
+def _paired_official_comparisons(
+    rows: list[dict[str, Any]],
+    *,
+    baseline: str,
+    candidates: list[str],
+) -> dict[str, Any]:
+    """Compute UID-identical metric effects with improvement-positive signs."""
+    metrics = {
+        "PSNR": ("asset_PSNR", 1.0),
+        "SSIM": ("asset_SSIM", 1.0),
+        "LPIPS": ("asset_LPIPS", -1.0),
+        "foreground_crop_PSNR": ("asset_render_foreground_crop_PSNR", 1.0),
+        "foreground_crop_SSIM": ("asset_render_foreground_crop_SSIM", 1.0),
+        "foreground_crop_LPIPS": ("asset_render_foreground_crop_LPIPS", -1.0),
+        "masked_PSNR": ("asset_render_masked_PSNR", 1.0),
+        "foreground_L1": ("asset_render_foreground_L1", -1.0),
+        "Mask_IoU": ("asset_render_Mask_IoU", 1.0),
+        "Boundary_F_score": ("asset_render_Boundary_F_score", 1.0),
+        "CD": ("asset_CD", -1.0),
+        "Chamfer-L2": ("asset_Chamfer-L2", -1.0),
+        "F-score": ("asset_F-score", 1.0),
+        "F-score precision": ("asset_F-score precision", 1.0),
+        "F-score recall": ("asset_F-score recall", 1.0),
+        "point-to-surface distance": ("asset_point-to-surface distance", -1.0),
+    }
+
+    def official_by_index(ablation: str) -> dict[int, dict[str, Any]]:
+        selected = {}
+        for row in rows:
+            if (
+                row.get("ablation") != ablation
+                or row.get("status") != "ok"
+                or row.get("asset_official_metrics") is not True
+                or row.get("asset_evaluation_protocol") != "meshfleet_heldout_v3"
+                or row.get("population_manifested") is not True
+                or not isinstance(row.get("index"), int)
+            ):
+                continue
+            selected[int(row["index"])] = row
+        return selected
+
+    baseline_rows = official_by_index(baseline)
+    comparisons: dict[str, Any] = {}
+    for candidate in candidates:
+        candidate_rows = official_by_index(candidate)
+        common = sorted(set(baseline_rows) & set(candidate_rows))
+        metric_effects = {}
+        for metric_name, (field, direction) in metrics.items():
+            improvements = []
+            raw_deltas = []
+            for index in common:
+                base_value = baseline_rows[index].get(field)
+                candidate_value = candidate_rows[index].get(field)
+                if not isinstance(base_value, (int, float)) or not isinstance(
+                    candidate_value, (int, float)
+                ):
+                    continue
+                base_value = float(base_value)
+                candidate_value = float(candidate_value)
+                if not math.isfinite(base_value) or not math.isfinite(candidate_value):
+                    continue
+                raw = candidate_value - base_value
+                raw_deltas.append(raw)
+                improvements.append(direction * raw)
+            if not improvements:
+                continue
+            stats = _distribution_stats(improvements)
+            wins = sum(value > 1e-12 for value in improvements)
+            losses = sum(value < -1e-12 for value in improvements)
+            ties = len(improvements) - wins - losses
+            metric_effects[metric_name] = {
+                "improvement_positive": True,
+                "candidate_minus_baseline_mean": sum(raw_deltas) / len(raw_deltas),
+                "paired_improvement": stats,
+                "win_rate": wins / len(improvements),
+                "wins": wins,
+                "losses": losses,
+                "ties": ties,
+                "two_sided_sign_test_p": _two_sided_sign_test_p(wins, losses),
+                "worst_regression": min(improvements),
+            }
+        comparisons[candidate] = {
+            "baseline": baseline,
+            "paired_object_count": len(common),
+            "baseline_official_object_count": len(baseline_rows),
+            "candidate_official_object_count": len(candidate_rows),
+            "paired_indices": common,
+            "metrics": metric_effects,
+        }
+    return comparisons
+
+
+def _two_sided_sign_test_p(wins: int, losses: int) -> float:
+    """Exact two-sided sign-test p-value; ties are excluded."""
+    trials = int(wins) + int(losses)
+    if trials == 0:
+        return 1.0
+    tail = min(int(wins), int(losses))
+    probability = sum(math.comb(trials, value) for value in range(tail + 1))
+    return min(1.0, 2.0 * probability / (2.0**trials))
 
 
 def _distribution_stats(values: list[float], *, mean: float | None = None, std: float | None = None) -> dict[str, float | int]:
