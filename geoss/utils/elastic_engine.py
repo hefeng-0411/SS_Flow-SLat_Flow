@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import copy
-import math
 import os
 import threading
-from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +10,8 @@ from typing import Any, Callable, Mapping
 
 import torch
 import torch.distributed as dist
+
+from geoss.utils.early_stopping import EarlyStopper
 
 
 @dataclass
@@ -31,142 +31,13 @@ class TrainStepSnapshot:
     sampler_state: dict[str, Any] | None
 
 
-class FastPlateauDetector:
-    """Aggressive, low-latency plateau detector for iteration-speed runs."""
+class FastPlateauDetector(EarlyStopper):
+    """Backward-compatible name for the evidence-rate controller.
 
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        metric: str = "loss",
-        mode: str = "min",
-        window: int = 8,
-        patience: int = 2,
-        min_delta: float = 0.002,
-        relative_delta: bool = True,
-        warmup_steps: int = 200,
-        min_steps: int = 300,
-        max_train_hours: float = 0.0,
-    ) -> None:
-        if mode not in {"min", "max"}:
-            raise ValueError("plateau mode must be 'min' or 'max'")
-        self.enabled = bool(enabled)
-        self.metric = metric
-        self.mode = mode
-        self.window = max(1, int(window))
-        self.patience = max(1, int(patience))
-        self.min_delta = max(0.0, float(min_delta))
-        self.relative_delta = bool(relative_delta)
-        self.warmup_steps = max(0, int(warmup_steps))
-        self.min_steps = max(0, int(min_steps))
-        self.max_train_seconds = max(0.0, float(max_train_hours)) * 3600.0
-        self.start_time = __import__("time").time()
-        self.values: deque[float] = deque(maxlen=self.window)
-        self.best_score: float | None = None
-        self.best_step: int | None = None
-        self.bad_steps = 0
-        self.seen_steps = 0
-        self.smoothed: float | None = None
-
-    @classmethod
-    def from_args(cls, args: Any, default_metric: str = "loss") -> "FastPlateauDetector":
-        return cls(
-            enabled=bool(getattr(args, "early_stop", False)),
-            metric=getattr(args, "early_stop_metric", None) or default_metric,
-            mode=getattr(args, "early_stop_mode", "min"),
-            window=getattr(args, "early_stop_window", 8),
-            patience=getattr(args, "early_stop_patience", 2),
-            min_delta=getattr(args, "early_stop_min_delta", 0.002),
-            relative_delta=bool(getattr(args, "early_stop_relative_delta", True)),
-            warmup_steps=getattr(args, "early_stop_warmup_steps", 200),
-            min_steps=getattr(args, "early_stop_min_steps", 300),
-            max_train_hours=getattr(args, "max_train_hours", 0.0),
-        )
-
-    def update(self, record: Mapping[str, Any]):
-        from geoss.utils.early_stopping import EarlyStopStatus
-
-        if not self.enabled:
-            return EarlyStopStatus(False, False, False, self.metric, None, None, self.best_score, self.bad_steps, "disabled")
-
-        step = _as_int(record.get("step"), 0)
-        raw = _as_float(_get_nested(record, self.metric))
-        if raw is None:
-            return EarlyStopStatus(True, False, False, self.metric, None, self.smoothed, self.best_score, self.bad_steps, "metric_missing")
-
-        self.seen_steps = max(self.seen_steps, step)
-        self.values.append(raw)
-        self.smoothed = sum(self.values) / len(self.values)
-
-        is_best = False
-        should_stop = False
-        reason = "running"
-        if step < self.warmup_steps:
-            reason = "warmup"
-        elif step < self.min_steps:
-            reason = "below_min_steps"
-        elif len(self.values) < self.window:
-            reason = "filling_window"
-        else:
-            is_best = self._is_improvement(self.smoothed)
-            if is_best:
-                self.best_score = self.smoothed
-                self.best_step = step
-                self.bad_steps = 0
-            else:
-                self.bad_steps += 1
-                if self.bad_steps >= self.patience:
-                    should_stop = True
-                    reason = f"fast_plateau_patience_{self.patience}"
-
-        if self.best_score is None and self.smoothed is not None:
-            self.best_score = self.smoothed
-            self.best_step = step
-            is_best = True
-
-        if self.max_train_seconds > 0 and (__import__("time").time() - self.start_time) >= self.max_train_seconds:
-            should_stop = True
-            reason = f"max_train_hours_{self.max_train_seconds / 3600.0:.3g}"
-
-        return EarlyStopStatus(True, should_stop, is_best, self.metric, raw, self.smoothed, self.best_score, self.bad_steps, reason)
-
-    def _is_improvement(self, score: float) -> bool:
-        if self.best_score is None:
-            return True
-        delta = self.min_delta * max(1.0, abs(self.best_score)) if self.relative_delta else self.min_delta
-        if self.mode == "min":
-            return score < self.best_score - delta
-        return score > self.best_score + delta
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "best_score": self.best_score,
-            "best_step": self.best_step,
-            "bad_steps": self.bad_steps,
-            "smoothed": self.smoothed,
-            "seen_steps": self.seen_steps,
-            "values": list(self.values),
-            "metric": self.metric,
-            "mode": self.mode,
-        }
-
-    def load_state_dict(self, state: Mapping[str, Any] | None) -> None:
-        if not state:
-            return
-        if state.get("metric") and state.get("metric") != self.metric:
-            return
-        if state.get("mode") and state.get("mode") != self.mode:
-            return
-        self.best_score = _as_float(state.get("best_score"))
-        self.best_step = _as_int(state.get("best_step"), 0) if state.get("best_step") is not None else None
-        self.bad_steps = _as_int(state.get("bad_steps"), 0)
-        self.smoothed = _as_float(state.get("smoothed"))
-        self.seen_steps = _as_int(state.get("seen_steps"), 0)
-        self.values.clear()
-        for value in state.get("values", [])[-self.window :]:
-            parsed = _as_float(value)
-            if parsed is not None:
-                self.values.append(parsed)
+    The former fixed-window/patience implementation was unsafe: independent
+    call sites could silently retain the obsolete stopping semantics. Keeping
+    this alias routes every caller through the single production controller.
+    """
 
 
 class AsyncArtifactManager:
@@ -414,29 +285,3 @@ def _load_sampler_state_dict(sampler: Any, state: Mapping[str, Any] | None) -> N
 def _is_cuda_oom(exc: BaseException) -> bool:
     text = str(exc).lower()
     return isinstance(exc, torch.cuda.OutOfMemoryError) or "cuda out of memory" in text or "outofmemoryerror" in text or "out of memory" in text
-
-
-def _as_float(value: Any) -> float | None:
-    try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return None
-    return out if out == out and abs(out) != math.inf else None
-
-
-def _as_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _get_nested(record: Mapping[str, Any], key: str) -> Any:
-    if key in record:
-        return record[key]
-    current: Any = record
-    for part in key.split("."):
-        if not isinstance(current, Mapping) or part not in current:
-            return None
-        current = current[part]
-    return current

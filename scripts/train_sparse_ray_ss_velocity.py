@@ -35,7 +35,13 @@ from geoss.utils.distributed import (
     sync_should_stop,
     unwrap_model,
 )
-from geoss.utils.early_stopping import EarlyStopper
+from geoss.utils.early_stopping import (
+    EarlyStopper,
+    apply_early_stop_action,
+    distributed_early_stop_update,
+    handoff_contract,
+    quarantine_legacy_best_checkpoint,
+)
 from geoss.utils.elastic_engine import cuda_memory_watermark, slice_batch_to_size, train_step_with_oom_retry
 
 
@@ -158,6 +164,11 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     early_stopper = EarlyStopper.from_args(args, default_metric="loss")
     if resume_state is not None:
         early_stopper.load_state_dict(resume_state.get("early_stopper"))
+        if ctx.is_main:
+            quarantine_legacy_best_checkpoint(
+                out_dir / "ss_velocity_adapter_best.pt",
+                resume_state,
+            )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
     if start_step >= end_step:
         return {
@@ -309,13 +320,20 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "memory": memory_end,
             "adaptive_batch": {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()},
         }
-        early_status = early_stopper.update(last)
+        early_status = distributed_early_stop_update(
+            early_stopper,
+            last,
+            rank=ctx.rank,
+        )
+        last["early_stop_action"] = apply_early_stop_action(opt, early_status)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last) + "\n")
         if ctx.is_main and args.save_best and early_status.is_best:
             _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_best.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
+        if ctx.is_main and early_status.is_candidate:
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_candidate.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
         if ctx.is_main and (should_fault_save or step % args.save_every == 0 or step == end_step):
             _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status)
@@ -796,8 +814,8 @@ def _maybe_launch_stage2(summary: dict, cfg: dict) -> None:
     if not workflow.get("auto_stage2_on_convergence", False):
         return
     early = summary.get("early_stop", {}) if isinstance(summary, dict) else {}
-    reason = str(early.get("reason", ""))
-    if not early.get("should_stop") or "plateau" not in reason:
+    ready, _ = handoff_contract(early)
+    if not early.get("should_stop") or not ready:
         return
     command = workflow.get("stage2_command")
     if command:

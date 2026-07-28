@@ -33,7 +33,12 @@ from geoss.utils.distributed import (
     sync_should_stop,
     unwrap_model,
 )
-from geoss.utils.early_stopping import EarlyStopper
+from geoss.utils.early_stopping import (
+    EarlyStopper,
+    apply_early_stop_action,
+    distributed_early_stop_update,
+    quarantine_legacy_best_checkpoint,
+)
 from geoss.utils.elastic_engine import slice_batch_to_size, train_step_with_oom_retry
 from geoss.utils.visualization import save_npz, save_projected_anchor_debug_png, save_ray_free_space_debug_png, write_point_cloud_ply
 
@@ -105,6 +110,11 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     early_stopper = EarlyStopper.from_args(args, default_metric="loss")
     if resume_state is not None:
         early_stopper.load_state_dict(resume_state.get("early_stopper"))
+        if ctx.is_main:
+            quarantine_legacy_best_checkpoint(
+                out_dir / "geoss_adapter_best.pt",
+                resume_state,
+            )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
     if start_step >= end_step:
         return {
@@ -226,13 +236,23 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         }
         if ctx.is_main and args.val_every > 0 and step % args.val_every == 0:
             last_summary["validation"] = _validation_step(unwrap_model(model), vggt, batch, device)
-        early_status = early_stopper.update(last_summary)
+        early_status = distributed_early_stop_update(
+            early_stopper,
+            last_summary,
+            rank=ctx.rank,
+        )
+        # The controller emits at most one self-calibrated LR intervention per
+        # statistically resolved plateau. Apply it on every rank so optimizer
+        # state remains DDP-identical.
+        last_summary["early_stop_action"] = apply_early_stop_action(opt, early_status)
         last_summary["early_stop"] = early_status.as_dict()
         if ctx.is_main:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last_summary) + "\n")
         if ctx.is_main and args.save_best and early_status.is_best:
             _save_geoss_checkpoint(out_dir / "geoss_adapter_best.pt", model, opt, step, cfg, early_stopper, early_status)
+        if ctx.is_main and early_status.is_candidate:
+            _save_geoss_checkpoint(out_dir / "geoss_adapter_candidate.pt", model, opt, step, cfg, early_stopper, early_status)
         if ctx.is_main and args.visualize_every > 0 and step % args.visualize_every == 0:
             _write_visualization_outputs(out_dir, step, batch, out)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0

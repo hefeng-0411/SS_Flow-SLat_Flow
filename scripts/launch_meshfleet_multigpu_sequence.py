@@ -12,6 +12,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from geoss.utils.early_stopping import handoff_contract
+
 
 OOM_PATTERNS = (
     "out of memory",
@@ -144,12 +148,14 @@ def main() -> None:
     parser.add_argument("--visualize_every", type=int, default=1000)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--disable_early_stop", action="store_true")
-    parser.add_argument("--early_stop_patience", type=int, default=2)
-    parser.add_argument("--early_stop_min_steps", type=int, default=300)
-    parser.add_argument("--early_stop_warmup_steps", type=int, default=200)
-    parser.add_argument("--early_stop_min_delta", type=float, default=0.002)
-    parser.add_argument("--early_stop_ema", type=float, default=0.6)
-    parser.add_argument("--early_stop_window", type=int, default=8)
+    # Legacy flags are accepted as inert compatibility inputs. No configured
+    # patience, warmup, window, EMA, or loss delta enters termination logic.
+    parser.add_argument("--early_stop_patience", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--early_stop_min_steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--early_stop_warmup_steps", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--early_stop_min_delta", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--early_stop_ema", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--early_stop_window", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--adaptive_min_batch_size", type=int, default=1)
     parser.add_argument("--adaptive_target_utilization", type=float, default=0.92)
     parser.add_argument("--adaptive_low_utilization", type=float, default=0.82)
@@ -199,10 +205,13 @@ def main() -> None:
     handoff = HandoffCoordinator(args, env, nproc)
     for index, stage in enumerate(stages):
         next_stage = stages[index + 1] if index + 1 < len(stages) else None
+        _assert_selected_input_contracts(stage)
         if _stage_is_complete(stage) and not args.force_rerun_completed:
             step = _checkpoint_step(_resolve_resume_path(stage))
             selected[stage.name] = "already_complete"
             print(f"\n==== {stage.name}: already complete at checkpoint step={step}; skipping ====", flush=True)
+            if next_stage is not None:
+                _assert_stage_handoff(stage, next_stage)
             continue
         if next_stage is not None:
             handoff.start_when_ready(next_stage, current_stage=stage)
@@ -211,6 +220,8 @@ def main() -> None:
         selected[stage.name] = batch_size
         print(f"==== {stage.name}: selected per-GPU batch_size={batch_size}, global_batch_size={batch_size * nproc} ====", flush=True)
         _run_full_stage(stage, args, env, nproc, batch_size)
+        if next_stage is not None:
+            _assert_stage_handoff(stage, next_stage)
     handoff.close()
 
     summary = {"nproc_per_node": nproc, "selected_per_gpu_batch_size": selected}
@@ -248,7 +259,11 @@ class HandoffCoordinator:
         self.pool.shutdown(wait=False, cancel_futures=True)
 
     def _wait_and_probe(self, next_stage: Stage, current_stage: Stage, env: dict, nproc: int) -> int:
-        while _checkpoint_step(_resolve_resume_path(current_stage)) is None:
+        while True:
+            current_status = _checkpoint_early_stop(_resolve_resume_path(current_stage))
+            ready, _ = handoff_contract(current_status)
+            if ready:
+                break
             time.sleep(2.0)
         while _required_initialization_path(next_stage) is not None and _resolve_initialization_path(next_stage) is None:
             time.sleep(2.0)
@@ -298,13 +313,6 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             "--early_stop", "true",
             "--early_stop_metric", "loss",
             "--early_stop_mode", "min",
-            "--early_stop_patience", str(args.early_stop_patience),
-            "--early_stop_min_steps", str(args.early_stop_min_steps),
-            "--early_stop_warmup_steps", str(args.early_stop_warmup_steps),
-            "--early_stop_min_delta", str(args.early_stop_min_delta),
-            "--early_stop_relative_delta", "true",
-            "--early_stop_ema", str(args.early_stop_ema),
-            "--early_stop_window", str(args.early_stop_window),
             "--max_train_hours", str(args.max_train_hours_per_stage),
             "--save_best", "true",
         ]
@@ -338,9 +346,9 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
         slat_runtime_args += ["--torch_hub_dir", args.torch_hub_dir]
     if args.dinov2_repo:
         slat_runtime_args += ["--dinov2_repo", args.dinov2_repo]
-    stage1_geoss_checkpoint = stage1_out / "geoss_adapter_last.pt"
-    if not stage1_geoss_checkpoint.exists() and (stage1_out / "geoss_adapter_best.pt").exists():
-        stage1_geoss_checkpoint = stage1_out / "geoss_adapter_best.pt"
+    # Downstream stages consume the statistically selected champion. The last
+    # checkpoint exists for exact resume and may be a degraded terminal state.
+    stage1_geoss_checkpoint = stage1_out / "geoss_adapter_best.pt"
 
     return [
         Stage(
@@ -611,7 +619,7 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
     setup_retries = 0
     launcher_log = stage.output_dir / "launcher_stage.log"
     while current >= args.min_batch_size:
-        if _stage_is_complete(stage):
+        if _stage_is_complete(stage) and not args.force_rerun_completed:
             print(f"{stage.name}: completed at checkpoint step={_checkpoint_step(_resolve_resume_path(stage))}", flush=True)
             return
         resume_path = _resolve_resume_path(stage)
@@ -705,11 +713,6 @@ def _resolve_initialization_path(stage: Stage) -> Optional[Path]:
         return None
     if _checkpoint_step(requested) is not None:
         return requested
-    name = requested.name
-    if name.endswith("_best.pt"):
-        fallback = requested.with_name(name.removesuffix("_best.pt") + "_last.pt")
-        if _checkpoint_step(fallback) is not None:
-            return fallback
     return None
 
 
@@ -845,6 +848,52 @@ def _stage_is_complete(stage: Stage) -> bool:
         return True
     early_stop = _checkpoint_early_stop(resume_path)
     return bool(early_stop and early_stop.get("should_stop"))
+
+
+def _assert_stage_handoff(stage: Stage, next_stage: Stage) -> None:
+    """Reject a cascading stage transition unless upstream learning is proven."""
+
+    checkpoint = _resolve_resume_path(stage)
+    status = _checkpoint_early_stop(checkpoint)
+    ready, reasons = handoff_contract(status)
+    if ready:
+        return
+    checkpoint_text = str(checkpoint) if checkpoint is not None else "<missing>"
+    details = ", ".join(reasons) if reasons else "unknown_contract_failure"
+    raise RuntimeError(
+        f"{stage.name} cannot hand off to {next_stage.name}: {details}. "
+        f"Certification source: {checkpoint_text}. Continue or repair the "
+        "upstream stage; never initialize downstream training from an "
+        "uncertified terminal snapshot."
+    )
+
+
+def _assert_selected_input_contracts(stage: Stage) -> None:
+    """Validate explicitly selected upstream weights on partial-sequence runs."""
+
+    for flag in ("--geoss_checkpoint", "--init_checkpoint"):
+        try:
+            index = stage.extra_args.index(flag)
+        except ValueError:
+            continue
+        if index + 1 >= len(stage.extra_args):
+            raise ValueError(f"{stage.name} has {flag} without a checkpoint path.")
+        selected = Path(stage.extra_args[index + 1])
+        certification = selected
+        if selected.name.endswith("_best.pt"):
+            sibling_last = selected.with_name(
+                selected.name.removesuffix("_best.pt") + "_last.pt"
+            )
+            if sibling_last.is_file():
+                certification = sibling_last
+        status = _checkpoint_early_stop(certification)
+        ready, reasons = handoff_contract(status)
+        if not ready:
+            details = ", ".join(reasons) if reasons else "unknown_contract_failure"
+            raise RuntimeError(
+                f"{stage.name} rejected {flag}={selected}: {details}. "
+                f"Certification source: {certification}."
+            )
 
 
 def _resolve_resume_path(stage: Stage) -> Optional[Path]:
