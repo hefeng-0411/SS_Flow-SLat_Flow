@@ -10,14 +10,29 @@ def confidence_calibration_loss(
     geo_error: torch.Tensor,
     regularizer_weight: float = 0.01,
 ) -> Dict[str, torch.Tensor]:
+    """Calibrate confidence to reconstruction correctness.
+
+    ``geo_error`` is an error (zero is correct), not a confidence target.  The
+    historical objective minimized ``confidence * error`` and had no term
+    rewarding confidence on correct anchors, making the all-zero gate an
+    optimum.  Brier calibration removes that degenerate solution.
+    """
     conf = torch.nan_to_num(confidence.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(1e-4, 1.0 - 1e-4)
     clean_error = torch.nan_to_num(geo_error.float(), nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    err = clean_error.detach() if clean_error.requires_grad else clean_error
-    weighted = (conf * clean_error).mean()
-    entropy_reg = regularizer_weight * (-(conf * conf.log() + (1 - conf) * (1 - conf).log())).mean()
-    loss = weighted + entropy_reg
+    err = clean_error.detach()
+    target = 1.0 - err
+    brier = (conf - target).square().mean()
+    # A very small barrier prevents exact sigmoid saturation without dictating
+    # whether a particular anchor should be trusted.
+    barrier = -(conf.log() + (1.0 - conf).log()).mean()
+    loss = brier + regularizer_weight * barrier
     corr = _safe_corr(conf.reshape(-1), err.reshape(-1))
-    return {"confidence_calibration": loss, "confidence_error_corr": corr.detach(), "loss": loss}
+    return {
+        "confidence_calibration": loss,
+        "confidence_brier": brier.detach(),
+        "confidence_error_corr": corr.detach(),
+        "loss": loss,
+    }
 
 
 def _safe_corr(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

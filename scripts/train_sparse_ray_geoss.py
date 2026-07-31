@@ -41,6 +41,15 @@ from geoss.utils.early_stopping import (
 )
 from geoss.utils.elastic_engine import slice_batch_to_size, train_step_with_oom_retry
 from geoss.utils.visualization import save_npz, save_projected_anchor_debug_png, save_ray_free_space_debug_png, write_point_cloud_ply
+from geoss.utils.training_control import (
+    BoundedLossBalancer,
+    ControlConfig,
+    WarmupCosineController,
+    build_geoss_optimizer,
+    gradient_group_norms,
+    group_update_ratios,
+    snapshot_group_parameters,
+)
 
 
 def run_dry_run(cfg: dict, device: str) -> dict:
@@ -93,10 +102,23 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         model.load_state_dict(resume_state.get("model", resume_state), strict=True)
         start_step = int(resume_state.get("step", 0))
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
-    base_lrs = [group["lr"] for group in opt.param_groups]
+    opt = build_geoss_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+    control_cfg = ControlConfig(
+        warmup_steps=args.warmup_steps,
+        total_steps=max(int(args.steps), int(args.schedule_total_steps)),
+        min_lr_ratio=args.min_lr_ratio,
+        gradient_clip_norm=args.gradient_clip_norm,
+        loss_ema_decay=args.loss_ema_decay,
+        loss_weight_min=args.loss_weight_min,
+        loss_weight_max=args.loss_weight_max,
+    )
+    scheduler = WarmupCosineController(opt, control_cfg)
+    loss_balancer = BoundedLossBalancer(("occupancy", "free_space", "projection", "confidence", "sparsity"), control_cfg)
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
+        training_control = resume_state.get("training_control", {})
+        scheduler.load_state_dict(training_control.get("scheduler"))
+        loss_balancer.load_state_dict(training_control.get("loss_balancer"))
     loader, sampler = _build_real_loader(args, ctx)
     iterator = iter(loader) if loader is not None else None
     if iterator is None:
@@ -127,6 +149,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     step = start_step
     while step < end_step:
         step += 1
+        learning_rates = scheduler.step(step)
         batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
         batch = _move_batch(batch, device)
 
@@ -172,19 +195,40 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 free_geometry=ray.get("evidence_debug", {}).get("free_geometry"),
             )
             proj_terms = projection_consistency_loss(out["anchor_xyz"], occ_prob, clean_batch["masks"], clean_batch["K"], clean_batch["w2c"])
-            conf_terms = confidence_calibration_loss(out["geo_confidence"], 1.0 - geo_error)
+            conf_terms = confidence_calibration_loss(out["geo_confidence"], geo_error)
             anchor_sparsity = occ_prob.mean() * args.anchor_sparsity_weight
-            loss = (
-                losses.get("loss", torch.zeros((), device=device))
-                + ray_terms["loss"]
-                + proj_terms["loss"]
-                + conf_terms["loss"]
-                + anchor_sparsity
-            )
+            objective_values = {
+                "occupancy": losses.get("loss", torch.zeros((), device=device)),
+                "free_space": ray_terms["loss"],
+                "projection": proj_terms["loss"],
+                "confidence": conf_terms["loss"],
+                "sparsity": anchor_sparsity,
+            }
+            # Geometry retains minimum authority while the free-space term is
+            # prevented from disappearing merely because it became small.
+            authority = _stage_authority(step, args)
+            loss, loss_weights = loss_balancer.combine(objective_values, authority)
+            audit_updates = step == 1 or step % args.update_audit_every == 0
+            parameter_before = snapshot_group_parameters(opt) if audit_updates else None
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            gradient_norms = gradient_group_norms(opt)
+            total_gradient_norm = float(torch.nn.utils.clip_grad_norm_(
+                [p for group in opt.param_groups for p in group["params"]],
+                args.gradient_clip_norm,
+            ).detach().cpu())
+            gradients_finite = all(
+                parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+                for group in opt.param_groups for parameter in group["params"]
+            )
+            if not gradients_finite:
+                opt.zero_grad(set_to_none=True)
+                raise FloatingPointError(f"non-finite GeoSS gradients at step {step}")
             opt.step()
-            return clean_batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss
+            update_ratios = group_update_ratios(opt, parameter_before) if parameter_before is not None else {}
+            return (clean_batch, out, ray, occ_prob, geo_error, losses, ray_terms,
+                    proj_terms, conf_terms, anchor_sparsity, loss, loss_weights,
+                    gradient_norms, total_gradient_norm, update_ratios)
 
         retry = train_step_with_oom_retry(
             step_fn,
@@ -198,13 +242,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             log_oom=log_oom,
         )
         batch_adjustment = retry.adjustment
-        batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms, conf_terms, anchor_sparsity, loss = retry.value
+        (batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms,
+         conf_terms, anchor_sparsity, loss, loss_weights, gradient_norms,
+         total_gradient_norm, update_ratios) = retry.value
         if batch_adjustment is not None and batch_adjustment.changed:
             rebuild_after_adjustment(batch_adjustment)
         confidence_std = float(out["geo_confidence"].std(unbiased=False).detach().cpu())
-        lr_adapted = _adapt_lr_for_confidence_collapse(
-            opt, base_lrs, confidence_std, args.confidence_std_target, args.confidence_lr_boost,
-        )
+        lr_adapted = False
         last_summary = {
             "step": step,
             "loss": float(loss.detach().cpu()),
@@ -216,7 +260,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "anchor_sparsity": float(anchor_sparsity.detach().cpu()),
             "confidence_mean": float(out["geo_confidence"].mean().detach().cpu()),
             "confidence_std": confidence_std,
-            "learning_rate": float(opt.param_groups[0]["lr"]),
+            "learning_rate": max(learning_rates),
+            "learning_rates": {str(group.get("name", i)): float(group["lr"]) for i, group in enumerate(opt.param_groups)},
+            "loss_weights": loss_weights,
+            "gradient_norm": total_gradient_norm,
+            "gradient_norms": gradient_norms,
+            "update_ratios": update_ratios,
+            "lr_stability_multiplier": scheduler.stability_multiplier,
             "confidence_lr_adapted": lr_adapted,
             "occ_score_mean": float(ray["occ_score"].mean().detach().cpu()),
             "free_score_mean": float(ray["free_score"].mean().detach().cpu()),
@@ -244,23 +294,26 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         # The controller emits at most one self-calibrated LR intervention per
         # statistically resolved plateau. Apply it on every rank so optimizer
         # state remains DDP-identical.
-        last_summary["early_stop_action"] = apply_early_stop_action(opt, early_status)
+        action = apply_early_stop_action(opt, early_status)
+        if action.get("applied"):
+            scheduler.contract(float(action["multiplier"]))
+        last_summary["early_stop_action"] = action
         last_summary["early_stop"] = early_status.as_dict()
         if ctx.is_main:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last_summary) + "\n")
         if ctx.is_main and args.save_best and early_status.is_best:
-            _save_geoss_checkpoint(out_dir / "geoss_adapter_best.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_geoss_checkpoint(out_dir / "geoss_adapter_best.pt", model, opt, step, cfg, early_stopper, early_status, scheduler, loss_balancer)
         if ctx.is_main and early_status.is_candidate:
-            _save_geoss_checkpoint(out_dir / "geoss_adapter_candidate.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_geoss_checkpoint(out_dir / "geoss_adapter_candidate.pt", model, opt, step, cfg, early_stopper, early_status, scheduler, loss_balancer)
         if ctx.is_main and args.visualize_every > 0 and step % args.visualize_every == 0:
             _write_visualization_outputs(out_dir, step, batch, out)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
         if ctx.is_main and (should_fault_save or step % args.save_every == 0 or step == end_step):
-            _save_geoss_checkpoint(out_dir / "geoss_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_geoss_checkpoint(out_dir / "geoss_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status, scheduler, loss_balancer)
         if sync_should_stop(early_status.should_stop, device):
             if ctx.is_main:
-                _save_geoss_checkpoint(out_dir / "geoss_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
+                _save_geoss_checkpoint(out_dir / "geoss_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status, scheduler, loss_balancer)
             break
     return last_summary
 
@@ -274,9 +327,16 @@ def main() -> None:
     parser.add_argument("--latent_tokens", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--schedule_total_steps", type=int, default=100000)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.05)
+    parser.add_argument("--gradient_clip_norm", type=float, default=2.0)
+    parser.add_argument("--update_audit_every", type=int, default=50)
+    parser.add_argument("--loss_ema_decay", type=float, default=0.98)
+    parser.add_argument("--loss_weight_min", type=float, default=0.25)
+    parser.add_argument("--loss_weight_max", type=float, default=4.0)
+    parser.add_argument("--geometry_stage_steps", type=int, default=1000)
     parser.add_argument("--anchor_sparsity_weight", type=float, default=1e-3)
-    parser.add_argument("--confidence_std_target", type=float, default=0.02)
-    parser.add_argument("--confidence_lr_boost", type=float, default=1.10)
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--visualize_every", type=int, default=100)
     parser.add_argument("--val_every", type=int, default=0)
@@ -347,15 +407,6 @@ def _move_batch(batch, device):
     return out
 
 
-def _adapt_lr_for_confidence_collapse(optimizer, base_lrs: list[float], std: float, target: float, boost: float) -> bool:
-    """Temporarily raise adapter LR when confidence variance signals a dead gate."""
-    collapsed = std < target
-    for group, base_lr in zip(optimizer.param_groups, base_lrs):
-        current = float(group["lr"])
-        group["lr"] = min(base_lr * 4.0, current * max(boost, 1.0)) if collapsed else max(base_lr, current * 0.98)
-    return collapsed
-
-
 def _without_sparse_structure_latents(batch: dict) -> dict:
     """Stage 1 trains geometry context only, not TRELLIS sparse-structure velocity."""
     blocked = {
@@ -409,7 +460,7 @@ def _write_visualization_outputs(out_dir: Path, step: int, batch, out) -> None:
     save_ray_free_space_debug_png(out_dir / f"ray_free_space_step_{step}.png", ray["free_score"][0], ray["occ_score"][0])
 
 
-def _save_geoss_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, early_stopper: EarlyStopper, early_status) -> None:
+def _save_geoss_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, early_stopper: EarlyStopper, early_status, scheduler, loss_balancer) -> None:
     save_checkpoint(
         path,
         model=unwrap_model(model).state_dict(),
@@ -418,7 +469,19 @@ def _save_geoss_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, e
         config=cfg,
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
+        training_control={
+            "scheduler": scheduler.state_dict(),
+            "loss_balancer": loss_balancer.state_dict(),
+        },
     )
+
+
+def _stage_authority(step: int, args: argparse.Namespace) -> dict[str, float]:
+    if step <= args.warmup_steps:
+        return {"occupancy": 1.0, "free_space": 1.0, "projection": 0.5, "confidence": 0.25, "sparsity": 0.25}
+    if step <= args.geometry_stage_steps:
+        return {"occupancy": 1.0, "free_space": 1.0, "projection": 0.75, "confidence": 0.5, "sparsity": 0.25}
+    return {"occupancy": 1.0, "free_space": 0.75, "projection": 1.0, "confidence": 0.5, "sparsity": 0.25}
 
 
 def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse.ArgumentParser) -> None:
