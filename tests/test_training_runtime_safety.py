@@ -9,6 +9,8 @@ from scripts.launch_meshfleet_multigpu_sequence import (
     _recover_allocator_incompatibility,
 )
 from scripts.train_geovis_slat import _validate_checkpoint_model_config
+from geoss.utils.distributed import init_distributed
+from geoss.utils.run_mode import validate_real_mode
 
 
 class _DummyPipeline:
@@ -19,6 +21,44 @@ class _DummyPipeline:
             "image_cond_model": torch.nn.Linear(4, 4),
             "slat_decoder_gs": torch.nn.Linear(4, 4),
         }
+
+
+def test_single_process_cuda_context_uses_indexed_device(monkeypatch) -> None:
+    class Args:
+        device = "cuda"
+
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    selected = []
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+    ctx = init_distributed(Args())
+    assert ctx.device == torch.device("cuda:0")
+    assert selected == [0]
+
+
+def test_pipeline_availability_does_not_claim_decoder_execution() -> None:
+    class Args:
+        dry_run = False
+        real_train = True
+        vggt_pretrained = "facebook/VGGT-1B"
+        trellis_model_path = "microsoft/TRELLIS-image-large"
+        meshfleet_root = "/dataset"
+
+    summary = validate_real_mode(
+        cfg={
+            "allow_mock": False,
+            "allow_synthetic": False,
+            "use_decoder": False,
+        },
+        args=Args(),
+        mode="real_train",
+        required=("vggt", "trellis", "dataset"),
+    )
+    assert summary["decoder_enabled"] is False
 
 
 def test_allocator_assert_removes_only_unsupported_option() -> None:

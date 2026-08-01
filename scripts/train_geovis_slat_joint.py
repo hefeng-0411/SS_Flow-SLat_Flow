@@ -15,7 +15,7 @@ from scripts.train_geovis_slat import _apply_config_defaults, run_dry_run, run_t
 
 def main() -> None:
     parser = add_common_args(argparse.ArgumentParser())
-    parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--steps", type=int, default=None, help="Required for real training; dry runs do not consume an update budget.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_views", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=64)

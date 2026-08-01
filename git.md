@@ -15,7 +15,7 @@ echo "*.pyc" >> .gitignore
 git add .
 
 # ③ 提交
-git commit -m "chore: update .gitignore to exclude __pycache__"
+git commit -m "update early-stop"
 
 # ④ 推送到远程 v2/main 分支
 git push origin v3/main

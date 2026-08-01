@@ -49,6 +49,20 @@ def init_distributed(args) -> DistributedContext:
             dist.init_process_group(backend=backend, init_method=getattr(args, "dist_url", "env://"))
     else:
         device = torch.device(getattr(args, "device", "cuda" if torch.cuda.is_available() else "cpu"))
+        if device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(f"CUDA device requested but torch.cuda.is_available() is false: {device}")
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            if index < 0 or index >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"Invalid single-process CUDA device index {index}; "
+                    f"torch.cuda.device_count()={torch.cuda.device_count()}."
+                )
+            torch.cuda.set_device(index)
+            # Tensor.device is always indexed (for example cuda:0). Returning
+            # an indexed context prevents false contract failures from
+            # comparing torch.device('cuda') with torch.device('cuda:0').
+            device = torch.device("cuda", index)
 
     args.rank = rank
     args.local_rank = local_rank

@@ -21,6 +21,7 @@ from geoss.datasets.srn_cars_dataset import SRNCarsDataset
 from geoss.datasets.vehicle_multiview_dataset import VehicleMultiViewDataset, make_dry_run_batch
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryWrapper
 from geoss.integration.trellis_residency import configure_trellis_training_residency
+from geoss.integration.trellis_hub import configure_trellis_hub
 from geoss.geometry.alignment import align_vggt_batch
 from geoss.slat.integration.ss_slat_context import build_ss_slat_context
 from geoss.slat.losses.appearance_feature_loss import appearance_feature_loss
@@ -36,8 +37,13 @@ from geoss.slat.utils.normalization import SLAT_TENSOR_CONTRACT_VERSION, normali
 from geoss.slat.utils.slat_visualization import save_slat_debug_npz, write_active_voxels_ply
 from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
-from geoss.utils.config import add_common_args, load_config, str2bool
+from geoss.utils.config import add_common_args, apply_config_mappings, load_config, str2bool
 from geoss.utils.run_mode import validate_real_mode
+from geoss.utils.training_budget import (
+    compute_training_budget,
+    defer_nonfatal_early_stop_until_minimum_exposure,
+    enforce_minimum_dataset_passes,
+)
 from geoss.utils.distributed import (
     build_dataloader,
     cleanup_distributed,
@@ -74,6 +80,47 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     device = ctx.device
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
+    if args.steps is None:
+        raise ValueError("real_train requires an explicit --steps value or a steps entry in the config.")
+    loader, sampler = build_real_loader(args, ctx)
+    if loader is None:
+        raise FileNotFoundError("real_train requires a non-empty real dataset loader; synthetic SLAT batches are only allowed in --dry_run.")
+    training_budget = compute_training_budget(
+        dataset_objects=len(loader.dataset),
+        world_size=ctx.world_size,
+        microbatch_per_rank=args.batch_size,
+        grad_accum_steps=max(1, int(args.grad_accum_steps)),
+        planned_optimizer_updates=int(args.steps),
+        drop_last=bool(getattr(loader, "drop_last", False)),
+    )
+    enforce_minimum_dataset_passes(
+        training_budget,
+        minimum_dataset_passes=args.minimum_dataset_passes,
+        stage="SLAT",
+    )
+    support_provenance = {
+        "coordinate_source": "cached_trellis_slat_teacher",
+        "slat_value_source": "cached_trellis_slat_teacher",
+        "support_schedule": "teacher_only",
+        "upstream_ss_checkpoint": None,
+        "cross_stage_gradient": "absent_ss_not_in_slat_training_graph",
+        "train_inference_support_match": False,
+    }
+    if ctx.is_main:
+        preflight_dir = Path(args.output_dir)
+        preflight_dir.mkdir(parents=True, exist_ok=True)
+        (preflight_dir / "training_preflight.json").write_text(
+            json.dumps(
+                {
+                    "stage": "SLAT",
+                    "training_budget": training_budget.as_dict(),
+                    "minimum_dataset_passes": args.minimum_dataset_passes,
+                    "support_provenance": support_provenance,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     decoded_config = cfg.get("decoded_supervision") if isinstance(cfg.get("decoded_supervision"), dict) else {}
     required_trellis_models = ["slat_flow_model", "image_cond_model"]
     if bool(decoded_config.get("enabled", False)):
@@ -121,7 +168,6 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     scaler = _make_grad_scaler(enabled=args.amp and amp_dtype == torch.float16 and device.type == "cuda")
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
-    loader, sampler = build_real_loader(args, ctx)
     iterator = iter(loader) if loader is not None else None
     if iterator is None:
         raise FileNotFoundError("real_train requires a non-empty real dataset loader; synthetic SLAT batches are only allowed in --dry_run.")
@@ -140,6 +186,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 resume_state,
             )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
+    update_contract = {
+        "configured_steps": int(args.steps),
+        "steps_are_total": bool(args.steps_are_total),
+        "resume_start_step": start_step,
+        "target_step": end_step,
+        "remaining_update_attempts_at_start": max(0, end_step - start_step),
+    }
     if start_step >= end_step:
         return {
             "step": start_step,
@@ -147,6 +200,9 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "mode": "already_complete",
             "rank": ctx.rank,
             "world_size": ctx.world_size,
+            "training_budget": training_budget.as_dict(),
+            "update_contract": update_contract,
+            "support_provenance": support_provenance,
         }
     step = start_step
     while step < end_step:
@@ -266,10 +322,19 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last["adaptive_batch"] = {**batch_controller.state_dict(), "last_adjustment": batch_adjustment.as_dict()}
         last["trellis_residency"] = getattr(trellis_pipeline, "training_residency", None)
         last["initialization_runtime_control_overrides"] = initialization_runtime_overrides
+        last["training_budget"] = training_budget.as_dict()
+        last["update_contract"] = update_contract
+        last["support_provenance"] = support_provenance
         early_status = distributed_early_stop_update(
             early_stopper,
             last,
             rank=ctx.rank,
+        )
+        last["minimum_exposure_gate"] = defer_nonfatal_early_stop_until_minimum_exposure(
+            early_status,
+            budget=training_budget,
+            step=step,
+            minimum_dataset_passes=args.minimum_dataset_passes,
         )
         last["early_stop_action"] = apply_early_stop_action(opt, early_status)
         last["early_stop"] = early_status.as_dict()
@@ -277,23 +342,24 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last) + "\n")
         if ctx.is_main and args.save_best and early_status.is_best:
-            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_best.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_best.pt", model, opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
         if ctx.is_main and early_status.is_candidate:
-            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_candidate.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_candidate.pt", model, opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
         if ctx.is_main and args.visualize_every > 0 and step % args.visualize_every == 0:
             write_outputs(out_dir, out, last)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
         periodic_save = args.save_every > 0 and step % args.save_every == 0
         if ctx.is_main and (should_fault_save or periodic_save or step == end_step):
-            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
+            _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
         if ctx.is_main and periodic_save:
             _save_slat_checkpoint(
                 out_dir / f"geovis_slat_adapter_step_{step:08d}.pt",
                 model, opt, step, cfg, early_stopper, early_status,
+                training_budget=training_budget.as_dict(), support_provenance=support_provenance,
             )
         if sync_should_stop(early_status.should_stop, device):
             if ctx.is_main:
-                _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status)
+                _save_slat_checkpoint(out_dir / "geovis_slat_adapter_last.pt", model, opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
             break
     if ctx.is_main:
         write_outputs(out_dir, out, last)
@@ -315,6 +381,9 @@ def compute_losses(
     supervision_mask = batch.get("slat_supervision_mask")
     raw_flow = slat_flow_matching_loss(raw_delta, target_residual.detach(), supervision_mask)
     effective_flow = slat_flow_matching_loss(effective_delta, target_residual.detach(), supervision_mask)
+    frozen_base_flow = slat_flow_matching_loss(
+        torch.zeros_like(effective_delta), target_residual.detach(), supervision_mask
+    )
     flow_loss = raw_residual_weight * raw_flow["loss"] + effective_residual_weight * effective_flow["loss"]
     base_valid_mask = batch.get("v_slat_base_valid_mask")
     joint_confidence = out["debug"]["joint_confidence"]
@@ -343,6 +412,7 @@ def compute_losses(
             "slat_flow_mse": flow_loss,
             "raw_residual_mse": raw_flow["loss"],
             "effective_residual_mse": effective_flow["loss"],
+            "frozen_base_residual_mse": frozen_base_flow["loss"],
         },
         "base_velocity": {"invalid_ratio": base_invalid_ratio.detach()},
         "view": view_consistency_loss(out["sampled_features"], out["visibility"], token_valid_mask),
@@ -378,6 +448,13 @@ def summarize(out: dict, terms: dict, mode: str) -> dict:
         "loss_slat_flow": float(terms["slat_flow"]["loss"].detach().cpu()),
         "loss_slat_raw_residual": float(terms["slat_flow"]["raw_residual_mse"].detach().cpu()),
         "loss_slat_effective_residual": float(terms["slat_flow"]["effective_residual_mse"].detach().cpu()),
+        "loss_slat_frozen_base_residual": float(terms["slat_flow"]["frozen_base_residual_mse"].detach().cpu()),
+        "slat_causal_residual_gain": float(
+            (
+                terms["slat_flow"]["frozen_base_residual_mse"]
+                - terms["slat_flow"]["effective_residual_mse"]
+            ).detach().cpu()
+        ),
         "slat_base_invalid_ratio": float(terms["base_velocity"]["invalid_ratio"].detach().cpu()),
         "loss_prior": float(terms["prior"]["loss"].detach().cpu()),
         "loss_velocity": float(terms["velocity"]["loss"].detach().cpu()),
@@ -531,7 +608,7 @@ def prepare_batch(
         if trellis_pipeline is None:
             raise RuntimeError("Real SLAT training requires a TRELLIS pipeline with its published latent normalization.")
         x0 = normalize_slat(x0_raw, trellis_pipeline.slat_normalization)
-        source = "trellis_native_slat_latents"
+        source = "cached_trellis_slat_teacher"
     else:
         raise KeyError("real_train requires trellis_slat_feats and trellis_slat_indices; synthetic SLAT latents are only allowed in --dry_run.")
     context = build_ss_slat_context(ss_active_indices=indices, resolution=resolution, target_dim=slat_dim)
@@ -698,7 +775,18 @@ def write_outputs(out_dir: Path, out: dict, summary: dict) -> None:
     (out_dir / "train_geovis_slat_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
-def _save_slat_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, early_stopper: EarlyStopper, early_status) -> None:
+def _save_slat_checkpoint(
+    path: Path,
+    model,
+    optimizer,
+    step: int,
+    cfg: dict,
+    early_stopper: EarlyStopper,
+    early_status,
+    *,
+    training_budget: dict | None = None,
+    support_provenance: dict | None = None,
+) -> None:
     save_checkpoint(
         path,
         model=unwrap_model(model).state_dict(),
@@ -716,6 +804,8 @@ def _save_slat_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, ea
         },
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
+        training_budget=training_budget,
+        support_provenance=support_provenance,
     )
 
 
@@ -773,7 +863,7 @@ def _validate_checkpoint_model_config(
 
 def main() -> None:
     parser = add_common_args(argparse.ArgumentParser())
-    parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--steps", type=int, default=None, help="Required for real training; dry runs do not consume an update budget.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_views", type=int, default=3)
     parser.add_argument("--image_size", type=int, default=64)
@@ -831,7 +921,7 @@ def _load_trellis_pipeline(
         sys.path.insert(0, args.trellis_root)
     if not args.trellis_model_path:
         raise FileNotFoundError("real_train requires --trellis_model_path or trellis.pipeline in config.")
-    _configure_trellis_hub(args)
+    configure_trellis_hub(args)
 
     if ctx.distributed and not ctx.is_main:
         dist.barrier()
@@ -872,79 +962,6 @@ def _load_trellis_pipeline_impl(
         device=device,
     )
     return pipeline
-
-
-def _configure_trellis_hub(args: argparse.Namespace) -> None:
-    hub_dir = _resolve_torch_hub_dir(args)
-    if hub_dir is not None:
-        torch.hub.set_dir(str(hub_dir))
-        os.environ["TORCH_HUB_DIR"] = str(hub_dir)
-        os.environ.setdefault("TORCH_HOME", str(hub_dir.parent if hub_dir.name == "hub" else hub_dir))
-    dinov2_repo = _resolve_dinov2_repo(args, hub_dir)
-    if dinov2_repo is not None:
-        _patch_torch_hub_for_local_dinov2(dinov2_repo)
-
-
-def _resolve_torch_hub_dir(args: argparse.Namespace) -> Path | None:
-    candidates: list[Path] = []
-    for value in (args.torch_hub_dir, os.environ.get("TORCH_HUB_DIR")):
-        if value:
-            candidates.append(Path(value).expanduser())
-    torch_home = os.environ.get("TORCH_HOME")
-    if torch_home:
-        home = Path(torch_home).expanduser()
-        candidates.extend([home / "hub", home])
-    candidates.extend(
-        [
-            Path.home() / ".cache" / "torch" / "hub",
-            Path("/mnt/sda3/yu/checkpoints/hub/hub"),
-            Path("/mnt/sda3/yu/checkpoints/hub"),
-        ]
-    )
-    seen = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        if (candidate / "facebookresearch_dinov2_main" / "hubconf.py").exists():
-            return candidate
-        nested = candidate / "hub"
-        if (nested / "facebookresearch_dinov2_main" / "hubconf.py").exists():
-            return nested
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _resolve_dinov2_repo(args: argparse.Namespace, hub_dir: Path | None) -> Path | None:
-    candidates: list[Path] = []
-    if args.dinov2_repo:
-        candidates.append(Path(args.dinov2_repo).expanduser())
-    if hub_dir is not None:
-        candidates.append(hub_dir / "facebookresearch_dinov2_main")
-        candidates.extend(sorted(hub_dir.glob("facebookresearch_dinov2*")))
-    for candidate in candidates:
-        if (candidate / "hubconf.py").exists():
-            return candidate
-    return None
-
-
-def _patch_torch_hub_for_local_dinov2(local_repo: Path) -> None:
-    if getattr(torch.hub, "_geoss_local_dinov2_patch", False):
-        return
-    original_load = torch.hub.load
-
-    def load(repo_or_dir, model, *args, **kwargs):
-        if str(repo_or_dir).rstrip("/") == "facebookresearch/dinov2":
-            local_kwargs = dict(kwargs)
-            local_kwargs.pop("trust_repo", None)
-            local_kwargs.pop("force_reload", None)
-            return original_load(str(local_repo), model, *args, source="local", **local_kwargs)
-        return original_load(repo_or_dir, model, *args, **kwargs)
-
-    torch.hub.load = load
-    torch.hub._geoss_local_dinov2_patch = True
 
 
 @torch.no_grad()
@@ -1098,6 +1115,7 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         return
     dataset = cfg.get("dataset") if isinstance(cfg.get("dataset"), dict) else {}
     trellis = cfg.get("trellis") if isinstance(cfg.get("trellis"), dict) else {}
+    vggt = cfg.get("vggt") if isinstance(cfg.get("vggt"), dict) else {}
     mappings = {
         "meshfleet_root": cfg.get("meshfleet_root") or cfg.get("dataset_root") or dataset.get("root"),
         "meshfleet_split": cfg.get("meshfleet_split") or dataset.get("train_split") or dataset.get("split"),
@@ -1106,7 +1124,17 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "image_size": cfg.get("image_size") or dataset.get("image_size"),
         "trellis_root": cfg.get("trellis_root") or trellis.get("root"),
         "trellis_model_path": cfg.get("trellis_model_path") or cfg.get("trellis_pipeline") or cfg.get("trellis_checkpoint") or trellis.get("model_path") or trellis.get("pipeline") or trellis.get("checkpoint"),
+        "vggt_root": cfg.get("vggt_root") or vggt.get("root"),
+        "vggt_checkpoint": cfg.get("vggt_checkpoint") or vggt.get("checkpoint"),
+        "vggt_pretrained": cfg.get("vggt_pretrained") or vggt.get("pretrained"),
         "steps": cfg.get("steps"),
+        "steps_are_total": cfg.get("steps_are_total"),
+        "minimum_dataset_passes": cfg.get("minimum_dataset_passes"),
+        "early_stop": cfg.get("early_stop"),
+        "early_stop_metric": cfg.get("early_stop_metric"),
+        "early_stop_mode": cfg.get("early_stop_mode"),
+        "max_train_hours": cfg.get("max_train_hours"),
+        "save_best": cfg.get("save_best"),
         "batch_size": cfg.get("batch_size"),
         "lr": cfg.get("lr"),
         "weight_decay": cfg.get("weight_decay"),
@@ -1115,6 +1143,7 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "raw_residual_weight": cfg.get("raw_residual_weight"),
         "effective_residual_weight": cfg.get("effective_residual_weight"),
         "grad_accum_steps": cfg.get("grad_accum_steps"),
+        "train_manifest": cfg.get("train_manifest") or dataset.get("train_manifest"),
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),
@@ -1122,11 +1151,7 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "dinov2_repo": cfg.get("dinov2_repo") or trellis.get("dinov2_repo"),
         **adaptive_config_defaults(cfg),
     }
-    for name, value in mappings.items():
-        if value is None or not hasattr(args, name):
-            continue
-        if getattr(args, name) == parser.get_default(name):
-            setattr(args, name, value)
+    apply_config_mappings(args, parser, mappings)
 
 
 if __name__ == "__main__":

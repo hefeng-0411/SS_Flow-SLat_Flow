@@ -84,7 +84,9 @@ def validate_real_mode(
         dry_run=False,
         use_real_vggt=_has_any(args, cfg, ("vggt_checkpoint", "vggt_pretrained")),
         use_real_trellis=_has_any(args, cfg, ("trellis_model_path", "trellis_checkpoint", "trellis_pipeline")),
-        use_decoder=_has_any(args, cfg, ("trellis_model_path", "trellis_pipeline", "decoder_path")),
+        # A pipeline path only proves decoder weights are addressable; it does
+        # not mean the training residency loaded or executed a decoder.
+        use_decoder=bool(cfg.get("use_decoder", False)),
         render_eval=bool(cfg.get("render_eval", getattr(args, "render_eval", False))),
         real_data=True,
     )
