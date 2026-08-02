@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -31,6 +37,7 @@ from geoss.utils.training_budget import (
     compute_training_budget,
     defer_nonfatal_early_stop_until_minimum_exposure,
     enforce_minimum_dataset_passes,
+    minimum_updates_for_dataset_passes,
 )
 from geoss.utils.distributed import (
     build_dataloader,
@@ -68,7 +75,7 @@ def run_dry_run(cfg: dict, device: str) -> dict:
     geo_dim = cfg.get("geo_dim", 256)
     x = torch.randn(B, C, R, R, R, device=device)
     t = torch.rand(B, device=device) * 1000
-    cond = torch.randn(B, 16, geo_dim, device=device)
+    synthetic_condition = torch.randn(B, 16, geo_dim, device=device)
     geo_context = {
         "geo_tokens": torch.randn(B, M, geo_dim, device=device),
         "geo_confidence": torch.rand(B, M, 1, device=device),
@@ -79,9 +86,9 @@ def run_dry_run(cfg: dict, device: str) -> dict:
     }
     adapter = SSVelocityAdapter(latent_dim=C, geo_dim=geo_dim).to(device)
     wrapper = GeoSSTrellisSSWrapper(MockSSFlowModel().to(device), adapter)
-    v_geo = wrapper(x, t, cond, geoss_context=geo_context)
+    v_geo = wrapper(x, t, synthetic_condition, geoss_context=geo_context)
     enabled_debug = dict(wrapper.last_debug)
-    v_base = wrapper(x, t, cond, geoss_context=geo_context, use_geoss_adapter=False)
+    v_base = wrapper(x, t, synthetic_condition, geoss_context=geo_context, use_geoss_adapter=False)
     summary = {
         "mode": "dry_run",
         "mock_trellis_base_velocity": True,
@@ -98,8 +105,26 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     run_modes = validate_real_mode(cfg=cfg, args=args, mode="real_train", required=("vggt", "trellis", "dataset"))
     ctx = init_distributed(args)
     device = ctx.device
+    execution_mode = str(args.execution_mode)
+    is_probe = execution_mode in {"probe", "smoke"}
+    if is_probe:
+        if float(args.minimum_dataset_passes) != 0.0:
+            raise ValueError(
+                f"execution_mode={execution_mode} requires --minimum_dataset_passes 0; "
+                "probe exposure is not training evidence."
+            )
+        if args.resume:
+            raise ValueError(f"execution_mode={execution_mode} cannot resume or mutate a training checkpoint.")
+        # Enforce artifact isolation in the trainer as well as the launcher so
+        # a hand-written direct probe command cannot accidentally promote data.
+        args.early_stop = False
+        args.save_best = False
+        args.fault_tolerant_save_every = 0
+    elif float(args.minimum_dataset_passes) < 1.0:
+        raise ValueError("execution_mode=train requires minimum_dataset_passes >= 1.")
     batch_controller = AdaptiveBatchController.from_args(args)
     args.batch_size = batch_controller.batch_size
+    args.grad_accum_steps = max(1, int(args.grad_accum_steps))
     if args.steps is None:
         raise ValueError("real_train requires an explicit --steps value or a steps entry in the config.")
     loader, sampler = _build_meshfleet_loader(args, ctx)
@@ -109,10 +134,28 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         dataset_objects=len(loader.dataset),
         world_size=ctx.world_size,
         microbatch_per_rank=args.batch_size,
-        grad_accum_steps=1,
+        grad_accum_steps=args.grad_accum_steps,
         planned_optimizer_updates=int(args.steps),
         drop_last=bool(getattr(loader, "drop_last", False)),
     )
+    required_updates = minimum_updates_for_dataset_passes(
+        training_budget, args.minimum_dataset_passes
+    )
+    configured_steps = int(args.steps)
+    if (
+        execution_mode == "train"
+        and args.auto_expand_training_budget
+        and configured_steps < required_updates
+    ):
+        args.steps = required_updates
+        training_budget = compute_training_budget(
+            dataset_objects=len(loader.dataset),
+            world_size=ctx.world_size,
+            microbatch_per_rank=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
+            planned_optimizer_updates=int(args.steps),
+            drop_last=bool(getattr(loader, "drop_last", False)),
+        )
     enforce_minimum_dataset_passes(
         training_budget,
         minimum_dataset_passes=args.minimum_dataset_passes,
@@ -130,8 +173,14 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             json.dumps(
                 {
                     "stage": "SS",
+                    "execution_mode": execution_mode,
+                    "is_probe": is_probe,
+                    "promotable_checkpoint": False if is_probe else True,
                     "training_budget": training_budget.as_dict(),
                     "minimum_dataset_passes": args.minimum_dataset_passes,
+                    "configured_steps": configured_steps,
+                    "resolved_steps": int(args.steps),
+                    "budget_auto_expanded": int(args.steps) != configured_steps,
                     "support_provenance": support_provenance,
                 },
                 indent=2,
@@ -180,20 +229,32 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     _assert_terminal_delta_head_is_trainable(adapter)
     adapter_model = maybe_wrap_ddp(adapter, ctx, find_unused_parameters=False)
     opt = torch.optim.AdamW(adapter_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = _build_lr_scheduler(opt, total_updates=int(args.steps), warmup_updates=args.warmup_updates, min_lr_ratio=args.min_lr_ratio)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = _make_grad_scaler(enabled=args.amp and args.amp_dtype == "fp16" and device.type == "cuda")
     if resume_state is not None and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
+    if resume_state is not None and "scheduler" in resume_state:
+        scheduler.load_state_dict(resume_state["scheduler"])
     iterator = iter(loader) if loader is not None else None
     data_epoch = 0
     geoss_model = None
+    geoss_handoff = None
     vggt = None
     if iterator is not None:
         geoss_cfg = _geoss_model_cfg_from_velocity_cfg(cfg)
         geoss_model = SparseRayGeoSSAdapter(**geoss_cfg).to(device).eval()
-        if args.geoss_checkpoint and Path(args.geoss_checkpoint).exists():
-            state = torch.load(args.geoss_checkpoint, map_location="cpu")
-            geoss_model.load_state_dict(state.get("model", state), strict=True)
+        if not args.geoss_checkpoint:
+            raise FileNotFoundError("Stage 2 requires --geoss_checkpoint selected from Stage 1.")
+        geoss_checkpoint = Path(args.geoss_checkpoint)
+        if not geoss_checkpoint.is_file():
+            raise FileNotFoundError(f"Stage 1 GeoSS checkpoint does not exist: {geoss_checkpoint}")
+        state = torch.load(geoss_checkpoint, map_location="cpu")
+        geoss_state = state.get("model", state)
+        incompatible = geoss_model.load_state_dict(geoss_state, strict=True)
+        geoss_handoff = _checkpoint_handoff_report(
+            geoss_checkpoint, geoss_state, incompatible
+        )
         for p in geoss_model.parameters():
             p.requires_grad_(False)
         vggt = VGGTGeometryWrapper(
@@ -202,7 +263,15 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             pretrained_name=args.vggt_pretrained,
             mock=False,
             cache_features=False,
-        ).to(device)
+        ).to(device).eval()
+        for p in vggt.parameters():
+            p.requires_grad_(False)
+    parameter_inventory = {
+        "trellis_sparse_structure_flow": _module_parameter_report(base),
+        "stage1_geoss": _module_parameter_report(geoss_model),
+        "vggt": _module_parameter_report(vggt),
+        "stage2_velocity_adapter": _module_parameter_report(unwrap_model(adapter_model)),
+    }
     out_dir = Path(args.output_dir)
     if ctx.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,11 +288,19 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
     update_contract = {
-        "configured_steps": int(args.steps),
+        "configured_steps": configured_steps,
+        "resolved_steps": int(args.steps),
+        "budget_auto_expanded": int(args.steps) != configured_steps,
         "steps_are_total": bool(args.steps_are_total),
         "resume_start_step": start_step,
         "target_step": end_step,
         "remaining_update_attempts_at_start": max(0, end_step - start_step),
+        "execution_mode": execution_mode,
+        "is_probe": is_probe,
+        "promotable_checkpoint": not is_probe,
+        "grad_accum_steps": args.grad_accum_steps,
+        "effective_global_batch_size": args.batch_size * ctx.world_size * args.grad_accum_steps,
+        "learning_rate_scaling": "none; AdamW uses mean loss over accumulation and the launcher preserves target effective batch",
     }
     if start_step >= end_step:
         return {
@@ -237,18 +314,34 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "support_provenance": support_provenance,
         }
     step = start_step
+    seen_object_ids: set[str] = set()
+    actual_sample_presentations = 0
     while step < end_step:
+        step_wall_start = time.perf_counter()
+        data_fetch_start = step_wall_start
         step += 1
-        if iterator is not None:
+        data_batches = []
+        for _ in range(args.grad_accum_steps):
+            if iterator is None:
+                data_batches.append(None)
+                continue
             raw_batch, iterator, data_epoch = next_from_loader(iterator, loader, sampler, data_epoch)
-            data_batch = _move_batch(raw_batch, device)
-        else:
-            data_batch = None
+            object_ids = raw_batch.get("object_id", []) if isinstance(raw_batch, dict) else []
+            if isinstance(object_ids, str):
+                object_ids = [object_ids]
+            seen_object_ids.update(str(uid) for uid in object_ids)
+            data_batches.append(_move_batch(raw_batch, device))
+        data_batch = data_batches[-1] if data_batches else None
+        data_fetch_seconds = time.perf_counter() - data_fetch_start
 
         def rebuild_after_adjustment(adjustment):
-            nonlocal data_batch, loader, sampler, iterator
+            nonlocal data_batch, data_batches, loader, sampler, iterator
             args.batch_size = adjustment.new_batch_size
-            data_batch = slice_batch_to_size(data_batch, args.batch_size)
+            data_batches = [
+                slice_batch_to_size(batch, args.batch_size) if batch is not None else None
+                for batch in data_batches
+            ]
+            data_batch = data_batches[-1] if data_batches else None
             loader, sampler = _build_meshfleet_loader(args, ctx)
             iterator = iter(loader) if loader is not None else None
 
@@ -259,84 +352,117 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
 
         def step_fn():
             memory_start = cuda_memory_watermark(device, reset_peak=True)
-            if data_batch is not None and "ss_latent_grid" in data_batch:
-                x0 = data_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
-                B = x0.shape[0]
-            else:
-                object_ids = data_batch.get("object_id") if isinstance(data_batch, dict) else None
-                keys = sorted(data_batch.keys()) if isinstance(data_batch, dict) else []
-                raise KeyError(
-                    "real_train requires ss_latent_grid from MeshFleet_TRELLIS ss_latents. "
-                    f"batch_keys={keys}, object_id={object_ids}"
-                )
-            noise = torch.randn_like(x0)
-            t = torch.rand(B, device=device)
-            t_view = t.view(B, 1, 1, 1, 1)
-            x_t = (1 - t_view) * x0 + (sigma_min + (1 - sigma_min) * t_view) * noise
-            target_v = (1 - sigma_min) * noise - x0
-            voxel_valid_mask = _exact_zero_voxel_mask(x0, args.voxel_prune_epsilon) if args.adaptive_voxel_pruning else None
-            cond = _real_condition_or_fail(data_batch, device, cfg, trellis_pipeline)
-            if data_batch is not None and geoss_model is not None and vggt is not None:
-                geoss_context = _compute_geoss_context(data_batch, geoss_model, vggt)
-            else:
-                raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
-            _assert_stage2_batch_contract(data_batch, x0, device)
-            t_model = t * 1000.0
-            with torch.inference_mode(), torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp and device.type == "cuda"):
-                v_base = base(x_t, t_model, cond)
-                direct_base = v_base
-                identity_error = (v_base - direct_base).abs().max()
-            ss_tokens = ss_grid_to_tokens(x_t)
-            v_base_tokens = ss_grid_to_tokens(v_base).detach()
-            target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()
-            _assert_stage2_geoss_context(geoss_context, ss_tokens)
-            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp and device.type == "cuda"):
-                vel = adapter_model(
-                    ss_latent_tokens=ss_tokens,
-                    geo_tokens=geoss_context["geo_tokens"],
-                    geo_confidence=geoss_context["geo_confidence"],
-                    timestep=t_model,
-                    v_base=v_base_tokens,
-                    voxel_xyz=geoss_context.get("ss_voxel_xyz", _ss_grid_xyz(x_t, ss_tokens.dtype)),
-                    anchor_xyz=geoss_context["anchor_xyz"],
-                    anchor_metadata=geoss_context.get("anchor_metadata"),
-                    voxel_valid_mask=voxel_valid_mask,
-                )
-            _assert_velocity_adapter_output(vel, ss_tokens, v_base_tokens)
-            v_geo_tokens = vel["v_geo"]
-            effective_delta_tokens = v_geo_tokens - v_base_tokens
-            if not effective_delta_tokens.requires_grad:
-                raise RuntimeError(
-                    "Stage 2 graph invariant failed: effective residual is detached. "
-                    "The loss must consume SSVelocityAdapter's DDP forward output."
-                )
-            delta_tokens = vel["delta_v_geo"]
-            raw_delta_tokens = vel["debug"]["delta_raw"]
-            _assert_residual_training_contract(raw_delta_tokens, effective_delta_tokens, target_residual_tokens)
-            # Keep reductions in FP32 while activations stay BF16/FP16.
-            token_mask = voxel_valid_mask[..., None] if voxel_valid_mask is not None else None
-            effective_mse = _masked_mse(effective_delta_tokens.float(), target_residual_tokens.float(), token_mask)
-            raw_mse = _masked_mse(raw_delta_tokens.float(), target_residual_tokens.float(), token_mask)
-            frozen_base_mse = _masked_mse(
-                torch.zeros_like(effective_delta_tokens, dtype=torch.float32),
-                target_residual_tokens.float(),
-                token_mask,
-            )
-            mse = effective_mse + args.raw_residual_weight * raw_mse
-            vel_reg = velocity_regularization_loss(delta_tokens, t)
-            prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, vel["token_confidence"].detach())
-            loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            accumulated = []
+            for micro_step, micro_batch in enumerate(data_batches):
+                if micro_batch is not None and "ss_latent_grid" in micro_batch:
+                    x0 = micro_batch["ss_latent_grid"].to(device=device, dtype=torch.float32)
+                    B = x0.shape[0]
+                else:
+                    object_ids = micro_batch.get("object_id") if isinstance(micro_batch, dict) else None
+                    keys = sorted(micro_batch.keys()) if isinstance(micro_batch, dict) else []
+                    raise KeyError(
+                        "real_train requires ss_latent_grid from MeshFleet_TRELLIS ss_latents. "
+                        f"batch_keys={keys}, object_id={object_ids}"
+                    )
+                noise = torch.randn_like(x0)
+                t = torch.rand(B, device=device)
+                t_view = t.view(B, 1, 1, 1, 1)
+                x_t = (1 - t_view) * x0 + (sigma_min + (1 - sigma_min) * t_view) * noise
+                target_v = (1 - sigma_min) * noise - x0
+                voxel_valid_mask = _exact_zero_voxel_mask(x0, args.voxel_prune_epsilon) if args.adaptive_voxel_pruning else None
+                cond = _real_condition_or_fail(micro_batch, device, cfg, trellis_pipeline)
+                if geoss_model is not None and vggt is not None:
+                    geoss_context = _compute_geoss_context(micro_batch, geoss_model, vggt)
+                else:
+                    raise RuntimeError("real_train requires real dataset GeoSS context; use --dry_run true for synthetic context.")
+                _assert_stage2_batch_contract(micro_batch, x0, device)
+                t_model = t * 1000.0
+                with torch.inference_mode(), torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp and device.type == "cuda"):
+                    v_base = base(x_t, t_model, cond)
+                ss_tokens = ss_grid_to_tokens(x_t)
+                v_base_tokens = ss_grid_to_tokens(v_base).detach()
+                target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()
+                _assert_stage2_geoss_context(geoss_context, ss_tokens)
+                sync_context = (
+                    adapter_model.no_sync()
+                    if ctx.distributed and hasattr(adapter_model, "no_sync") and micro_step < len(data_batches) - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp and device.type == "cuda"):
+                        vel = adapter_model(
+                            ss_latent_tokens=ss_tokens,
+                            geo_tokens=geoss_context["geo_tokens"],
+                            geo_confidence=geoss_context["geo_confidence"],
+                            timestep=t_model,
+                            v_base=v_base_tokens,
+                            voxel_xyz=geoss_context.get("ss_voxel_xyz", _ss_grid_xyz(x_t, ss_tokens.dtype)),
+                            anchor_xyz=geoss_context["anchor_xyz"],
+                            anchor_metadata=geoss_context.get("anchor_metadata"),
+                            voxel_valid_mask=voxel_valid_mask,
+                        )
+                    _assert_velocity_adapter_output(vel, ss_tokens, v_base_tokens)
+                    v_geo_tokens = vel["v_geo"]
+                    effective_delta_tokens = v_geo_tokens - v_base_tokens
+                    if not effective_delta_tokens.requires_grad:
+                        raise RuntimeError(
+                            "Stage 2 graph invariant failed: effective residual is detached. "
+                            "The loss must consume SSVelocityAdapter's DDP forward output."
+                        )
+                    delta_tokens = vel["delta_v_geo"]
+                    raw_delta_tokens = vel["debug"]["delta_raw"]
+                    _assert_residual_training_contract(raw_delta_tokens, effective_delta_tokens, target_residual_tokens)
+                    token_mask = voxel_valid_mask[..., None] if voxel_valid_mask is not None else None
+                    effective_mse = _masked_mse(effective_delta_tokens.float(), target_residual_tokens.float(), token_mask)
+                    raw_mse = _masked_mse(raw_delta_tokens.float(), target_residual_tokens.float(), token_mask)
+                    frozen_base_mse = _masked_mse(
+                        torch.zeros_like(effective_delta_tokens, dtype=torch.float32),
+                        target_residual_tokens.float(),
+                        token_mask,
+                    )
+                    mse = effective_mse + args.raw_residual_weight * raw_mse
+                    vel_reg = velocity_regularization_loss(delta_tokens, t)
+                    prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, vel["token_confidence"].detach())
+                    loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
+                    scaler.scale(loss / len(data_batches)).backward()
+                accumulated.append((loss, mse, effective_mse, raw_mse, frozen_base_mse, vel_reg, prior))
             scaler.unscale_(opt)
             grad_norms = _assert_adapter_gradients(unwrap_model(adapter_model), step)
+            measure_update = is_probe or step == 1 or step % 100 == 0
+            parameters_before = (
+                [parameter.detach().clone() for parameter in unwrap_model(adapter_model).parameters()]
+                if measure_update
+                else None
+            )
             scaler.step(opt)
             scaler.update()
+            scheduler.step()
+            grad_norms["update_to_weight_ratio"] = _update_to_weight_ratio(
+                unwrap_model(adapter_model), parameters_before
+            )
+            loss, mse, effective_mse, raw_mse, frozen_base_mse, vel_reg, prior = [
+                torch.stack([values[index].detach() for values in accumulated]).mean()
+                for index in range(7)
+            ]
             debug = vel["debug"]
             effective_delta_grid = tokens_to_ss_grid(effective_delta_tokens, tuple(x_t.shape[-3:]))
             target_residual_grid = tokens_to_ss_grid(target_residual_tokens, tuple(x_t.shape[-3:]))
-            return loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual_grid, debug, effective_delta_grid, vel_reg, prior, identity_error, grad_norms, memory_start, cuda_memory_watermark(device)
+            tensor_shapes = {
+                "ss_latent_grid": list(x0.shape),
+                "noised_ss_grid": list(x_t.shape),
+                "ss_tokens": list(ss_tokens.shape),
+                "trellis_condition": list(cond.shape),
+                "geo_tokens": list(geoss_context["geo_tokens"].shape),
+                "geo_confidence": list(geoss_context["geo_confidence"].shape),
+                "anchor_xyz": list(geoss_context["anchor_xyz"].shape),
+                "base_velocity_tokens": list(v_base_tokens.shape),
+                "target_residual_tokens": list(target_residual_tokens.shape),
+                "corrected_velocity_tokens": list(v_geo_tokens.shape),
+            }
+            return loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual_grid, debug, effective_delta_grid, vel_reg, prior, grad_norms, tensor_shapes, memory_start, cuda_memory_watermark(device)
 
+        compute_start = time.perf_counter()
         retry = train_step_with_oom_retry(
             step_fn,
             model=adapter_model,
@@ -350,7 +476,18 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             log_oom=log_oom,
         )
         batch_adjustment = retry.adjustment
-        loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual, debug, effective_delta, vel_reg, prior, identity_error, grad_norms, memory_start, memory_end = retry.value
+        loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual, debug, effective_delta, vel_reg, prior, grad_norms, tensor_shapes, memory_start, memory_end = retry.value
+        if is_probe and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        compute_seconds = time.perf_counter() - compute_start
+        step_latency_seconds = time.perf_counter() - step_wall_start
+        local_presentations = sum(
+            int(batch["ss_latent_grid"].shape[0])
+            for batch in data_batches
+            if isinstance(batch, dict) and isinstance(batch.get("ss_latent_grid"), torch.Tensor)
+        )
+        global_presentations = local_presentations * ctx.world_size
+        actual_sample_presentations += global_presentations
         if batch_adjustment.changed:
             args.batch_size = batch_adjustment.new_batch_size
             loader, sampler = _build_meshfleet_loader(args, ctx)
@@ -367,18 +504,42 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "residual_base_ratio": float((effective_delta.norm(dim=1).mean() / debug["velocity_base_norm"].clamp_min(1e-6)).detach().cpu()),
             "velocity_regularization": float(vel_reg.detach().cpu()),
             "prior_preservation": float(prior.detach().cpu()),
-            "identity_error": float(identity_error.detach().cpu()),
+            "base_velocity_contract": "direct frozen TRELLIS sparse_structure_flow_model output; adapter disabled path is not invoked",
             "velocity_norm": float(debug["velocity_norm"].detach().cpu()),
             "delta_norm": float(effective_delta.norm(dim=1).mean().detach().cpu()),
             "clipping_ratio": float(debug["clipping_ratio"].detach().cpu()),
+            "confidence_mean": float(debug["confidence_mean"].detach().cpu()),
+            "confidence_std": float(debug["confidence_std"].detach().cpu()),
+            "confidence_all_zero": bool(debug["confidence_all_zero"].detach().cpu()),
+            "confidence_all_one": bool(debug["confidence_all_one"].detach().cpu()),
             "voxel_prune_ratio": float(debug.get("voxel_prune_ratio", torch.zeros((), device=device)).detach().cpu()),
             "mode": _training_mode(args, data_batch is not None),
+            "execution_mode": execution_mode,
+            "is_probe": is_probe,
+            "promotable_checkpoint": not is_probe,
             **run_modes,
             "rank": ctx.rank,
             "world_size": ctx.world_size,
             "per_gpu_batch_size": args.batch_size,
             "global_batch_size": args.batch_size * ctx.world_size,
+            "grad_accum_steps": args.grad_accum_steps,
+            "effective_global_batch_size": args.batch_size * ctx.world_size * args.grad_accum_steps,
+            "actual_global_sample_presentations_this_update": global_presentations,
+            "actual_sample_presentations_cumulative": actual_sample_presentations,
+            "actual_dataset_passes_cumulative": actual_sample_presentations / len(loader.dataset),
+            "learning_rate": float(opt.param_groups[0]["lr"]),
+            "step_latency_seconds": step_latency_seconds,
+            "compute_seconds": compute_seconds,
+            "dataloader_seconds": data_fetch_seconds,
+            "dataloader_stall_fraction": data_fetch_seconds / max(step_latency_seconds, 1.0e-12),
+            "samples_per_second": global_presentations / max(step_latency_seconds, 1.0e-12),
+            "gpu_utilization_percent": _cuda_utilization_percent(device),
+            "communication_fraction": None,
+            "communication_fraction_status": "requires training-server profiler trace; not inferred from wall time",
             "adapter_grad_norms": grad_norms,
+            "tensor_shapes": tensor_shapes,
+            "stage1_handoff": geoss_handoff,
+            "parameter_inventory": parameter_inventory,
             "spconv": spconv_status,
             "trellis_residency": trellis_residency,
             "trellis_hub": trellis_hub,
@@ -401,21 +562,41 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             minimum_dataset_passes=args.minimum_dataset_passes,
         )
         last["early_stop_action"] = apply_early_stop_action(opt, early_status)
+        if last["early_stop_action"].get("applied"):
+            multiplier = float(last["early_stop_action"]["multiplier"])
+            scheduler.base_lrs = [float(value) * multiplier for value in scheduler.base_lrs]
+            last["early_stop_action"]["scheduler_base_lrs"] = list(scheduler.base_lrs)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(last) + "\n")
-        if ctx.is_main and args.save_best and early_status.is_best:
-            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_best.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
-        if ctx.is_main and early_status.is_candidate:
-            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_candidate.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
+        if ctx.is_main and not is_probe and args.save_best and early_status.is_best:
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_best.pt", unwrap_model(adapter_model), opt, scheduler, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance, execution_mode=execution_mode, stage1_handoff=geoss_handoff)
+        if ctx.is_main and not is_probe and early_status.is_candidate:
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_candidate.pt", unwrap_model(adapter_model), opt, scheduler, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance, execution_mode=execution_mode, stage1_handoff=geoss_handoff)
         should_fault_save = args.fault_tolerant_save_every > 0 and step % args.fault_tolerant_save_every == 0
-        if ctx.is_main and (should_fault_save or step % args.save_every == 0 or step == end_step):
-            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
+        if ctx.is_main and not is_probe and (should_fault_save or step % args.save_every == 0 or step == end_step):
+            _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, scheduler, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance, execution_mode=execution_mode, stage1_handoff=geoss_handoff)
         if sync_should_stop(early_status.should_stop, device):
-            if ctx.is_main:
-                _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance)
+            if ctx.is_main and not is_probe:
+                _save_velocity_checkpoint(out_dir / "ss_velocity_adapter_last.pt", unwrap_model(adapter_model), opt, scheduler, step, cfg, early_stopper, early_status, training_budget=training_budget.as_dict(), support_provenance=support_provenance, execution_mode=execution_mode, stage1_handoff=geoss_handoff)
             break
+    coverage = _distributed_unique_coverage(seen_object_ids, len(loader.dataset))
+    last["observed_dataset_coverage"] = coverage
+    last["per_rank_hardware"] = _distributed_rank_telemetry(
+        {
+            "rank": ctx.rank,
+            "memory": last.get("memory"),
+            "step_latency_seconds": last.get("step_latency_seconds"),
+            "samples_per_second": last.get("samples_per_second"),
+            "dataloader_stall_fraction": last.get("dataloader_stall_fraction"),
+            "gpu_utilization_percent": last.get("gpu_utilization_percent"),
+            "communication_fraction": last.get("communication_fraction"),
+        }
+    )
+    if ctx.is_main and last:
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "final_coverage", **coverage}) + "\n")
     return last
 
 
@@ -423,7 +604,10 @@ def main() -> None:
     parser = add_common_args(argparse.ArgumentParser())
     parser.add_argument("--steps", type=int, default=None, help="Required for real training; dry runs do not consume an update budget.")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_updates", type=int, default=0, help="0 derives a 3% warmup from the resolved real horizon.")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.05)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--sigma_min", type=float, default=1e-5)
     parser.add_argument("--velocity_reg_weight", type=float, default=1e-3)
@@ -461,17 +645,49 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
-    if not args.dry_run:
-        summary = run_training(cfg, args)
-    else:
-        summary = run_dry_run(cfg, args.device)
-    rank = getattr(args, "rank", 0)
-    if rank == 0:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        (Path(args.output_dir) / "train_sparse_ray_ss_velocity_dry_run.json").write_text(json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2))
-    cleanup_distributed()
-    if not args.dry_run and rank == 0:
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _interrupt(_signum, _frame):
+        raise KeyboardInterrupt("received SIGTERM")
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    summary = None
+    rank = 0
+    try:
+        summary = run_training(cfg, args) if not args.dry_run else run_dry_run(cfg, args.device)
+        rank = getattr(args, "rank", 0)
+        if rank == 0:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            if args.dry_run:
+                summary_name = "train_sparse_ray_ss_velocity_dry_run.json"
+            elif args.execution_mode in {"probe", "smoke"}:
+                summary_name = "probe_summary.json"
+            else:
+                summary_name = "training_summary.json"
+            (output_dir / summary_name).write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            print(json.dumps(summary, indent=2))
+    except KeyboardInterrupt:
+        rank = getattr(args, "rank", 0)
+        if rank == 0:
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "interrupted.json").write_text(
+                json.dumps(
+                    {
+                        "status": "interrupted",
+                        "execution_mode": args.execution_mode,
+                        "partial_checkpoint_promoted": False,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        raise
+    finally:
+        cleanup_distributed()
+        signal.signal(signal.SIGTERM, previous_sigterm)
+    if not args.dry_run and rank == 0 and summary is not None:
         _maybe_launch_stage2(summary, cfg)
 
 
@@ -539,6 +755,97 @@ def _make_grad_scaler(*, enabled: bool):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     except (AttributeError, TypeError):
         return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _build_lr_scheduler(optimizer, *, total_updates: int, warmup_updates: int, min_lr_ratio: float):
+    total_updates = max(1, int(total_updates))
+    if int(warmup_updates) <= 0:
+        warmup_updates = max(1, min(1000, math.ceil(0.03 * total_updates)))
+    warmup_updates = min(int(warmup_updates), max(0, total_updates - 1))
+    min_lr_ratio = float(min_lr_ratio)
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError(f"min_lr_ratio must be in [0,1], got {min_lr_ratio}")
+
+    def multiplier(update: int) -> float:
+        if warmup_updates > 0 and update < warmup_updates:
+            return max(1.0 / warmup_updates, (update + 1) / warmup_updates)
+        decay_updates = max(1, total_updates - warmup_updates)
+        progress = min(1.0, max(0.0, (update - warmup_updates) / decay_updates))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+    scheduler.resolved_warmup_updates = warmup_updates
+    scheduler.resolved_total_updates = total_updates
+    scheduler.min_lr_ratio = min_lr_ratio
+    return scheduler
+
+
+def _checkpoint_handoff_report(path: Path, state_dict: dict, incompatible) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    tensors = [value for value in state_dict.values() if isinstance(value, torch.Tensor)]
+    return {
+        "checkpoint_path": str(path.resolve()),
+        "sha256": digest.hexdigest(),
+        "missing_keys": list(getattr(incompatible, "missing_keys", [])),
+        "unexpected_keys": list(getattr(incompatible, "unexpected_keys", [])),
+        "tensor_count": len(tensors),
+        "parameter_numel": sum(int(value.numel()) for value in tensors),
+        "strict_load": True,
+        "loaded_module": "SparseRayGeoSSAdapter",
+        "frozen_in_stage2": True,
+    }
+
+
+def _distributed_unique_coverage(local_uids: set[str], dataset_objects: int) -> dict:
+    gathered: list[list[str]] = [list(local_uids)]
+    if dist.is_available() and dist.is_initialized():
+        gathered = [[] for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, sorted(local_uids))
+    unique = set().union(*(set(items) for items in gathered))
+    return {
+        "unique_objects_seen": len(unique),
+        "dataset_objects": int(dataset_objects),
+        "unique_object_fraction": len(unique) / max(1, int(dataset_objects)),
+        "distributed_sampler_padding_counted_as_unique": False,
+    }
+
+
+def _distributed_rank_telemetry(local: dict) -> list[dict]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return [local]
+    gathered: list[dict] = [{} for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, local)
+    return gathered
+
+
+def _cuda_utilization_percent(device: torch.device) -> float | None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    utilization = getattr(torch.cuda, "utilization", None)
+    if utilization is None:
+        return None
+    try:
+        return float(utilization(device.index))
+    except Exception:
+        return None
+
+
+def _module_parameter_report(module: nn.Module | None) -> dict:
+    if module is None:
+        return {"present": False, "parameters": 0, "trainable_parameters": 0, "frozen_parameters": 0}
+    parameters = list(module.parameters())
+    total = sum(int(parameter.numel()) for parameter in parameters)
+    trainable = sum(int(parameter.numel()) for parameter in parameters if parameter.requires_grad)
+    return {
+        "present": True,
+        "parameters": total,
+        "trainable_parameters": trainable,
+        "frozen_parameters": total - trainable,
+    }
 
 
 def _build_meshfleet_loader(args: argparse.Namespace, ctx):
@@ -698,7 +1005,39 @@ def _assert_adapter_gradients(adapter: SSVelocityAdapter, step: int) -> dict[str
         f"Stage 2 degenerate residual graph at step={step}; zero gradient norms for {zero_weights}. "
         "The raw residual estimator must receive supervised gradients independent of the confidence gate."
     )
+    all_gradients = [
+        parameter.grad.detach().float()
+        for parameter in adapter.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    total_elements = sum(int(gradient.numel()) for gradient in all_gradients)
+    grad_norms["total"] = math.sqrt(
+        sum(float(gradient.square().sum().cpu()) for gradient in all_gradients)
+    )
+    grad_norms["zero_fraction"] = (
+        sum(int((gradient == 0).sum().cpu()) for gradient in all_gradients) / max(1, total_elements)
+    )
+    grad_norms["nonfinite_fraction"] = (
+        sum(int((~torch.isfinite(gradient)).sum().cpu()) for gradient in all_gradients) / max(1, total_elements)
+    )
     return grad_norms
+
+
+def _update_to_weight_ratio(
+    adapter: SSVelocityAdapter,
+    parameters_before: list[torch.Tensor] | None,
+) -> float | None:
+    if parameters_before is None:
+        return None
+    parameters_after = [parameter.detach() for parameter in adapter.parameters()]
+    update_squared = sum(
+        float((after.float() - before.float()).square().sum().cpu())
+        for before, after in zip(parameters_before, parameters_after)
+    )
+    weight_squared = sum(
+        float(after.float().square().sum().cpu()) for after in parameters_after
+    )
+    return math.sqrt(update_squared) / max(math.sqrt(weight_squared), 1.0e-12)
 
 
 def _assert_terminal_delta_head_is_trainable(adapter: SSVelocityAdapter) -> None:
@@ -730,10 +1069,16 @@ def _masked_mse(prediction: torch.Tensor, target: torch.Tensor, token_mask: torc
 def _ss_grid_xyz(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     assert x.ndim == 5, f"SS grid must be [B,C,D,H,W], got {tuple(x.shape)}"
     B, _, D, H, W = x.shape
+    # Dense latent sites represent voxel centers. This must be bitwise aligned
+    # with geoss.integration.trellis_ss_hook._ss_grid_xyz; endpoint coordinates
+    # shift local anchor neighborhoods between training and inference.
+    z = (torch.arange(D, device=x.device, dtype=dtype) + 0.5) / D * 2.0 - 1.0
+    y = (torch.arange(H, device=x.device, dtype=dtype) + 0.5) / H * 2.0 - 1.0
+    x_coord = (torch.arange(W, device=x.device, dtype=dtype) + 0.5) / W * 2.0 - 1.0
     zz, yy, xx = torch.meshgrid(
-        torch.linspace(-1, 1, D, device=x.device, dtype=dtype),
-        torch.linspace(-1, 1, H, device=x.device, dtype=dtype),
-        torch.linspace(-1, 1, W, device=x.device, dtype=dtype),
+        z,
+        y,
+        x_coord,
         indexing="ij",
     )
     xyz = torch.stack([xx, yy, zz], dim=-1).reshape(1, D * H * W, 3)
@@ -744,48 +1089,18 @@ def _ss_grid_xyz(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 def _compute_geoss_context(batch: dict, geoss_model: SparseRayGeoSSAdapter, vggt: VGGTGeometryWrapper) -> dict:
     batch = dict(batch)
     batch.update(vggt(batch["images"], use_cache=False))
-    if getattr(geoss_model, "alignment_enabled", True):
-        alignment = geoss_model.geometry_alignment(
-            vggt_depth=batch.get("vggt_depth"),
-            vggt_pointmap=batch.get("vggt_pointmap"),
-            K=batch["K"],
-            c2w=batch["c2w"],
-            w2c=batch["w2c"],
-            masks=batch.get("masks"),
-            vggt_confidence=batch.get("vggt_confidence"),
-            dataset_depth=batch.get("depths"),
-            vggt_camera=batch.get("vggt_camera"),
-        )
-        batch["aligned_pointmap"] = alignment["aligned_pointmap"]
-        batch["aligned_depth"] = alignment["aligned_depth"]
-        batch["alignment_confidence"] = alignment["alignment_confidence"]
-    B = batch["images"].shape[0]
-    device = batch["images"].device
-    anchors = geoss_model.anchor_queries.forward_dynamic(
-        B,
-        device=device,
-        aligned_pointmap=batch.get("aligned_pointmap", batch.get("vggt_pointmap")),
-        masks=batch.get("masks"),
-        confidence=batch.get("alignment_confidence", batch.get("vggt_confidence")),
-    )
-    anchor_xyz, anchor_feat = anchors["anchor_xyz"], anchors["anchor_feat"]
-    ray = geoss_model.ray_sampler(
-        anchor_xyz=anchor_xyz,
-        K=batch["K"],
-        c2w=batch["c2w"],
-        w2c=batch["w2c"],
-        masks=batch["masks"],
-        depths=batch.get("aligned_depth", batch.get("depths")),
-        vggt_depth=batch.get("aligned_depth", batch.get("vggt_depth")),
-        vggt_pointmap=batch.get("aligned_pointmap", batch.get("vggt_pointmap")),
-        vggt_features=batch.get("vggt_features"),
-    )
-    agg = geoss_model.aggregator(ray["view_tokens"], anchor_feat, ray["ray_valid"], conflict_score=ray.get("conflict_score"))
+    # Dataset samples include cached SS tokens. Removing them selects the
+    # context-only branch of the exact frozen Stage 1 operator, avoiding a
+    # second hand-maintained copy of alignment, camera/world scaling, dynamic
+    # anchor construction, ray evidence, and confidence aggregation.
+    batch.pop("ss_latent_tokens", None)
+    batch.pop("v_base", None)
+    context = geoss_model(batch)
     return {
-        "geo_tokens": agg["geo_tokens"].detach(),
-        "geo_confidence": agg["geo_confidence"].detach(),
-        "anchor_xyz": anchor_xyz.detach(),
-        "anchor_metadata": anchors["anchor_metadata"].detach(),
+        "geo_tokens": context["geo_tokens"].detach(),
+        "geo_confidence": context["geo_confidence"].detach(),
+        "anchor_xyz": context["anchor_xyz"].detach(),
+        "anchor_metadata": context["anchor_metadata"].detach(),
     }
 
 
@@ -830,6 +1145,7 @@ def _save_velocity_checkpoint(
     path: Path,
     adapter: SSVelocityAdapter,
     optimizer,
+    scheduler,
     step: int,
     cfg: dict,
     early_stopper: EarlyStopper,
@@ -837,17 +1153,28 @@ def _save_velocity_checkpoint(
     *,
     training_budget: dict | None = None,
     support_provenance: dict | None = None,
+    execution_mode: str = "train",
+    stage1_handoff: dict | None = None,
 ) -> None:
+    if execution_mode != "train":
+        raise RuntimeError(
+            f"Refusing to write a promotable Stage 2 checkpoint in execution_mode={execution_mode}."
+        )
     save_checkpoint(
         path,
         velocity_adapter=adapter.state_dict(),
         optimizer=optimizer.state_dict(),
+        scheduler=scheduler.state_dict(),
         step=step,
         config=cfg,
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
         training_budget=training_budget,
         support_provenance=support_provenance,
+        execution_mode=execution_mode,
+        is_probe=False,
+        promotable_checkpoint=True,
+        stage1_handoff=stage1_handoff,
     )
 
 
@@ -883,6 +1210,8 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "geoss_checkpoint": cfg.get("geoss_checkpoint"),
         "steps": cfg.get("steps"),
         "steps_are_total": cfg.get("steps_are_total"),
+        "execution_mode": cfg.get("execution_mode"),
+        "auto_expand_training_budget": cfg.get("auto_expand_training_budget"),
         "minimum_dataset_passes": cfg.get("minimum_dataset_passes"),
         "early_stop": cfg.get("early_stop"),
         "early_stop_metric": cfg.get("early_stop_metric"),
@@ -891,7 +1220,10 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "save_best": cfg.get("save_best"),
         "train_manifest": cfg.get("train_manifest") or dataset.get("train_manifest"),
         "batch_size": cfg.get("batch_size"),
+        "grad_accum_steps": cfg.get("grad_accum_steps"),
         "lr": cfg.get("lr"),
+        "warmup_updates": cfg.get("warmup_updates"),
+        "min_lr_ratio": cfg.get("min_lr_ratio"),
         "weight_decay": cfg.get("weight_decay"),
         "sigma_min": cfg.get("sigma_min"),
         "velocity_reg_weight": cfg.get("velocity_reg_weight"),

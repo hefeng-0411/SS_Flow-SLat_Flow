@@ -18,7 +18,7 @@ git add .
 git commit -m "update early-stop"
 
 # ④ 推送到远程 v2/main 分支
-git push origin main:v3/main
+git push origin main:v3/main --force
 ```
 
 > 如果你确实有其他业务代码修改但还没保存/生成，请先完成代码修改后再执行上述命令。当前 status 显示没有已修改的跟踪文件，只有未跟踪的缓存文件。

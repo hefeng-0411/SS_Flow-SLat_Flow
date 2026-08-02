@@ -203,13 +203,19 @@ def cuda_memory_watermark(device: torch.device, *, reset_peak: bool = False) -> 
         torch.cuda.reset_peak_memory_stats(index)
     free, total = torch.cuda.mem_get_info(index)
     gib = float(1024 ** 3)
+    allocated = torch.cuda.memory_allocated(index)
+    reserved = torch.cuda.memory_reserved(index)
+    peak_allocated = torch.cuda.max_memory_allocated(index)
+    peak_reserved = torch.cuda.max_memory_reserved(index)
+    driver_used = total - free
     return {
-        "allocated_gib": torch.cuda.memory_allocated(index) / gib,
-        "reserved_gib": torch.cuda.memory_reserved(index) / gib,
-        "peak_allocated_gib": torch.cuda.max_memory_allocated(index) / gib,
-        "peak_reserved_gib": torch.cuda.max_memory_reserved(index) / gib,
-        "driver_used_gib": (total - free) / gib,
+        "allocated_gib": allocated / gib,
+        "reserved_gib": reserved / gib,
+        "peak_allocated_gib": peak_allocated / gib,
+        "peak_reserved_gib": peak_reserved / gib,
+        "driver_used_gib": driver_used / gib,
         "total_gib": total / gib,
+        "vram_utilization": max(driver_used, reserved, peak_reserved) / max(1, total),
     }
 
 

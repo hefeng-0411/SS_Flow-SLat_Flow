@@ -110,7 +110,7 @@ def _gaussian_tensors(gaussians: Any) -> tuple[torch.Tensor, torch.Tensor, torch
     if colors.ndim != 2 or colors.shape[-1] != 3:
         raise ValueError(f"Gaussian colors must be [G,3] or [G,1,3], got {tuple(colors.shape)}")
     opacities = opacities.reshape(-1)
-    # PLY exports retain the optimizer parameterization (log-scales/logits).
+    # PLY exports retain the stored parameterization (log-scales/logits).
     # Decode it here so evaluation renders the same physical Gaussians as TRELLIS.
     if scale_parameterization == "log" or (scale_parameterization is None and scales.median() < 0):
         scales = scales.exp()

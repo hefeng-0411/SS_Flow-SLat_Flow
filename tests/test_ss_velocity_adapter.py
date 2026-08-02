@@ -11,7 +11,17 @@ def test_ss_velocity_adapter_shapes():
     geo = torch.randn(B, M, G)
     conf = torch.rand(B, M, 1)
     v_base = torch.randn(B, L, C)
-    out = adapter(ss, geo, conf, torch.tensor([100.0, 500.0]), v_base)
+    voxel_xyz = torch.rand(B, L, 3) * 2.0 - 1.0
+    anchor_xyz = torch.rand(B, M, 3) * 2.0 - 1.0
+    out = adapter(
+        ss,
+        geo,
+        conf,
+        torch.tensor([100.0, 500.0]),
+        v_base,
+        voxel_xyz=voxel_xyz,
+        anchor_xyz=anchor_xyz,
+    )
     assert out["v_geo"].shape == (B, L, C)
     assert out["delta_v_geo"].shape == (B, L, C)
     assert out["token_confidence"].shape == (B, L, 1)

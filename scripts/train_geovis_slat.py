@@ -843,7 +843,7 @@ def _validate_checkpoint_model_config(
     accepted_overrides = {}
     keys = (
         "slat_dim", "resolution", "evidence_dim", "hidden_dim", "feature_dim", "num_heads",
-        "fusion_mode", "confidence_floor", "trust_region", "beta_mode", "beta_strength",
+        "fusion_mode", "trust_region", "confidence_floor", "beta_mode", "beta_strength",
         "factorized_control", "use_geovis_slat",
     )
     for key in keys:

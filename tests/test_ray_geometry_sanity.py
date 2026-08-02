@@ -12,7 +12,15 @@ def test_ray_geometry_occ_free_invalid_rules():
     masks[:, :, :, 12:20, 12:20] = 1
     depths = torch.ones(B, N, 1, H, W) * 2.0
     anchors = torch.tensor([[[0.0, 0.0, 2.0], [0.0, 0.0, 1.0], [0.6, 0.0, 2.0], [10.0, 0.0, 2.0]]])
-    sampler = RayEvidenceSampler(evidence_dim=8, depth_near_threshold=0.05, depth_free_margin=0.05)
+    # This synthetic fixture defines anchors and camera depth in the same
+    # coordinate frame. Production MeshFleet uses GeoSS [-1,1] anchors and
+    # camera-world [-0.5,0.5], for which the sampler's default scale is 0.5.
+    sampler = RayEvidenceSampler(
+        evidence_dim=8,
+        depth_near_threshold=0.05,
+        depth_free_margin=0.05,
+        geo_to_camera_scale=1.0,
+    )
     out = sampler(anchors, K, c2w, w2c, masks, depths=depths)
     assert out["occ_score"][0, 0, 0, 0] > out["free_score"][0, 0, 0, 0]
     assert out["free_score"][0, 1, 0, 0] > out["occ_score"][0, 1, 0, 0]

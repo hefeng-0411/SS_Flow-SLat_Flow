@@ -20,7 +20,11 @@ def test_trellis_ss_hook_debug_enabled():
     wrapper = GeoSSTrellisSSWrapper(base, adapter)
     x = torch.randn(1, 8, 4, 4, 4)
     cond = torch.randn(1, 4, 16)
-    ctx = {"geo_tokens": torch.randn(1, 32, 16), "geo_confidence": torch.rand(1, 32, 1)}
+    ctx = {
+        "geo_tokens": torch.randn(1, 32, 16),
+        "geo_confidence": torch.rand(1, 32, 1),
+        "anchor_xyz": torch.rand(1, 32, 3) * 2.0 - 1.0,
+    }
     y = wrapper(x, torch.tensor([100.0]), cond, geoss_context=ctx)
     assert y.shape == x.shape
     assert wrapper.last_debug["enabled"]

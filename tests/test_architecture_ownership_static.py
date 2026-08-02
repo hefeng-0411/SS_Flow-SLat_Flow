@@ -24,10 +24,11 @@ def test_real_training_paths_do_not_create_random_condition_or_zero_base():
     ss = _read("scripts/train_sparse_ray_ss_velocity.py")
     assert "cond = torch.randn" not in ss
     assert "torch.zeros_like(ss_latent_tokens)" not in ss
-    assert "target_residual = (target_v - v_base).detach()" in ss
+    assert "target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()" in ss
     slat = _read("scripts/train_geovis_slat.py")
     assert "trellis_slat_base_velocity" in slat
-    assert "zero base velocity is only allowed in --dry_run" in slat
+    assert "real_train requires trellis_slat_base_velocity or a real TRELLIS pipeline" in slat
+    assert 'batch["target_residual"] = (batch["target_velocity"] - batch["v_slat_base"]).detach()' in slat
 
 
 def test_sparse_adapter_refuses_missing_base_velocity_when_tokens_exist():

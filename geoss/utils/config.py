@@ -43,6 +43,18 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--steps_are_total", type=str2bool, default=False)
     parser.add_argument(
+        "--execution_mode",
+        choices=("probe", "smoke", "train"),
+        default="train",
+        help="Execution contract. Probe/smoke outputs are never training evidence.",
+    )
+    parser.add_argument(
+        "--auto_expand_training_budget",
+        type=str2bool,
+        default=False,
+        help="Expand a real run's total update horizon at runtime to satisfy minimum_dataset_passes.",
+    )
+    parser.add_argument(
         "--minimum_dataset_passes",
         type=float,
         default=1.0,

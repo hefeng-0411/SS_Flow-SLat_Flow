@@ -52,7 +52,12 @@ def build_ss_slat_context(
             if ss_confidence is None and "mapped_confidence" in mapped:
                 ss_confidence = mapped["mapped_confidence"]
             debug["nearest_anchor_distance_mean"] = mapped["knn_anchor_distance"].mean()
-            debug["ss_to_slat_token_map"] = mapped["knn_anchor_index"]
+            # The public token map is one deterministic nearest-anchor index per
+            # SS token. Preserve the full KNN neighborhood separately for
+            # uncertainty/debugging instead of returning a rank-3 tensor under
+            # a singular-map API name.
+            debug["knn_anchor_indices"] = mapped["knn_anchor_index"]
+            debug["ss_to_slat_token_map"] = mapped["knn_anchor_index"][..., 0]
             debug["local_geo_uncertainty"] = mapped["local_geo_uncertainty"]
 
     if ss_geo_tokens is None:

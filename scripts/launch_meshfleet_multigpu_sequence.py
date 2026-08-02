@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from enum import Enum
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -24,8 +26,56 @@ OOM_PATTERNS = (
     "cudnn_status_alloc_failed",
     "cuda error: out of memory",
     "torch.cuda.outofmemoryerror",
+)
+
+CONFIGURATION_PATTERNS = (
+    "training budget is not a real dataset pass",
+    "minimum_dataset_passes",
+    "configuration invariant",
+    "contract invariant",
+)
+
+DATASET_PATTERNS = (
+    "dataset loader",
+    "uid manifest",
+    "manifest preflight",
+    "failed to load meshfleet",
+    "requires ss_latent_grid",
+    "no reconstructed samples",
+)
+
+CHECKPOINT_PATTERNS = (
+    "checkpoint incompatib",
+    "initialization checkpoint",
+    "load_state_dict",
+    "missing key(s) in state_dict",
+    "unexpected key(s) in state_dict",
+    "geoss_checkpoint",
+)
+
+DISTRIBUTED_PATTERNS = (
     "nccl error",
     "processgroupnccl",
+    "collective operation timeout",
+    "connection closed by peer",
+    "rendezvous",
+)
+
+NONFINITE_PATTERNS = (
+    "non-finite",
+    "nonfinite",
+    "contains nan",
+    "contains inf",
+    "nan loss",
+    "inf loss",
+)
+
+INTERRUPTION_PATTERNS = (
+    "keyboardinterrupt",
+    "received signal",
+    "signalexception",
+    "sigint",
+    "sigterm",
 )
 
 TRANSIENT_SETUP_PATTERNS = (
@@ -78,6 +128,17 @@ class Stage:
     extra_args: List[str]
 
 
+class FailureKind(str, Enum):
+    CONFIGURATION = "configuration_invariant_violation"
+    DATASET = "dataset_or_manifest_failure"
+    CHECKPOINT = "checkpoint_incompatibility"
+    CUDA_OOM = "cuda_oom"
+    DISTRIBUTED = "nccl_or_distributed_failure"
+    NONFINITE = "nonfinite_numerical_state"
+    INTERRUPTED = "user_interruption"
+    UNKNOWN = "unknown_exception"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sequential multi-GPU MeshFleet training launcher with OOM batch probing.")
     parser.add_argument("--data_root", type=str, required=True)
@@ -88,6 +149,7 @@ def main() -> None:
     parser.add_argument("--probe_max_vram_util", type=float, default=0.96)
     parser.add_argument("--min_batch_size", type=int, default=1)
     parser.add_argument("--no_auto_batch", action="store_true")
+    parser.add_argument("--probe_only", action="store_true", help="Run isolated batch feasibility probes and write selection metadata without launching real training.")
     parser.add_argument("--batch_probe_strategy", choices=["binary", "halve"], default="binary")
     parser.add_argument("--oom_retry_limit", type=int, default=8)
     parser.add_argument("--setup_retry_limit", type=int, default=3)
@@ -132,6 +194,8 @@ def main() -> None:
     parser.add_argument("--stage1_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_raw_residual_weight", type=float, default=1.0)
+    parser.add_argument("--stage2_grad_accum_steps", type=int, default=1)
+    parser.add_argument("--stage2_minimum_dataset_passes", type=float, default=1.0)
     parser.add_argument("--slat_lr", type=float, default=1e-4)
     parser.add_argument("--slat_joint_lr", type=float, default=5e-5)
     parser.add_argument(
@@ -202,6 +266,8 @@ def main() -> None:
         )
 
     selected = {}
+    selected_accumulation = {}
+    selected_effective_batch = {}
     handoff = HandoffCoordinator(args, env, nproc)
     for index, stage in enumerate(stages):
         next_stage = stages[index + 1] if index + 1 < len(stages) else None
@@ -209,6 +275,8 @@ def main() -> None:
         if _stage_is_complete(stage) and not args.force_rerun_completed:
             step = _checkpoint_step(_resolve_resume_path(stage))
             selected[stage.name] = "already_complete"
+            selected_accumulation[stage.name] = "checkpoint"
+            selected_effective_batch[stage.name] = "checkpoint"
             print(f"\n==== {stage.name}: already complete at checkpoint step={step}; skipping ====", flush=True)
             if next_stage is not None:
                 _assert_stage_handoff(stage, next_stage)
@@ -218,13 +286,23 @@ def main() -> None:
         print(f"\n==== {stage.name}: probing per-GPU batch size up to {stage.max_batch_size} on {nproc} GPUs ====", flush=True)
         batch_size = handoff.consume(stage.name) or (stage.max_batch_size if args.no_auto_batch else _probe_batch(stage, args, env, nproc))
         selected[stage.name] = batch_size
+        selected_accumulation[stage.name] = _resolved_grad_accum_steps(stage, batch_size)
+        selected_effective_batch[stage.name] = batch_size * nproc * selected_accumulation[stage.name]
         print(f"==== {stage.name}: selected per-GPU batch_size={batch_size}, global_batch_size={batch_size * nproc} ====", flush=True)
+        if args.probe_only:
+            print(f"==== {stage.name}: probe-only mode; real training was not launched ====", flush=True)
+            continue
         _run_full_stage(stage, args, env, nproc, batch_size)
         if next_stage is not None:
             _assert_stage_handoff(stage, next_stage)
     handoff.close()
 
-    summary = {"nproc_per_node": nproc, "selected_per_gpu_batch_size": selected}
+    summary = {
+        "nproc_per_node": nproc,
+        "selected_per_gpu_batch_size": selected,
+        "selected_grad_accum_steps": selected_accumulation,
+        "selected_effective_global_batch_size": selected_effective_batch,
+    }
     (output_root / "multigpu_sequence_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
 
@@ -392,6 +470,9 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             + trellis_args
             + [
                 "--geoss_checkpoint", str(stage1_geoss_checkpoint),
+                "--grad_accum_steps", str(args.stage2_grad_accum_steps),
+                "--minimum_dataset_passes", str(args.stage2_minimum_dataset_passes),
+                "--auto_expand_training_budget", "true",
                 "--adaptive_max_batch_size", str(args.stage2_max_batch_size),
                 "--lr", str(args.stage2_lr),
                 "--raw_residual_weight", str(args.stage2_raw_residual_weight),
@@ -528,13 +609,22 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
     setup_retries: dict[int, int] = {}
     while batch_size >= args.min_batch_size:
         probe_dir = stage.output_dir / f"_probe_bs{batch_size}"
-        command = _torchrun_command(stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False)
+        grad_accum_steps = _resolved_grad_accum_steps(stage, batch_size)
+        command = _torchrun_command(
+            stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False,
+            execution_mode="probe", grad_accum_steps=grad_accum_steps,
+        )
+        _write_probe_metadata(probe_dir, command, stage, batch_size, nproc, grad_accum_steps)
+        _append_launcher_command(stage.output_dir / "launcher_stage.log", command, env, execution_mode="probe")
+        print(f"{stage.name}: probe command: {shlex.join(command)}", flush=True)
         result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         text = result.stdout or ""
         (probe_dir / "probe.log").parent.mkdir(parents=True, exist_ok=True)
         (probe_dir / "probe.log").write_text(text, encoding="utf-8", errors="replace")
         if _recover_allocator_incompatibility(text, env, stage.name, batch_size):
             continue
+        failure_kind = classify_failure(text, result.returncode)
+        _finish_probe_metadata(probe_dir, result.returncode, failure_kind)
         if result.returncode == 0:
             if _probe_too_hot(text, args):
                 print(f"{stage.name}: per-GPU batch_size={batch_size} exceeded probe VRAM headroom, retrying with {batch_size // 2}", flush=True)
@@ -542,7 +632,7 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
                 continue
             return batch_size
         last_error = text[-8000:]
-        if not _looks_like_oom(text):
+        if failure_kind is not FailureKind.CUDA_OOM:
             if _looks_like_transient_setup(text) and setup_retries.get(batch_size, 0) < args.setup_retry_limit:
                 setup_retries[batch_size] = setup_retries.get(batch_size, 0) + 1
                 print(
@@ -552,7 +642,9 @@ def _probe_batch_halve(stage: Stage, args: argparse.Namespace, env: dict, nproc:
                 )
                 time.sleep(max(0.0, args.restart_sleep_seconds))
                 continue
-            raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
+            raise RuntimeError(
+                f"{stage.name} batch probe failed: failure_kind={failure_kind.value}.\n{last_error}"
+            )
         print(f"{stage.name}: per-GPU batch_size={batch_size} OOM, retrying with {batch_size // 2}", flush=True)
         time.sleep(max(0.0, args.restart_sleep_seconds))
         batch_size //= 2
@@ -574,7 +666,14 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
             batch_size = (low + high) // 2
         tried.add(batch_size)
         probe_dir = stage.output_dir / f"_probe_bs{batch_size}"
-        command = _torchrun_command(stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False)
+        grad_accum_steps = _resolved_grad_accum_steps(stage, batch_size)
+        command = _torchrun_command(
+            stage, nproc, batch_size, args.probe_steps, probe_dir, resume=False,
+            execution_mode="probe", grad_accum_steps=grad_accum_steps,
+        )
+        _write_probe_metadata(probe_dir, command, stage, batch_size, nproc, grad_accum_steps)
+        _append_launcher_command(stage.output_dir / "launcher_stage.log", command, env, execution_mode="probe")
+        print(f"{stage.name}: probe command: {shlex.join(command)}", flush=True)
         result = subprocess.run(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         text = result.stdout or ""
         probe_dir.mkdir(parents=True, exist_ok=True)
@@ -582,6 +681,8 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
         if _recover_allocator_incompatibility(text, env, stage.name, batch_size):
             tried.discard(batch_size)
             continue
+        failure_kind = classify_failure(text, result.returncode)
+        _finish_probe_metadata(probe_dir, result.returncode, failure_kind)
         if result.returncode == 0:
             if _probe_too_hot(text, args):
                 last_error = text[-12000:]
@@ -593,7 +694,7 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
             print(f"{stage.name}: probe OK at per-GPU batch_size={batch_size}", flush=True)
         else:
             last_error = text[-12000:]
-            if not _looks_like_oom(text):
+            if failure_kind is not FailureKind.CUDA_OOM:
                 if _looks_like_transient_setup(text) and setup_retries.get(batch_size, 0) < args.setup_retry_limit:
                     setup_retries[batch_size] = setup_retries.get(batch_size, 0) + 1
                     print(
@@ -604,7 +705,9 @@ def _probe_batch_binary(stage: Stage, args: argparse.Namespace, env: dict, nproc
                     time.sleep(max(0.0, args.restart_sleep_seconds))
                     tried.discard(batch_size)
                     continue
-                raise RuntimeError(f"{stage.name} batch probe failed for a non-OOM reason.\n{last_error}")
+                raise RuntimeError(
+                    f"{stage.name} batch probe failed: failure_kind={failure_kind.value}.\n{last_error}"
+                )
             high = batch_size - 1
             print(f"{stage.name}: probe OOM at per-GPU batch_size={batch_size}; next search range [{low}, {high}]", flush=True)
             time.sleep(max(0.0, args.restart_sleep_seconds))
@@ -624,12 +727,18 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
             return
         resume_path = _resolve_resume_path(stage)
         resume = resume_path is not None
-        command = _torchrun_command(stage, nproc, current, stage.steps, stage.output_dir, resume=resume)
+        grad_accum_steps = _resolved_grad_accum_steps(stage, current)
+        command = _torchrun_command(
+            stage, nproc, current, stage.steps, stage.output_dir, resume=resume,
+            execution_mode="train", grad_accum_steps=grad_accum_steps,
+        )
         print(
             f"{stage.name}: launching per-GPU batch_size={current}, global_batch_size={current * nproc}, "
+            f"grad_accum_steps={grad_accum_steps}, effective_global_batch_size={current * nproc * grad_accum_steps}, "
             f"resume={resume}, checkpoint={resume_path}, checkpoint_step={_checkpoint_step(resume_path)}",
             flush=True,
         )
+        print(f"{stage.name}: final training command: {shlex.join(command)}", flush=True)
         returncode, tail = _run_command_logged(command, env, launcher_log)
         if returncode == 0:
             return
@@ -644,7 +753,8 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
         if _stage_is_complete(stage):
             print(f"{stage.name}: subprocess failed after writing a completed checkpoint; treating stage as complete.", flush=True)
             return
-        if _looks_like_oom(tail) and current > args.min_batch_size and oom_retries < args.oom_retry_limit:
+        failure_kind = classify_failure(tail, returncode)
+        if failure_kind is FailureKind.CUDA_OOM and current > args.min_batch_size and oom_retries < args.oom_retry_limit:
             next_batch = max(args.min_batch_size, current // 2)
             print(
                 f"{stage.name}: OOM/fatal CUDA detected, lowering per-GPU batch_size from {current} to {next_batch}; "
@@ -665,13 +775,42 @@ def _run_full_stage(stage: Stage, args: argparse.Namespace, env: dict, nproc: in
             time.sleep(max(0.0, args.restart_sleep_seconds))
             continue
         raise RuntimeError(
-            f"{stage.name} failed with per-GPU batch_size={current}, returncode={returncode}. "
+            f"{stage.name} failed with per-GPU batch_size={current}, returncode={returncode}, "
+            f"failure_kind={failure_kind.value}. "
             f"Check {launcher_log}. Tail:\n{tail[-4000:]}"
         )
 
 
-def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, output_dir: Path, *, resume: bool) -> list[str]:
+def _torchrun_command(
+    stage: Stage,
+    nproc: int,
+    batch_size: int,
+    steps: int,
+    output_dir: Path,
+    *,
+    resume: bool,
+    execution_mode: str = "train",
+    grad_accum_steps: Optional[int] = None,
+) -> list[str]:
     extra_args = _resolved_stage_args(stage)
+    extra_args = _replace_cli_arg(extra_args, "--execution_mode", execution_mode)
+    if execution_mode == "probe":
+        extra_args = _replace_cli_arg(extra_args, "--minimum_dataset_passes", "0")
+        extra_args = _replace_cli_arg(extra_args, "--auto_expand_training_budget", "false")
+        extra_args = _replace_cli_arg(extra_args, "--early_stop", "false")
+        extra_args = _replace_cli_arg(extra_args, "--save_best", "false")
+        extra_args = _replace_cli_arg(extra_args, "--fault_tolerant_save_every", "0")
+        # A candidate probe must test the requested microbatch. Letting the
+        # in-process adaptive controller silently shrink it would make the
+        # launcher report an untested larger batch as feasible.
+        extra_args = _replace_cli_arg(extra_args, "--adaptive_batch", "false")
+    else:
+        # Never let the in-process controller grow above the largest batch
+        # proven by the isolated multi-rank probe. A fresh DDP process is the
+        # only safe response to a distributed OOM.
+        extra_args = _replace_cli_arg(extra_args, "--adaptive_max_batch_size", str(batch_size))
+    if grad_accum_steps is not None and "--grad_accum_steps" in extra_args:
+        extra_args = _replace_cli_arg(extra_args, "--grad_accum_steps", str(grad_accum_steps))
     command = [
         sys.executable,
         "-m",
@@ -695,6 +834,74 @@ def _torchrun_command(stage: Stage, nproc: int, batch_size: int, steps: int, out
     if resume and resume_path is not None:
         command += ["--resume", str(resume_path)]
     return command
+
+
+def _replace_cli_arg(arguments: list[str], flag: str, value: str) -> list[str]:
+    """Return one unambiguous value for a serialized CLI option."""
+    resolved: list[str] = []
+    index = 0
+    while index < len(arguments):
+        if arguments[index] == flag:
+            index += 2
+            continue
+        resolved.append(arguments[index])
+        index += 1
+    resolved.extend([flag, str(value)])
+    return resolved
+
+
+def _configured_grad_accum_steps(stage: Stage) -> int:
+    try:
+        index = stage.extra_args.index("--grad_accum_steps")
+    except ValueError:
+        return 1
+    return max(1, int(stage.extra_args[index + 1]))
+
+
+def _resolved_grad_accum_steps(stage: Stage, microbatch_per_rank: int) -> int:
+    """Preserve the stage's intended per-rank samples per optimizer update."""
+    configured = _configured_grad_accum_steps(stage)
+    target_per_rank = max(1, stage.max_batch_size) * configured
+    return max(1, (target_per_rank + int(microbatch_per_rank) - 1) // int(microbatch_per_rank))
+
+
+def _write_probe_metadata(
+    probe_dir: Path,
+    command: list[str],
+    stage: Stage,
+    batch_size: int,
+    nproc: int,
+    grad_accum_steps: int,
+) -> None:
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "is_probe": True,
+        "execution_mode": "probe",
+        "stage": stage.name,
+        "command": command,
+        "command_shell": shlex.join(command),
+        "microbatch_per_rank": batch_size,
+        "world_size": nproc,
+        "grad_accum_steps": grad_accum_steps,
+        "effective_global_batch_size": batch_size * nproc * grad_accum_steps,
+        "promotable_checkpoint": False,
+        "status": "running",
+    }
+    (probe_dir / "probe_metadata.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _finish_probe_metadata(probe_dir: Path, returncode: int, failure_kind: FailureKind) -> None:
+    path = probe_dir / "probe_metadata.json"
+    payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"is_probe": True}
+    payload.update(
+        {
+            "returncode": int(returncode),
+            "failure_kind": failure_kind.value,
+            "status": "completed" if returncode == 0 else "failed",
+            "promotable_checkpoint": False,
+        }
+    )
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _required_initialization_path(stage: Stage) -> Optional[Path]:
@@ -776,6 +983,30 @@ def _looks_like_oom(text: str) -> bool:
     return any(pattern in lower for pattern in OOM_PATTERNS)
 
 
+def classify_failure(text: str, returncode: int) -> FailureKind:
+    """Classify a subprocess result without treating every failure as memory pressure."""
+    if int(returncode) == 0:
+        return FailureKind.UNKNOWN
+    lower = (text or "").lower()
+    ordered = (
+        (FailureKind.INTERRUPTED, INTERRUPTION_PATTERNS),
+        (FailureKind.CONFIGURATION, CONFIGURATION_PATTERNS),
+        (FailureKind.DATASET, DATASET_PATTERNS),
+        (FailureKind.CHECKPOINT, CHECKPOINT_PATTERNS),
+        (FailureKind.CUDA_OOM, OOM_PATTERNS),
+        (FailureKind.DISTRIBUTED, DISTRIBUTED_PATTERNS),
+        (FailureKind.NONFINITE, NONFINITE_PATTERNS),
+    )
+    for kind, patterns in ordered:
+        if any(pattern in lower for pattern in patterns):
+            return kind
+    # POSIX shells encode SIGINT/SIGTERM as 128 + signal. Python subprocesses
+    # may expose the direct negative signal number instead.
+    if int(returncode) in {-2, -15, 130, 143}:
+        return FailureKind.INTERRUPTED
+    return FailureKind.UNKNOWN
+
+
 def _looks_like_transient_setup(text: str) -> bool:
     lower = text.lower()
     return any(pattern in lower for pattern in TRANSIENT_SETUP_PATTERNS)
@@ -815,7 +1046,7 @@ def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[
     tail_lines: list[str] = []
     with log_path.open("a", encoding="utf-8", errors="replace") as log:
         log.write("\n\n==== COMMAND ====\n")
-        log.write(" ".join(command) + "\n")
+        log.write(shlex.join(command) + "\n")
         log.write(f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n")
         log.write(f"PYTORCH_CUDA_ALLOC_CONF={env.get('PYTORCH_CUDA_ALLOC_CONF', '<default>')}\n")
         log.flush()
@@ -837,6 +1068,20 @@ def _run_command_logged(command: list[str], env: dict, log_path: Path) -> tuple[
         returncode = process.wait()
         log.write(f"\n==== RETURN CODE: {returncode} ====\n")
     return returncode, "".join(tail_lines)
+
+
+def _append_launcher_command(
+    log_path: Path,
+    command: list[str],
+    env: dict,
+    *,
+    execution_mode: str,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8", errors="replace") as log:
+        log.write(f"\n\n==== {execution_mode.upper()} COMMAND ====\n")
+        log.write(shlex.join(command) + "\n")
+        log.write(f"CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n")
 
 
 def _stage_is_complete(stage: Stage) -> bool:
