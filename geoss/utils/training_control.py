@@ -16,6 +16,8 @@ class ControlConfig:
     loss_ema_decay: float = 0.98
     loss_weight_min: float = 0.25
     loss_weight_max: float = 4.0
+    min_stability_multiplier: float = 0.1
+    max_stability_multiplier: float = 2.0
 
 
 class WarmupCosineController:
@@ -55,7 +57,22 @@ class WarmupCosineController:
     def contract(self, multiplier: float) -> None:
         if not 0.0 < multiplier <= 1.0:
             raise ValueError("LR contraction multiplier must be in (0, 1]")
-        self.stability_multiplier *= float(multiplier)
+        self.intervene(multiplier)
+
+    def bound_intervention(self, multiplier: float) -> float:
+        if not math.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError("LR intervention multiplier must be positive and finite")
+        floor = float(self.config.min_stability_multiplier)
+        ceiling = float(self.config.max_stability_multiplier)
+        if not 0.0 < floor <= 1.0 <= ceiling:
+            raise ValueError("stability multiplier bounds must satisfy 0 < floor <= 1 <= ceiling")
+        target = min(ceiling, max(floor, self.stability_multiplier * float(multiplier)))
+        return target / self.stability_multiplier
+
+    def intervene(self, multiplier: float) -> float:
+        applied = self.bound_intervention(multiplier)
+        self.stability_multiplier *= applied
+        return applied
 
     def state_dict(self) -> dict:
         return {

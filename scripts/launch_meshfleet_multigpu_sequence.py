@@ -19,6 +19,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from geoss.utils.early_stopping import handoff_contract
 
 
+REQUIRED_OPTIMIZATION_CONTRACTS = {
+    "stage1": "stage1_stationary_control_v2",
+    "stage2": "stage2_gate_consistent_flow_v2",
+}
+
+
 OOM_PATTERNS = (
     "out of memory",
     "cuda oom",
@@ -193,7 +199,7 @@ def main() -> None:
     parser.add_argument("--slat_joint_max_batch_size", type=int, default=6)
     parser.add_argument("--stage1_lr", type=float, default=1e-4)
     parser.add_argument("--stage2_lr", type=float, default=1e-4)
-    parser.add_argument("--stage2_raw_residual_weight", type=float, default=1.0)
+    parser.add_argument("--stage2_raw_residual_weight", type=float, default=0.25)
     parser.add_argument("--stage2_grad_accum_steps", type=int, default=1)
     parser.add_argument("--stage2_minimum_dataset_passes", type=float, default=1.0)
     parser.add_argument("--slat_lr", type=float, default=1e-4)
@@ -212,8 +218,8 @@ def main() -> None:
     parser.add_argument("--visualize_every", type=int, default=1000)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--disable_early_stop", action="store_true")
-    # Legacy flags are accepted as inert compatibility inputs. No configured
-    # patience, warmup, window, EMA, or loss delta enters termination logic.
+    # Legacy patience/window/EMA/delta flags are inert compatibility inputs.
+    # A minimum step, when forwarded, is only a control-start safety boundary.
     parser.add_argument("--early_stop_patience", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--early_stop_min_steps", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--early_stop_warmup_steps", type=int, default=None, help=argparse.SUPPRESS)
@@ -338,9 +344,10 @@ class HandoffCoordinator:
 
     def _wait_and_probe(self, next_stage: Stage, current_stage: Stage, env: dict, nproc: int) -> int:
         while True:
-            current_status = _checkpoint_early_stop(_resolve_resume_path(current_stage))
+            current_checkpoint = _resolve_resume_path(current_stage)
+            current_status = _checkpoint_early_stop(current_checkpoint)
             ready, _ = handoff_contract(current_status)
-            if ready:
+            if ready and _checkpoint_has_required_optimization_contract(current_stage.name, current_checkpoint):
                 break
             time.sleep(2.0)
         while _required_initialization_path(next_stage) is not None and _resolve_initialization_path(next_stage) is None:
@@ -389,11 +396,12 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
     if not args.disable_early_stop:
         early_stop_args = [
             "--early_stop", "true",
-            "--early_stop_metric", "loss",
             "--early_stop_mode", "min",
             "--max_train_hours", str(args.max_train_hours_per_stage),
             "--save_best", "true",
         ]
+        if args.early_stop_min_steps is not None:
+            early_stop_args += ["--early_stop_min_steps", str(args.early_stop_min_steps)]
     adaptive_args = [
         "--adaptive_batch", "true",
         "--adaptive_min_batch_size", str(args.adaptive_min_batch_size),
@@ -441,6 +449,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + stage1_manifest
             + early_stop_args
+            + (["--early_stop_metric", "loss_stationary"] if early_stop_args else [])
             + adaptive_args
             + vggt_args
             + [
@@ -465,6 +474,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + stage2_manifest
             + early_stop_args
+            + (["--early_stop_metric", "normalized_effective_residual"] if early_stop_args else [])
             + adaptive_args
             + vggt_args
             + trellis_args
@@ -476,6 +486,10 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
                 "--adaptive_max_batch_size", str(args.stage2_max_batch_size),
                 "--lr", str(args.stage2_lr),
                 "--raw_residual_weight", str(args.stage2_raw_residual_weight),
+                "--normalize_residual_loss", "true",
+                "--timestep_sampling", "logit_normal",
+                "--fused_flow_matching", "auto",
+                "--release_frozen_cache", "true",
                 "--amp", "true",
                 "--amp_dtype", "bf16",
                 "--activation_checkpointing", "true",
@@ -499,6 +513,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + stage3_manifest
             + early_stop_args
+            + (["--early_stop_metric", "loss"] if early_stop_args else [])
             + adaptive_args
             + vggt_args
             + trellis_args
@@ -524,6 +539,7 @@ def _make_stages(args: argparse.Namespace, root: Path, output_root: Path) -> lis
             extra_args=common_data
             + stage4_manifest
             + early_stop_args
+            + (["--early_stop_metric", "loss"] if early_stop_args else [])
             + adaptive_args
             + vggt_args
             + trellis_args
@@ -1088,6 +1104,8 @@ def _stage_is_complete(stage: Stage) -> bool:
     resume_path = _resolve_resume_path(stage)
     if resume_path is None:
         return False
+    if not _checkpoint_has_required_optimization_contract(stage.name, resume_path):
+        return False
     step = _checkpoint_step(resume_path)
     if step is not None and step >= stage.steps:
         return True
@@ -1099,6 +1117,13 @@ def _assert_stage_handoff(stage: Stage, next_stage: Stage) -> None:
     """Reject a cascading stage transition unless upstream learning is proven."""
 
     checkpoint = _resolve_resume_path(stage)
+    if not _checkpoint_has_required_optimization_contract(stage.name, checkpoint):
+        expected = REQUIRED_OPTIMIZATION_CONTRACTS.get(stage.name)
+        raise RuntimeError(
+            f"{stage.name} cannot hand off to {next_stage.name}: checkpoint uses a legacy "
+            f"optimization contract; expected {expected!r}. Resume {stage.name} once to "
+            "warm-start its weights under the repaired control system."
+        )
     status = _checkpoint_early_stop(checkpoint)
     ready, reasons = handoff_contract(status)
     if ready:
@@ -1124,6 +1149,11 @@ def _assert_selected_input_contracts(stage: Stage) -> None:
         if index + 1 >= len(stage.extra_args):
             raise ValueError(f"{stage.name} has {flag} without a checkpoint path.")
         selected = Path(stage.extra_args[index + 1])
+        if flag == "--geoss_checkpoint" and not _checkpoint_has_required_optimization_contract("stage1", selected):
+            raise RuntimeError(
+                f"{stage.name} selected a legacy Stage-1 checkpoint at {selected}. "
+                f"Expected optimization contract {REQUIRED_OPTIMIZATION_CONTRACTS['stage1']!r}."
+            )
         certification = selected
         if selected.name.endswith("_best.pt"):
             sibling_last = selected.with_name(
@@ -1162,6 +1192,14 @@ def _checkpoint_early_stop(path: Optional[Path]) -> Optional[dict]:
     state = _load_checkpoint_meta(path)
     early_stop = state.get("early_stop") if state else None
     return early_stop if isinstance(early_stop, dict) else None
+
+
+def _checkpoint_has_required_optimization_contract(stage_name: str, path: Optional[Path]) -> bool:
+    expected = REQUIRED_OPTIMIZATION_CONTRACTS.get(stage_name)
+    if expected is None:
+        return True
+    state = _load_checkpoint_meta(path)
+    return state.get("optimization_contract_version") == expected
 
 
 def _load_checkpoint_meta(path: Optional[Path]) -> dict:

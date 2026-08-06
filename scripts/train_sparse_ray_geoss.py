@@ -52,6 +52,9 @@ from geoss.utils.training_control import (
 )
 
 
+OPTIMIZATION_CONTRACT_VERSION = "stage1_stationary_control_v2"
+
+
 def run_dry_run(cfg: dict, device: str) -> dict:
     batch_cfg = cfg.get("dry_run_batch", {})
     model_cfg = cfg.get("model", {})
@@ -59,7 +62,9 @@ def run_dry_run(cfg: dict, device: str) -> dict:
     vggt = VGGTGeometryWrapper(mock=True)
     batch.update(vggt(batch["images"]))
     model = SparseRayGeoSSAdapter(**model_cfg).to(device)
-    out = model(batch)
+    # Real Stage 1 trains the geometry/context branch only.  Keep the smoke
+    # path identical instead of accidentally entering Stage 2's velocity hook.
+    out = model(_without_sparse_structure_latents(batch))
     gt_occ = torch.zeros(batch["images"].shape[0], 32, 32, 32, device=device)
     occ_terms = occupancy_bce_loss(out["occ_evidence"], out["free_evidence"], out["anchor_xyz"], gt_occ)
     occ_prob = torch.sigmoid(out["occ_evidence"] - out["free_evidence"])
@@ -71,7 +76,7 @@ def run_dry_run(cfg: dict, device: str) -> dict:
         "anchor_xyz": list(out["anchor_xyz"].shape),
         "geo_tokens": list(out["geo_tokens"].shape),
         "geo_confidence": list(out["geo_confidence"].shape),
-        "delta_v_geo": list(out["delta_v_geo"].shape),
+        "context_only": bool(out["debug"].get("context_only", False)),
         "occupancy_loss": float(occ_terms["loss"].detach().cpu()),
         "projection_loss": float(proj_terms["loss"].detach().cpu()),
     }
@@ -97,10 +102,15 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     ).to(device)
     start_step = 0
     resume_state = None
+    reset_legacy_optimization_state = False
     if args.resume and Path(args.resume).exists():
         resume_state = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(resume_state.get("model", resume_state), strict=True)
         start_step = int(resume_state.get("step", 0))
+        reset_legacy_optimization_state = (
+            resume_state.get("optimization_contract_version")
+            != OPTIMIZATION_CONTRACT_VERSION
+        )
     model = maybe_wrap_ddp(model, ctx, find_unused_parameters=args.ddp_find_unused_parameters)
     opt = build_geoss_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     control_cfg = ControlConfig(
@@ -114,7 +124,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     )
     scheduler = WarmupCosineController(opt, control_cfg)
     loss_balancer = BoundedLossBalancer(("occupancy", "free_space", "projection", "confidence", "sparsity"), control_cfg)
-    if resume_state is not None and "optimizer" in resume_state:
+    if resume_state is not None and not reset_legacy_optimization_state and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
         training_control = resume_state.get("training_control", {})
         scheduler.load_state_dict(training_control.get("scheduler"))
@@ -129,14 +139,21 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_sparse_ray_geoss.jsonl"
     last_summary = {"mode": "real_dataset", **run_modes}
-    early_stopper = EarlyStopper.from_args(args, default_metric="loss")
-    if resume_state is not None:
+    early_stopper = EarlyStopper.from_args(
+        args,
+        default_metric="loss_stationary",
+        min_control_updates=max(
+            int(args.warmup_steps),
+            int(args.early_stop_min_steps or 0),
+        ),
+    )
+    if resume_state is not None and not reset_legacy_optimization_state:
         early_stopper.load_state_dict(resume_state.get("early_stopper"))
-        if ctx.is_main:
-            quarantine_legacy_best_checkpoint(
-                out_dir / "geoss_adapter_best.pt",
-                resume_state,
-            )
+    if resume_state is not None and ctx.is_main:
+        quarantine_legacy_best_checkpoint(
+            out_dir / "geoss_adapter_best.pt",
+            resume_state,
+        )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
     if start_step >= end_step:
         return {
@@ -204,6 +221,11 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 "confidence": conf_terms["loss"],
                 "sparsity": anchor_sparsity,
             }
+            # The EMA-balanced optimization objective is intentionally
+            # nonstationary and therefore invalid for convergence decisions or
+            # across-step plots.  Keep a fixed physical objective for those
+            # controls while retaining bounded gradient balancing below.
+            stationary_loss = _stationary_geoss_loss(objective_values)
             # Geometry retains minimum authority while the free-space term is
             # prevented from disappearing merely because it became small.
             authority = _stage_authority(step, args)
@@ -227,7 +249,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             opt.step()
             update_ratios = group_update_ratios(opt, parameter_before) if parameter_before is not None else {}
             return (clean_batch, out, ray, occ_prob, geo_error, losses, ray_terms,
-                    proj_terms, conf_terms, anchor_sparsity, loss, loss_weights,
+                    proj_terms, conf_terms, anchor_sparsity, loss, stationary_loss, loss_weights,
                     gradient_norms, total_gradient_norm, update_ratios)
 
         retry = train_step_with_oom_retry(
@@ -243,7 +265,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         )
         batch_adjustment = retry.adjustment
         (batch, out, ray, occ_prob, geo_error, losses, ray_terms, proj_terms,
-         conf_terms, anchor_sparsity, loss, loss_weights, gradient_norms,
+         conf_terms, anchor_sparsity, loss, stationary_loss, loss_weights, gradient_norms,
          total_gradient_norm, update_ratios) = retry.value
         if batch_adjustment is not None and batch_adjustment.changed:
             rebuild_after_adjustment(batch_adjustment)
@@ -252,6 +274,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last_summary = {
             "step": step,
             "loss": float(loss.detach().cpu()),
+            "loss_optimization": float(loss.detach().cpu()),
+            "loss_stationary": float(stationary_loss.detach().cpu()),
             "loss_occ": float(losses.get("occupancy_bce", torch.zeros((), device=device)).detach().cpu()),
             "loss_dice": float(losses.get("occupancy_dice", torch.zeros((), device=device)).detach().cpu()),
             "loss_free": float(ray_terms["loss"].detach().cpu()),
@@ -277,6 +301,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "geo_error_min": float(geo_error.min().detach().cpu()),
             "geo_error_max": float(geo_error.max().detach().cpu()),
             "mode": "real_dataset",
+            "optimization_contract_version": OPTIMIZATION_CONTRACT_VERSION,
+            "legacy_weights_warm_started_with_control_reset": reset_legacy_optimization_state,
             **run_modes,
             "rank": ctx.rank,
             "world_size": ctx.world_size,
@@ -294,9 +320,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         # The controller emits at most one self-calibrated LR intervention per
         # statistically resolved plateau. Apply it on every rank so optimizer
         # state remains DDP-identical.
+        if early_status.lr_multiplier is not None:
+            early_status.lr_multiplier = scheduler.bound_intervention(
+                float(early_status.lr_multiplier)
+            )
         action = apply_early_stop_action(opt, early_status)
         if action.get("applied"):
-            scheduler.contract(float(action["multiplier"]))
+            scheduler.intervene(float(action["multiplier"]))
         last_summary["early_stop_action"] = action
         last_summary["early_stop"] = early_status.as_dict()
         if ctx.is_main:
@@ -357,15 +387,18 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     _apply_config_defaults(args, cfg, parser)
-    if not args.dry_run:
-        summary = run_training(cfg, args)
-    else:
-        summary = run_dry_run(cfg, args.device)
-    if getattr(args, "rank", 0) == 0:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        (Path(args.output_dir) / "train_sparse_ray_geoss_dry_run.json").write_text(json.dumps(summary, indent=2))
-        print(json.dumps(summary, indent=2))
-    cleanup_distributed()
+    try:
+        if not args.dry_run:
+            summary = run_training(cfg, args)
+        else:
+            summary = run_dry_run(cfg, args.device)
+        if getattr(args, "rank", 0) == 0:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            summary_name = "train_sparse_ray_geoss_dry_run.json" if args.dry_run else "training_summary.json"
+            (Path(args.output_dir) / summary_name).write_text(json.dumps(summary, indent=2))
+            print(json.dumps(summary, indent=2))
+    finally:
+        cleanup_distributed()
 
 
 def _build_real_loader(args: argparse.Namespace, ctx):
@@ -467,6 +500,7 @@ def _save_geoss_checkpoint(path: Path, model, optimizer, step: int, cfg: dict, e
         optimizer=optimizer.state_dict(),
         step=step,
         config=cfg,
+        optimization_contract_version=OPTIMIZATION_CONTRACT_VERSION,
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
         training_control={
@@ -482,6 +516,18 @@ def _stage_authority(step: int, args: argparse.Namespace) -> dict[str, float]:
     if step <= args.geometry_stage_steps:
         return {"occupancy": 1.0, "free_space": 1.0, "projection": 0.75, "confidence": 0.5, "sparsity": 0.25}
     return {"occupancy": 1.0, "free_space": 0.75, "projection": 1.0, "confidence": 0.5, "sparsity": 0.25}
+
+
+def _stationary_geoss_loss(objectives: dict[str, torch.Tensor]) -> torch.Tensor:
+    """A fixed-scale metric suitable for trends and checkpoint selection."""
+
+    return (
+        objectives["occupancy"]
+        + 0.75 * objectives["free_space"]
+        + objectives["projection"]
+        + 0.5 * objectives["confidence"]
+        + 0.25 * objectives["sparsity"]
+    )
 
 
 def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse.ArgumentParser) -> None:

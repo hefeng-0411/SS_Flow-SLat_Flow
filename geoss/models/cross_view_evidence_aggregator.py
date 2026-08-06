@@ -5,6 +5,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class CrossViewEvidenceAggregator(nn.Module):
@@ -17,10 +18,12 @@ class CrossViewEvidenceAggregator(nn.Module):
         hidden_dim: int = 256,
         num_heads: int = 4,
         view_dropout: float = 0.0,
+        activation_checkpointing: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.view_dropout = view_dropout
+        self.activation_checkpointing = bool(activation_checkpointing)
         self.anchor_proj = nn.Linear(anchor_dim, hidden_dim)
         self.evidence_proj = nn.Linear(evidence_dim, hidden_dim)
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads=num_heads, batch_first=True)
@@ -44,6 +47,54 @@ class CrossViewEvidenceAggregator(nn.Module):
         valid = ray_valid > 0.5
         if valid.shape != (B, M, N, 1):
             raise ValueError(f"ray_valid must be [B,M,N,1], got {tuple(ray_valid.shape)}")
+        has_conflict = conflict_score is not None
+        conflict = (
+            conflict_score
+            if conflict_score is not None
+            else view_tokens.new_zeros(B, M, 1)
+        )
+        if self.training and self.activation_checkpointing:
+            outputs = checkpoint(
+                lambda views, anchors, validity, conflicts: self._forward_core(
+                    views,
+                    anchors,
+                    validity,
+                    conflicts if has_conflict else None,
+                ),
+                view_tokens,
+                anchor_feat,
+                ray_valid,
+                conflict,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        else:
+            outputs = self._forward_core(view_tokens, anchor_feat, ray_valid, conflict_score)
+        geo_tokens, occ_evidence, free_evidence, p_occ, uncertainty, geo_confidence = outputs
+        return {
+            "geo_tokens": geo_tokens,
+            "occ_evidence": occ_evidence,
+            "free_evidence": free_evidence,
+            "p_occ": p_occ,
+            "uncertainty": uncertainty,
+            "geo_confidence": geo_confidence,
+            "confidence_stats": {
+                "mean": geo_confidence.mean().detach(),
+                "std": geo_confidence.std(unbiased=False).detach(),
+                "all_zero": (geo_confidence <= 1e-6).all().detach(),
+                "all_one": (geo_confidence >= 1.0 - 1e-6).all().detach(),
+            },
+        }
+
+    def _forward_core(
+        self,
+        view_tokens: torch.Tensor,
+        anchor_feat: torch.Tensor,
+        ray_valid: torch.Tensor,
+        conflict_score: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, ...]:
+        B, M, N, _ = view_tokens.shape
+        valid = ray_valid > 0.5
         if self.training and self.view_dropout > 0:
             keep = torch.rand(B, M, N, 1, device=view_tokens.device) >= self.view_dropout
             valid = valid & keep
@@ -55,7 +106,15 @@ class CrossViewEvidenceAggregator(nn.Module):
         key_padding_mask = ~valid_flat
         key_padding_mask[all_invalid] = False
         kv = kv.masked_fill((~valid_flat).unsqueeze(-1), 0.0)
-        attn, _ = self.cross_attn(q, kv, kv, key_padding_mask=key_padding_mask)
+        # We never consume attention weights. Disabling them selects PyTorch's
+        # fused scaled-dot-product attention path and avoids a [B*M,1,N] write.
+        attn, _ = self.cross_attn(
+            q,
+            kv,
+            kv,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         token = self.norm(q + attn)
         token = self.norm(token + self.ffn(token))
         geo_tokens = token.reshape(B, M, self.hidden_dim)
@@ -71,17 +130,4 @@ class CrossViewEvidenceAggregator(nn.Module):
                 raise ValueError(f"conflict_score must be [B,M,1], got {tuple(conflict_score.shape)}")
             geo_confidence = geo_confidence * torch.exp(-conflict_score.clamp_min(0.0))
         geo_confidence = geo_confidence * valid.any(dim=2).float()
-        return {
-            "geo_tokens": geo_tokens,
-            "occ_evidence": occ_evidence,
-            "free_evidence": free_evidence,
-            "p_occ": p_occ,
-            "uncertainty": uncertainty,
-            "geo_confidence": geo_confidence,
-            "confidence_stats": {
-                "mean": geo_confidence.mean().detach(),
-                "std": geo_confidence.std(unbiased=False).detach(),
-                "all_zero": (geo_confidence <= 1e-6).all().detach(),
-                "all_one": (geo_confidence >= 1.0 - 1e-6).all().detach(),
-            },
-        }
+        return geo_tokens, occ_evidence, free_evidence, p_occ, uncertainty, geo_confidence

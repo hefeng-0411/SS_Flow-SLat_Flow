@@ -14,7 +14,7 @@ STAGE_SPECS = {
         "dir": "stage1_geoss",
         "log": "train_sparse_ray_geoss.jsonl",
         "title": "Stage 1: Sparse-Ray GeoSS Evidence",
-        "loss_metrics": ["loss", "loss_occ", "loss_dice", "loss_free", "loss_conf", "loss_proj", "anchor_sparsity"],
+        "loss_metrics": ["loss_stationary", "loss_occ", "loss_dice", "loss_free", "loss_conf", "loss_proj", "anchor_sparsity"],
         "quality_metrics": [
             "confidence_mean",
             "confidence_std",
@@ -30,8 +30,8 @@ STAGE_SPECS = {
         "dir": "stage2_ss_velocity",
         "log": "train_sparse_ray_ss_velocity.jsonl",
         "title": "Stage 2: TRELLIS SS Velocity Adapter",
-        "loss_metrics": ["loss", "cfm_mse", "velocity_regularization", "prior_preservation", "identity_error"],
-        "quality_metrics": ["velocity_norm", "delta_norm", "clipping_ratio"],
+        "loss_metrics": ["normalized_effective_residual", "cfm_mse", "loss_unclipped_effective_residual", "loss_frozen_base_residual", "velocity_regularization", "prior_preservation"],
+        "quality_metrics": ["velocity_norm", "delta_norm", "clipping_ratio", "effective_gate_mean", "causal_residual_gain"],
     },
     "stage3_geovis_slat": {
         "dir": "stage3_geovis_slat",
@@ -118,13 +118,19 @@ def main() -> None:
     overview_loss = _plot_overview(
         plt,
         records_by_stage,
-        metric="loss",
-        title="Sequential Training Loss Overview",
+        metric=None,
+        title="Sequential Training Stationary Objective Overview",
         out_base=report_dir / "overview_loss",
         formats=formats,
         smooth=args.smooth,
         max_points=args.max_points,
         dpi=args.dpi,
+        per_stage_metric={
+            "stage1_geoss": "loss_stationary",
+            "stage2_ss_velocity": "normalized_effective_residual",
+            "stage3_geovis_slat": "loss",
+            "stage4_geovis_slat_joint": "loss",
+        },
     )
     overview_conf = _plot_overview(
         plt,

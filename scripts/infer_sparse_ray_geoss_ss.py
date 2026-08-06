@@ -191,9 +191,13 @@ def _move_batch(batch: dict, device: torch.device) -> dict:
 def _load_optional_checkpoints(model: SparseRayGeoSSAdapter, args: argparse.Namespace) -> None:
     if args.geoss_checkpoint and Path(args.geoss_checkpoint).exists():
         state = torch.load(args.geoss_checkpoint, map_location="cpu")
+        if state.get("optimization_contract_version") != "stage1_stationary_control_v2":
+            raise RuntimeError("Refusing a Stage-1 checkpoint from the legacy nonstationary control regime.")
         model.load_state_dict(state.get("model", state), strict=True)
     if args.ss_adapter_checkpoint and Path(args.ss_adapter_checkpoint).exists():
         state = torch.load(args.ss_adapter_checkpoint, map_location="cpu")
+        if state.get("optimization_contract_version") != "stage2_gate_consistent_flow_v2":
+            raise RuntimeError("Refusing a Stage-2 checkpoint trained with the legacy gate-inconsistent objective.")
         adapter_state = state.get("velocity_adapter", state)
         model.velocity_adapter.load_state_dict(adapter_state, strict=True)
 

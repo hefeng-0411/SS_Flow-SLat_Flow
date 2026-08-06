@@ -111,7 +111,11 @@ class SSVelocityAdapter(nn.Module):
 
         t_norm = normalize_timestep(timestep, B).to(v_base.device)
         tau = self.trust_region * (0.25 + 0.75 * t_norm).view(B, 1, 1)
-        delta_clipped = delta_raw.clamp(-tau, tau)
+        # A hard clamp has exactly zero derivative outside the trust region and
+        # can permanently strand a residual head after one large update.  This
+        # smooth projection has the same bounded range while retaining an
+        # analytic gradient everywhere at finite inputs.
+        delta_clipped = tau * torch.tanh(delta_raw / tau.clamp_min(1e-6))
         clipping_ratio = (delta_raw.abs() > tau).float().mean()
 
         alpha_t = self.gate(timestep, B).to(v_base.device, v_base.dtype)
@@ -131,6 +135,7 @@ class SSVelocityAdapter(nn.Module):
                 "confidence_std": token_confidence.std(unbiased=False),
                 "confidence_all_zero": (token_confidence <= 1e-6).all(),
                 "confidence_all_one": (token_confidence >= 1.0 - 1e-6).all(),
+                "effective_gate_mean": (alpha_t * token_confidence).mean(),
                 **local_debug,
             },
         }

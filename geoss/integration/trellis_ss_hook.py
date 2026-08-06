@@ -10,10 +10,13 @@ from geoss.models.ss_velocity_adapter import SSVelocityAdapter
 
 
 def ss_grid_to_tokens(x: torch.Tensor) -> torch.Tensor:
-    """Convert TRELLIS SS grid [B,C,D,H,W] to tokens [B,L,C]."""
+    """Return a zero-copy ``[B,L,C]`` view of a TRELLIS SS grid."""
     if x.ndim != 5:
         raise ValueError(f"SS grid must be [B,C,D,H,W], got {tuple(x.shape)}")
-    return x.flatten(2).transpose(1, 2).contiguous()
+    # A channel-first grid cannot also be token-contiguous without a copy.
+    # Linear/attention operators accept this strided view, so keep one storage
+    # owner and let the consuming kernel honor the explicit strides.
+    return x.flatten(2).transpose(1, 2)
 
 
 def tokens_to_ss_grid(tokens: torch.Tensor, spatial_shape: Tuple[int, int, int]) -> torch.Tensor:

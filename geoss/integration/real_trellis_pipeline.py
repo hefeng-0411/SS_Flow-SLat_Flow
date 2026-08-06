@@ -6,6 +6,7 @@ from types import MethodType
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+import numpy as np
 import torch
 
 from geoss.integration.trellis_ss_hook import GeoSSTrellisSSWrapper, ss_grid_to_tokens, tokens_to_ss_grid
@@ -349,7 +350,12 @@ class RealTrellisGeoPipeline:
         sample_kwargs = {**cond, **params, "verbose": True}
         if geoss_context is not None:
             sample_kwargs["geoss_context"] = _to_device(geoss_context, self.device)
-        z_s = self.pipeline.sparse_structure_sampler.sample(flow_model, noise, **sample_kwargs).samples
+        z_s = _sample_final_without_trajectory(
+            self.pipeline.sparse_structure_sampler,
+            flow_model,
+            noise,
+            **sample_kwargs,
+        )
         decoder = self.pipeline.models["sparse_structure_decoder"]
         coords = torch.argwhere(decoder(z_s) > 0)[:, [0, 2, 3, 4]].int()
         if coords.numel() == 0:
@@ -380,7 +386,12 @@ class RealTrellisGeoPipeline:
         sample_kwargs = {**cond, **params, "verbose": True}
         if geovis_slat_context is not None:
             sample_kwargs["geovis_slat_context"] = _to_device(geovis_slat_context, self.device)
-        slat = self.pipeline.slat_sampler.sample(flow_model, noise, **sample_kwargs).samples
+        slat = _sample_final_without_trajectory(
+            self.pipeline.slat_sampler,
+            flow_model,
+            noise,
+            **sample_kwargs,
+        )
         slat_feats = slat.feats if hasattr(slat, "feats") else slat
         if not isinstance(slat_feats, torch.Tensor) or slat_feats.ndim != 2 or slat_feats.shape[-1] != in_channels:
             shape = list(slat_feats.shape) if isinstance(slat_feats, torch.Tensor) else type(slat_feats).__name__
@@ -537,6 +548,38 @@ def mask_aware_trellis_crop(
         )
         cropped.append(crop.clamp(0.0, 1.0))
     return torch.cat(cropped, dim=0)
+
+
+@torch.no_grad()
+def _sample_final_without_trajectory(sampler, model, noise, **kwargs):
+    """Run TRELLIS Flow-Euler sampling without retaining every ODE state.
+
+    Upstream TRELLIS appends ``pred_x_prev`` and ``pred_x_0`` at every solver
+    step even when callers consume only ``samples``.  For large sparse SLATs
+    that is linear-in-step VRAM retention.  This path uses the sampler's exact
+    ``sample_once`` transition and exact NumPy time grid, but owns only the
+    current state.  Unknown sampler families retain their native behavior.
+    """
+
+    sample_once = getattr(sampler, "sample_once", None)
+    if not callable(sample_once) or not hasattr(sampler, "sigma_min"):
+        result = sampler.sample(model, noise, **kwargs)
+        return result.samples
+    params = dict(kwargs)
+    steps = int(params.pop("steps", 50))
+    rescale_t = float(params.pop("rescale_t", 1.0))
+    params.pop("verbose", None)
+    if steps <= 0:
+        raise ValueError(f"TRELLIS sampler steps must be positive, got {steps}.")
+    if rescale_t <= 0.0:
+        raise ValueError(f"TRELLIS rescale_t must be positive, got {rescale_t}.")
+    t_seq = np.linspace(1.0, 0.0, steps + 1)
+    t_seq = rescale_t * t_seq / (1.0 + (rescale_t - 1.0) * t_seq)
+    sample = noise
+    for t, t_prev in zip(t_seq[:-1], t_seq[1:]):
+        out = sample_once(model, sample, float(t), float(t_prev), **params)
+        sample = out.pred_x_prev if hasattr(out, "pred_x_prev") else out["pred_x_prev"]
+    return sample
 
 
 @contextlib.contextmanager

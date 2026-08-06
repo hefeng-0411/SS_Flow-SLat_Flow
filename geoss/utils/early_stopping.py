@@ -253,8 +253,9 @@ class EarlyStopper:
     """Evidence-rate adaptive termination for heterogeneous training stages.
 
     The controller stores only sufficient statistics. It does not use a loss
-    window, patience counter, fixed warmup, fixed minimum step, or configured
-    improvement threshold. Training progress is measured in processed examples
+    window, patience counter, or configured improvement threshold. Trainers may
+    supply a control-start update to exclude a known nonstationary LR warmup.
+    Training progress after that boundary is measured in processed examples
     and partitioned into powers-of-two compute regimes. Within each regime,
     BIC selects between a constant and linear utility model.
     """
@@ -266,6 +267,7 @@ class EarlyStopper:
         metric: str,
         mode: str = "min",
         max_train_hours: float = 0.0,
+        min_control_updates: int = 0,
         **legacy_ignored: Any,
     ) -> None:
         if mode not in {"min", "max"}:
@@ -274,6 +276,7 @@ class EarlyStopper:
         self.metric = str(metric)
         self.mode = mode
         self.max_train_seconds = max(0.0, float(max_train_hours)) * 3600.0
+        self.min_control_updates = max(0, int(min_control_updates))
         self.start_time = time.time()
         self.primary = _Signal(mode)
         self.components: dict[str, _Signal] = {}
@@ -301,14 +304,25 @@ class EarlyStopper:
         self.distributed_schema: tuple[str, ...] | None = None
 
     @classmethod
-    def from_args(cls, args: Any, default_metric: str = "loss") -> "EarlyStopper":
-        # Legacy patience/window/min-step flags remain parseable so existing
-        # launch commands are valid, but they do not enter the controller.
+    def from_args(
+        cls,
+        args: Any,
+        default_metric: str = "loss",
+        *,
+        min_control_updates: int | None = None,
+    ) -> "EarlyStopper":
+        # Legacy patience/window/delta flags remain parseable. A minimum control
+        # step is now a safety boundary because warmup data is nonstationary.
         return cls(
             enabled=bool(getattr(args, "early_stop", False)),
             metric=getattr(args, "early_stop_metric", None) or default_metric,
             mode=getattr(args, "early_stop_mode", "min"),
             max_train_hours=getattr(args, "max_train_hours", 0.0),
+            min_control_updates=(
+                max(0, int(min_control_updates))
+                if min_control_updates is not None
+                else max(0, int(getattr(args, "early_stop_min_steps", 0) or 0))
+            ),
         )
 
     def update(self, record: Mapping[str, Any]) -> EarlyStopStatus:
@@ -332,6 +346,34 @@ class EarlyStopper:
         step = _as_int(record.get("step"), self.last_step or 0)
         if self.last_step is not None and step <= self.last_step:
             status = self._status(reason="duplicate_or_out_of_order_summary", raw=raw)
+            self.last_status = status
+            return status
+
+        # Scheduler warmup is an intentional nonstationary experiment.  Fitting
+        # convergence/degeneration models to it caused repeated LR contractions
+        # before the base learning rate was ever reached.  Structural failures
+        # still terminate immediately, but trend evidence begins only after the
+        # trainer-defined control horizon.
+        if step <= self.min_control_updates:
+            health = _telemetry_health(record)
+            if health.hard_failure is not None:
+                status = self._status(
+                    reason=health.hard_failure,
+                    raw=raw,
+                    should_stop=True,
+                    selected_checkpoint="best",
+                )
+            else:
+                status = self._status(reason="control_warmup", raw=raw, regime="warmup")
+            status.diagnostics.update(
+                {
+                    "control_updates_deferred": True,
+                    "control_start_update": self.min_control_updates + 1,
+                    "updates_remaining": self.min_control_updates - step + 1,
+                }
+            )
+            self.last_step = step
+            self.last_raw = raw
             self.last_status = status
             return status
 
@@ -871,6 +913,7 @@ class EarlyStopper:
             "probe_baseline_variance": self.probe_baseline_variance,
             "probe_generation": self.probe_generation,
             "last_raw": self.last_raw,
+            "min_control_updates": self.min_control_updates,
             "elapsed_seconds": self.elapsed_seconds,
         }
 
@@ -939,6 +982,10 @@ class EarlyStopper:
         self.probe_baseline_variance = _as_float(state.get("probe_baseline_variance"))
         self.probe_generation = _as_int(state.get("probe_generation"), 0)
         self.last_raw = _as_float(state.get("last_raw"))
+        self.min_control_updates = max(
+            self.min_control_updates,
+            _as_int(state.get("min_control_updates"), 0),
+        )
         elapsed = _as_float(state.get("elapsed_seconds")) or 0.0
         self.start_time = time.time() - elapsed
 
@@ -1155,14 +1202,13 @@ def add_early_stopping_args(parser):
     parser.add_argument("--early_stop_mode", choices=["min", "max"], default="min")
     parser.add_argument("--max_train_hours", type=float, default=0.0)
     parser.add_argument("--save_best", type=_str2bool, default=True)
-    # Accepted but deliberately ignored: old launch commands and checkpoints
-    # remain parse-compatible while no fixed patience/min-step/delta enters the
-    # evidence-rate controller.
+    # Patience/window/delta remain inert compatibility inputs. A minimum step is
+    # honored only as a nonstationary-control exclusion boundary.
     parser.add_argument("--early_stop_patience", type=int, default=None, help="Deprecated; ignored.")
     parser.add_argument("--early_stop_min_delta", type=float, default=None, help="Deprecated; ignored.")
     parser.add_argument("--early_stop_relative_delta", type=_str2bool, default=None, help="Deprecated; ignored.")
     parser.add_argument("--early_stop_warmup_steps", type=int, default=None, help="Deprecated; ignored.")
-    parser.add_argument("--early_stop_min_steps", type=int, default=None, help="Deprecated; ignored.")
+    parser.add_argument("--early_stop_min_steps", type=int, default=None, help="Do not fit trends or intervene before this update.")
     parser.add_argument("--early_stop_ema", type=float, default=None, help="Deprecated; ignored.")
     parser.add_argument("--early_stop_window", type=int, default=None, help="Deprecated; ignored.")
     return parser

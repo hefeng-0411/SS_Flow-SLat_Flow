@@ -29,6 +29,7 @@ from geoss.losses.prior_preservation_loss import prior_preservation_loss
 from geoss.losses.velocity_loss import velocity_regularization_loss
 from geoss.models.sparse_ray_geoss_adapter import SparseRayGeoSSAdapter
 from geoss.models.ss_velocity_adapter import SSVelocityAdapter
+from geoss.ops.flow_matching import flow_matching_pair
 from geoss.utils.adaptive_batch import AdaptiveBatchController, adaptive_config_defaults, add_adaptive_batch_args
 from geoss.utils.checkpoint import save_checkpoint
 from geoss.utils.config import add_common_args, apply_config_mappings, load_config, str2bool
@@ -56,6 +57,10 @@ from geoss.utils.early_stopping import (
     quarantine_legacy_best_checkpoint,
 )
 from geoss.utils.elastic_engine import cuda_memory_watermark, slice_batch_to_size, train_step_with_oom_retry
+
+
+OPTIMIZATION_CONTRACT_VERSION = "stage2_gate_consistent_flow_v2"
+REQUIRED_STAGE1_OPTIMIZATION_CONTRACT = "stage1_stationary_control_v2"
 
 
 class MockSSFlowModel(nn.Module):
@@ -221,20 +226,25 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     _repair_zero_terminal_delta_head(adapter)
     start_step = 0
     resume_state = None
+    reset_legacy_optimization_state = False
     if args.resume and Path(args.resume).exists():
         resume_state = torch.load(args.resume, map_location="cpu")
         adapter.load_state_dict(resume_state.get("velocity_adapter", resume_state), strict=True)
         _repair_zero_terminal_delta_head(adapter)
         start_step = int(resume_state.get("step", 0))
+        reset_legacy_optimization_state = (
+            resume_state.get("optimization_contract_version")
+            != OPTIMIZATION_CONTRACT_VERSION
+        )
     _assert_terminal_delta_head_is_trainable(adapter)
     adapter_model = maybe_wrap_ddp(adapter, ctx, find_unused_parameters=False)
     opt = torch.optim.AdamW(adapter_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = _build_lr_scheduler(opt, total_updates=int(args.steps), warmup_updates=args.warmup_updates, min_lr_ratio=args.min_lr_ratio)
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = _make_grad_scaler(enabled=args.amp and args.amp_dtype == "fp16" and device.type == "cuda")
-    if resume_state is not None and "optimizer" in resume_state:
+    if resume_state is not None and not reset_legacy_optimization_state and "optimizer" in resume_state:
         opt.load_state_dict(resume_state["optimizer"])
-    if resume_state is not None and "scheduler" in resume_state:
+    if resume_state is not None and not reset_legacy_optimization_state and "scheduler" in resume_state:
         scheduler.load_state_dict(resume_state["scheduler"])
     iterator = iter(loader) if loader is not None else None
     data_epoch = 0
@@ -250,6 +260,13 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         if not geoss_checkpoint.is_file():
             raise FileNotFoundError(f"Stage 1 GeoSS checkpoint does not exist: {geoss_checkpoint}")
         state = torch.load(geoss_checkpoint, map_location="cpu")
+        if state.get("optimization_contract_version") != REQUIRED_STAGE1_OPTIMIZATION_CONTRACT:
+            raise RuntimeError(
+                "Stage 2 refuses a Stage-1 checkpoint from the collapsed optimization regime: "
+                f"expected contract {REQUIRED_STAGE1_OPTIMIZATION_CONTRACT!r}, got "
+                f"{state.get('optimization_contract_version')!r}. Resume Stage 1 once under the "
+                "repaired trainer before Stage-2 handoff."
+            )
         geoss_state = state.get("model", state)
         incompatible = geoss_model.load_state_dict(geoss_state, strict=True)
         geoss_handoff = _checkpoint_handoff_report(
@@ -278,14 +295,25 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
     log_path = out_dir / "train_sparse_ray_ss_velocity.jsonl"
     last = {}
     sigma_min = args.sigma_min
-    early_stopper = EarlyStopper.from_args(args, default_metric="loss")
-    if resume_state is not None:
+    early_stopper = EarlyStopper.from_args(
+        args,
+        default_metric="normalized_effective_residual",
+        min_control_updates=max(
+            int(args.early_stop_min_steps or 0),
+            (
+                start_step + int(scheduler.resolved_warmup_updates)
+                if reset_legacy_optimization_state
+                else int(scheduler.resolved_warmup_updates)
+            ),
+        ),
+    )
+    if resume_state is not None and not reset_legacy_optimization_state:
         early_stopper.load_state_dict(resume_state.get("early_stopper"))
-        if ctx.is_main:
-            quarantine_legacy_best_checkpoint(
-                out_dir / "ss_velocity_adapter_best.pt",
-                resume_state,
-            )
+    if resume_state is not None and ctx.is_main:
+        quarantine_legacy_best_checkpoint(
+            out_dir / "ss_velocity_adapter_best.pt",
+            resume_state,
+        )
     end_step = int(args.steps) if args.steps_are_total else start_step + int(args.steps)
     update_contract = {
         "configured_steps": configured_steps,
@@ -301,6 +329,8 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         "grad_accum_steps": args.grad_accum_steps,
         "effective_global_batch_size": args.batch_size * ctx.world_size * args.grad_accum_steps,
         "learning_rate_scaling": "none; AdamW uses mean loss over accumulation and the launcher preserves target effective batch",
+        "optimization_contract_version": OPTIMIZATION_CONTRACT_VERSION,
+        "legacy_weights_warm_started_with_control_reset": reset_legacy_optimization_state,
     }
     if start_step >= end_step:
         return {
@@ -366,10 +396,20 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                         f"batch_keys={keys}, object_id={object_ids}"
                     )
                 noise = torch.randn_like(x0)
-                t = torch.rand(B, device=device)
-                t_view = t.view(B, 1, 1, 1, 1)
-                x_t = (1 - t_view) * x0 + (sigma_min + (1 - sigma_min) * t_view) * noise
-                target_v = (1 - sigma_min) * noise - x0
+                t = _sample_flow_timesteps(
+                    B,
+                    device,
+                    mode=args.timestep_sampling,
+                    mean=args.timestep_logit_mean,
+                    std=args.timestep_logit_std,
+                )
+                x_t, target_v, flow_matching_backend = flow_matching_pair(
+                    x0,
+                    noise,
+                    t,
+                    sigma_min,
+                    backend=args.fused_flow_matching,
+                )
                 voxel_valid_mask = _exact_zero_voxel_mask(x0, args.voxel_prune_epsilon) if args.adaptive_voxel_pruning else None
                 cond = _real_condition_or_fail(micro_batch, device, cfg, trellis_pipeline)
                 if geoss_model is not None and vggt is not None:
@@ -380,6 +420,12 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 t_model = t * 1000.0
                 with torch.inference_mode(), torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp and device.type == "cuda"):
                     v_base = base(x_t, t_model, cond)
+                allocator_reclamation = _release_frozen_forward_cache(
+                    device,
+                    enabled=args.release_frozen_cache,
+                    reserved_fraction=args.release_cache_reserved_fraction,
+                    inactive_gib=args.release_cache_inactive_gib,
+                )
                 ss_tokens = ss_grid_to_tokens(x_t)
                 v_base_tokens = ss_grid_to_tokens(v_base).detach()
                 target_residual_tokens = ss_grid_to_tokens(target_v - v_base).detach()
@@ -414,14 +460,25 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                     raw_delta_tokens = vel["debug"]["delta_raw"]
                     _assert_residual_training_contract(raw_delta_tokens, effective_delta_tokens, target_residual_tokens)
                     token_mask = voxel_valid_mask[..., None] if voxel_valid_mask is not None else None
-                    effective_mse = _masked_mse(effective_delta_tokens.float(), target_residual_tokens.float(), token_mask)
-                    raw_mse = _masked_mse(raw_delta_tokens.float(), target_residual_tokens.float(), token_mask)
                     frozen_base_mse = _masked_mse(
                         torch.zeros_like(effective_delta_tokens, dtype=torch.float32),
                         target_residual_tokens.float(),
                         token_mask,
                     )
-                    mse = effective_mse + args.raw_residual_weight * raw_mse
+                    residual_terms = _stage2_residual_objective(
+                        raw_delta_tokens.float(),
+                        effective_delta_tokens.float(),
+                        target_residual_tokens.float(),
+                        alpha_t=vel["alpha_t"],
+                        token_confidence=vel["token_confidence"],
+                        token_mask=token_mask,
+                        frozen_base_mse=frozen_base_mse,
+                        auxiliary_weight=args.raw_residual_weight,
+                        normalize=args.normalize_residual_loss,
+                    )
+                    effective_mse = residual_terms["effective_mse"]
+                    raw_mse = residual_terms["unclipped_effective_mse"]
+                    mse = residual_terms["optimization_residual"]
                     vel_reg = velocity_regularization_loss(delta_tokens, t)
                     prior = prior_preservation_loss(v_geo_tokens, v_base_tokens, vel["token_confidence"].detach())
                     loss = mse + args.velocity_reg_weight * vel_reg + args.prior_weight * prior
@@ -460,7 +517,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
                 "target_residual_tokens": list(target_residual_tokens.shape),
                 "corrected_velocity_tokens": list(v_geo_tokens.shape),
             }
-            return loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual_grid, debug, effective_delta_grid, vel_reg, prior, grad_norms, tensor_shapes, memory_start, cuda_memory_watermark(device)
+            return loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual_grid, debug, effective_delta_grid, vel_reg, prior, grad_norms, tensor_shapes, memory_start, cuda_memory_watermark(device), flow_matching_backend, allocator_reclamation, t.detach().mean()
 
         compute_start = time.perf_counter()
         retry = train_step_with_oom_retry(
@@ -476,7 +533,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             log_oom=log_oom,
         )
         batch_adjustment = retry.adjustment
-        loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual, debug, effective_delta, vel_reg, prior, grad_norms, tensor_shapes, memory_start, memory_end = retry.value
+        loss, mse, effective_mse, raw_mse, frozen_base_mse, target_residual, debug, effective_delta, vel_reg, prior, grad_norms, tensor_shapes, memory_start, memory_end, flow_matching_backend, allocator_reclamation, timestep_mean = retry.value
         if is_probe and device.type == "cuda":
             torch.cuda.synchronize(device)
         compute_seconds = time.perf_counter() - compute_start
@@ -495,10 +552,14 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
         last = {
             "step": step,
             "loss": float(loss.detach().cpu()),
-            "cfm_mse": float(mse.detach().cpu()),
+            "cfm_mse": float(effective_mse.detach().cpu()),
+            "loss_residual_optimization": float(mse.detach().cpu()),
             "loss_effective_residual": float(effective_mse.detach().cpu()),
             "loss_raw_residual": float(raw_mse.detach().cpu()),
+            "loss_unclipped_effective_residual": float(raw_mse.detach().cpu()),
             "loss_frozen_base_residual": float(frozen_base_mse.detach().cpu()),
+            "normalized_effective_residual": float((effective_mse / frozen_base_mse.clamp_min(1.0e-6)).detach().cpu()),
+            "normalized_unclipped_effective_residual": float((raw_mse / frozen_base_mse.clamp_min(1.0e-6)).detach().cpu()),
             "causal_residual_gain": float((frozen_base_mse - effective_mse).detach().cpu()),
             "residual_target_norm": float(target_residual.norm(dim=1).mean().detach().cpu()),
             "residual_base_ratio": float((effective_delta.norm(dim=1).mean() / debug["velocity_base_norm"].clamp_min(1e-6)).detach().cpu()),
@@ -512,6 +573,7 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "confidence_std": float(debug["confidence_std"].detach().cpu()),
             "confidence_all_zero": bool(debug["confidence_all_zero"].detach().cpu()),
             "confidence_all_one": bool(debug["confidence_all_one"].detach().cpu()),
+            "effective_gate_mean": float(debug["effective_gate_mean"].detach().cpu()),
             "voxel_prune_ratio": float(debug.get("voxel_prune_ratio", torch.zeros((), device=device)).detach().cpu()),
             "mode": _training_mode(args, data_batch is not None),
             "execution_mode": execution_mode,
@@ -536,6 +598,10 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             "gpu_utilization_percent": _cuda_utilization_percent(device),
             "communication_fraction": None,
             "communication_fraction_status": "requires training-server profiler trace; not inferred from wall time",
+            "timestep_sampling": args.timestep_sampling,
+            "timestep_mean": float(timestep_mean.cpu()),
+            "flow_matching_backend": flow_matching_backend,
+            "allocator_reclamation": allocator_reclamation,
             "adapter_grad_norms": grad_norms,
             "tensor_shapes": tensor_shapes,
             "stage1_handoff": geoss_handoff,
@@ -561,10 +627,16 @@ def run_training(cfg: dict, args: argparse.Namespace) -> dict:
             step=step,
             minimum_dataset_passes=args.minimum_dataset_passes,
         )
+        if early_status.lr_multiplier is not None:
+            early_status.lr_multiplier = _bound_scheduler_intervention(
+                scheduler,
+                float(early_status.lr_multiplier),
+            )
         last["early_stop_action"] = apply_early_stop_action(opt, early_status)
         if last["early_stop_action"].get("applied"):
             multiplier = float(last["early_stop_action"]["multiplier"])
             scheduler.base_lrs = [float(value) * multiplier for value in scheduler.base_lrs]
+            scheduler.control_multiplier *= multiplier
             last["early_stop_action"]["scheduler_base_lrs"] = list(scheduler.base_lrs)
         last["early_stop"] = early_status.as_dict()
         if ctx.is_main:
@@ -612,7 +684,17 @@ def main() -> None:
     parser.add_argument("--sigma_min", type=float, default=1e-5)
     parser.add_argument("--velocity_reg_weight", type=float, default=1e-3)
     parser.add_argument("--prior_weight", type=float, default=1e-2)
-    parser.add_argument("--raw_residual_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--raw_residual_weight",
+        type=float,
+        default=0.25,
+        help="Weight of the gate-consistent, unclipped residual auxiliary.",
+    )
+    parser.add_argument("--normalize_residual_loss", type=str2bool, default=True)
+    parser.add_argument("--timestep_sampling", choices=("logit_normal", "uniform"), default="logit_normal")
+    parser.add_argument("--timestep_logit_mean", type=float, default=0.0)
+    parser.add_argument("--timestep_logit_std", type=float, default=1.0)
+    parser.add_argument("--fused_flow_matching", choices=("auto", "torch", "triton"), default="auto")
     parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--trellis_root", type=str, default=None)
@@ -641,6 +723,9 @@ def main() -> None:
     parser.add_argument("--spconv_algo", choices=("native", "mask_implicit_gemm"), default="mask_implicit_gemm")
     parser.add_argument("--adaptive_voxel_pruning", type=str2bool, default=True)
     parser.add_argument("--voxel_prune_epsilon", type=float, default=0.0)
+    parser.add_argument("--release_frozen_cache", type=str2bool, default=True)
+    parser.add_argument("--release_cache_reserved_fraction", type=float, default=0.90)
+    parser.add_argument("--release_cache_inactive_gib", type=float, default=8.0)
     add_adaptive_batch_args(parser)
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -757,6 +842,120 @@ def _make_grad_scaler(*, enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _sample_flow_timesteps(
+    batch_size: int,
+    device: torch.device,
+    *,
+    mode: str,
+    mean: float = 0.0,
+    std: float = 1.0,
+) -> torch.Tensor:
+    """Match the frozen TRELLIS trainer's timestep distribution by default."""
+
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if mode == "uniform":
+        return torch.rand(batch_size, device=device)
+    if mode != "logit_normal":
+        raise ValueError(f"Unsupported timestep sampling mode {mode!r}.")
+    if not math.isfinite(std) or std <= 0.0:
+        raise ValueError(f"timestep logit-normal std must be positive and finite, got {std}.")
+    logits = torch.randn(batch_size, device=device) * float(std) + float(mean)
+    return torch.sigmoid(logits)
+
+
+def _stage2_residual_objective(
+    raw_delta: torch.Tensor,
+    effective_delta: torch.Tensor,
+    target_residual: torch.Tensor,
+    *,
+    alpha_t: torch.Tensor,
+    token_confidence: torch.Tensor,
+    token_mask: torch.Tensor | None,
+    frozen_base_mse: torch.Tensor,
+    auxiliary_weight: float,
+    normalize: bool,
+) -> dict[str, torch.Tensor]:
+    """Build a gate-consistent residual objective with a stationary baseline.
+
+    The old auxiliary compared the *ungated* head directly with the desired
+    effective correction.  For a gate ``g < 1`` it therefore asked the same
+    parameter to approach both ``target`` and ``target / g``.  The auxiliary
+    below bypasses only the smooth trust projection while retaining the exact
+    inference gate, so both terms have one optimum and clipped heads keep a
+    useful analytic gradient.
+    """
+
+    if auxiliary_weight < 0.0:
+        raise ValueError(f"auxiliary_weight must be non-negative, got {auxiliary_weight}")
+    effective_mse = _masked_mse(effective_delta, target_residual, token_mask)
+    detached_gate = (alpha_t.float() * token_confidence.float()).detach()
+    if detached_gate.shape != (*raw_delta.shape[:2], 1):
+        raise ValueError(
+            f"effective gate must be [B,L,1], got {tuple(detached_gate.shape)} "
+            f"for residual {tuple(raw_delta.shape)}"
+        )
+    unclipped_effective = detached_gate * raw_delta
+    unclipped_effective_mse = _masked_mse(unclipped_effective, target_residual, token_mask)
+    denominator = frozen_base_mse.detach().float().clamp_min(1.0e-6) if normalize else raw_delta.new_ones(())
+    # The derivative of a gated residual carries an unavoidable factor ``g``.
+    # Divide the auxiliary by E[g²] (with a conservative floor) to condition
+    # the residual-head gradient without changing the auxiliary's minimizer.
+    gate_energy = detached_gate.square().mean().clamp_min(1.0e-2)
+    optimization_residual = (
+        effective_mse / denominator
+        + float(auxiliary_weight) * unclipped_effective_mse / (denominator * gate_energy)
+    )
+    return {
+        "effective_mse": effective_mse,
+        "unclipped_effective_mse": unclipped_effective_mse,
+        "optimization_residual": optimization_residual,
+        "detached_gate_mean": detached_gate.mean(),
+        "detached_gate_energy": gate_energy,
+    }
+
+
+def _release_frozen_forward_cache(
+    device: torch.device,
+    *,
+    enabled: bool,
+    reserved_fraction: float,
+    inactive_gib: float,
+) -> dict[str, float | bool | str]:
+    """Release only allocator cache left by sequential frozen giant models."""
+
+    if not enabled or device.type != "cuda" or not torch.cuda.is_available():
+        return {"released": False, "reason": "disabled_or_non_cuda"}
+    if not 0.0 < float(reserved_fraction) <= 1.0:
+        raise ValueError("release_cache_reserved_fraction must be in (0,1].")
+    if float(inactive_gib) < 0.0:
+        raise ValueError("release_cache_inactive_gib must be non-negative.")
+    gib = 1024.0 ** 3
+    allocated = float(torch.cuda.memory_allocated(device))
+    reserved = float(torch.cuda.memory_reserved(device))
+    total = float(torch.cuda.get_device_properties(device).total_memory)
+    inactive = max(0.0, reserved - allocated)
+    should_release = reserved / max(total, 1.0) >= float(reserved_fraction) and inactive / gib >= float(inactive_gib)
+    if not should_release:
+        return {
+            "released": False,
+            "reason": "below_threshold",
+            "reserved_gib_before": reserved / gib,
+            "allocated_gib": allocated / gib,
+            "inactive_gib_before": inactive / gib,
+        }
+    torch.cuda.empty_cache()
+    reserved_after = float(torch.cuda.memory_reserved(device))
+    return {
+        "released": True,
+        "reason": "frozen_forward_cache_pressure",
+        "reserved_gib_before": reserved / gib,
+        "reserved_gib_after": reserved_after / gib,
+        "allocated_gib": allocated / gib,
+        "reclaimed_gib": max(0.0, reserved - reserved_after) / gib,
+    }
+
+
 def _build_lr_scheduler(optimizer, *, total_updates: int, warmup_updates: int, min_lr_ratio: float):
     total_updates = max(1, int(total_updates))
     if int(warmup_updates) <= 0:
@@ -778,7 +977,22 @@ def _build_lr_scheduler(optimizer, *, total_updates: int, warmup_updates: int, m
     scheduler.resolved_warmup_updates = warmup_updates
     scheduler.resolved_total_updates = total_updates
     scheduler.min_lr_ratio = min_lr_ratio
+    scheduler.control_multiplier = 1.0
     return scheduler
+
+
+def _bound_scheduler_intervention(
+    scheduler,
+    requested: float,
+    *,
+    floor: float = 0.1,
+    ceiling: float = 2.0,
+) -> float:
+    if not math.isfinite(requested) or requested <= 0.0:
+        raise ValueError(f"LR intervention must be positive and finite, got {requested}.")
+    current = float(getattr(scheduler, "control_multiplier", 1.0))
+    target = min(float(ceiling), max(float(floor), current * float(requested)))
+    return target / current
 
 
 def _checkpoint_handoff_report(path: Path, state_dict: dict, incompatible) -> dict:
@@ -1167,6 +1381,7 @@ def _save_velocity_checkpoint(
         scheduler=scheduler.state_dict(),
         step=step,
         config=cfg,
+        optimization_contract_version=OPTIMIZATION_CONTRACT_VERSION,
         early_stop=early_status.as_dict() if early_status is not None else None,
         early_stopper=early_stopper.state_dict(),
         training_budget=training_budget,
@@ -1229,6 +1444,14 @@ def _apply_config_defaults(args: argparse.Namespace, cfg: dict, parser: argparse
         "velocity_reg_weight": cfg.get("velocity_reg_weight"),
         "prior_weight": cfg.get("prior_weight"),
         "raw_residual_weight": cfg.get("raw_residual_weight"),
+        "normalize_residual_loss": cfg.get("normalize_residual_loss"),
+        "timestep_sampling": cfg.get("timestep_sampling"),
+        "timestep_logit_mean": cfg.get("timestep_logit_mean"),
+        "timestep_logit_std": cfg.get("timestep_logit_std"),
+        "fused_flow_matching": cfg.get("fused_flow_matching"),
+        "release_frozen_cache": cfg.get("release_frozen_cache"),
+        "release_cache_reserved_fraction": cfg.get("release_cache_reserved_fraction"),
+        "release_cache_inactive_gib": cfg.get("release_cache_inactive_gib"),
         "save_every": cfg.get("save_every"),
         "output_dir": cfg.get("output_dir"),
         "device": cfg.get("device"),

@@ -10,6 +10,15 @@
     "freeze_trellis_ss_flow": true
   },
   "geoss_apply_to_uncond": false,
+  "timestep_sampling": "logit_normal",
+  "timestep_logit_mean": 0.0,
+  "timestep_logit_std": 1.0,
+  "normalize_residual_loss": true,
+  "raw_residual_weight": 0.25,
+  "fused_flow_matching": "auto",
+  "release_frozen_cache": true,
+  "release_cache_reserved_fraction": 0.90,
+  "release_cache_inactive_gib": 8.0,
   "ablation": {
     "use_confidence_gate": true,
     "use_trust_region_clipping": true,
