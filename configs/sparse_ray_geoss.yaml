@@ -1,0 +1,29 @@
+{
+  "model": {
+    "num_anchors": 4096,
+    "anchor_dim": 256,
+    "evidence_dim": 128,
+    "geo_dim": 256,
+    "latent_dim": 8
+  },
+  "dry_run_batch": {
+    "batch_size": 1,
+    "num_views": 3,
+    "image_size": 64,
+    "latent_tokens": 512,
+    "latent_dim": 8
+  },
+  "training": {
+    "stage": "sparse_ray_geoss_evidence_pretraining",
+    "freeze_vggt": true,
+    "datasets": ["objaverse_cars", "srn_cars"]
+  },
+  "ablation": {
+    "use_sparse_anchor_query": true,
+    "use_ray_free_space": true,
+    "use_confidence_gate": true,
+    "use_trust_region_clipping": true,
+    "use_timestep_alpha": true,
+    "use_velocity_level_control": true
+  }
+}

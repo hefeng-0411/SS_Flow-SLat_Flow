@@ -1,0 +1,10 @@
+{
+  "dataset": {
+    "name": "srn_cars",
+    "root": "SRN_ROOT",
+    "split": "train",
+    "num_views": 4,
+    "image_size": 128,
+    "coordinate_system": "opencv_canonical"
+  }
+}

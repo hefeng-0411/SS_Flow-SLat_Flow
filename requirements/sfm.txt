@@ -1,0 +1,7 @@
+-r base.txt
+pycolmap
+kornia
+poselib
+lightglue
+# hloc is commonly installed from source:
+# pip install git+https://github.com/cvg/Hierarchical-Localization.git

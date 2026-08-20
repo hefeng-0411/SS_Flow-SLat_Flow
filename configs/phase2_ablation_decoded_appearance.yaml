@@ -1,0 +1,18 @@
+{
+  "protocol_version": "phase2_ablation_decoded_appearance_v1",
+  "model": {
+    "resolution": 64, "slat_dim": 8, "evidence_dim": 128, "hidden_dim": 128,
+    "feature_dim": 16, "num_heads": 4, "trust_region": 0.20,
+    "beta_mode": "cosine", "beta_strength": 1.0, "fusion_mode": "aligned",
+    "confidence_floor": 0.0, "factorized_control": true, "use_geovis_slat": true
+  },
+  "flow": {"sigma_min": 1e-5, "latent_space": "trellis_normalized_slat"},
+  "decoded_supervision": {
+    "enabled": true, "every": 4, "views_per_object": 2,
+    "rgb_weight": 1.0, "foreground_rgb_weight": 1.0,
+    "ssim_weight": 0.2, "lpips_weight": 0.1, "mask_weight": 0.5,
+    "depth_weight": 0.0, "geometry_weight": 0.0, "geometry_points": 2048,
+    "background": [0.0, 0.0, 0.0]
+  },
+  "training": {"stage": "ablation_decoded_appearance", "multiview_teacher": true, "factorized_control_weight": 0.2}
+}

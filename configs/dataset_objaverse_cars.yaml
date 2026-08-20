@@ -1,0 +1,11 @@
+{
+  "dataset": {
+    "name": "objaverse_cars",
+    "raw_root": "OBJAVERSE_RAW",
+    "rendered_root": "OBJAVERSE_RENDERED_CARS",
+    "split": "train",
+    "num_views": 4,
+    "image_size": 128,
+    "coordinate_system": "opencv_canonical"
+  }
+}

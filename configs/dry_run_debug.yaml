@@ -1,0 +1,49 @@
+use_real_vggt: false
+use_real_trellis: false
+use_decoder: false
+use_render_loss: false
+allow_mock: true
+allow_synthetic: true
+alignment_enabled: true
+dynamic_anchor_enabled: true
+local_attention_enabled: true
+confidence_calibration: true
+trust_region: true
+render_eval: false
+dry_run: true
+ablation_mode: dry_run_debug
+dependencies:
+  require_gsplat_for_real_eval: false
+  require_pycolmap_for_pose_check: false
+  require_kornia_for_projection: false
+  require_pytorch3d_for_mesh_render: false
+  require_nvdiffrast_for_advanced_render: false
+  require_kaolin_for_voxel_ops: false
+rendering:
+  renderer: none
+  enable_render_loss: false
+  enable_mask_loss: false
+  enable_depth_loss: false
+  enable_lpips_loss: false
+  enable_dino_loss: false
+geometry:
+  use_pycolmap_pose_check: false
+  use_kornia_projection: false
+  use_open3d_icp_refine: false
+  use_point_cloud_utils_metrics: false
+anchors:
+  dynamic_anchor_backend: torch
+  use_vggt_pointmap_anchors: true
+  use_fps_sampling: true
+  use_boundary_sampling: true
+  use_uncertainty_sampling: true
+evaluation:
+  use_gsplat_render_metrics: false
+  use_geometry_metrics: false
+  use_gaussian_statistics: false
+  export_debug_assets: true
+dry_run_batch:
+  batch_size: 1
+  num_views: 3
+  image_size: 64
+  latent_tokens: 512

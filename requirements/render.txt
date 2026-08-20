@@ -1,0 +1,5 @@
+-r base.txt
+# Environment-sensitive; install versions matching Python/PyTorch/CUDA.
+# pytorch3d
+# nvdiffrast
+# kaolin
