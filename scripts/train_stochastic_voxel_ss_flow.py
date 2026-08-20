@@ -358,14 +358,20 @@ def forward_training_batch(
     base_tokens = ss_grid_to_tokens(v_base_grid)
     target_tokens = ss_grid_to_tokens(v_target_grid)
     with torch.autocast(device_type=device.type, dtype=precision, enabled=device.type == "cuda"):
-        fused, adapted, branch_timings = trainable(
-            geometry,
-            batch,
-            x_tokens,
-            timestep_model,
-            base_tokens,
-            profile=args.profile,
-        )
+        try:
+            fused, adapted, branch_timings = trainable(
+                geometry,
+                batch,
+                x_tokens,
+                timestep_model,
+                base_tokens,
+                profile=args.profile,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"SS voxel fusion failed for uid={batch.get('uid')}, "
+                f"view_ids={batch.get('view_ids')}: {exc}"
+            ) from exc
         v_final_grid = tokens_to_ss_grid(adapted.v_final, (16, 16, 16))
         predicted_clean = velocity_to_clean_state(x_t, v_final_grid, timestep, args.sigma_min)
         target_surface_points, target_surface_weights = (
@@ -403,6 +409,8 @@ def forward_training_batch(
         "adapter_diagnostics": adapted.diagnostics,
         "flow_backend": flow_backend,
         "observed_fraction": fused.observation_mask.float().mean(),
+        "alignment_plausible_fraction": fused.alignment_plausible_fraction.mean(),
+        "alignment_scale": fused.alignment_scale.mean(),
         "timings": {"vggt_forward": vggt_ms, "frozen_trellis_forward": trellis_ms, "losses": losses_ms, **branch_timings},
     }
 
@@ -536,6 +544,7 @@ def slice_validation_views(batch: Dict[str, Any], requested_views: int) -> Dict[
         "w2c_dataset",
         "view_valid_mask",
         "view_ids",
+        "view_metadata_indices",
     }
     result = {
         key: value[:, :count] if key in view_keys and isinstance(value, torch.Tensor) else value
@@ -785,9 +794,14 @@ def build_metrics(step, epoch, loss, payload, timings, dataloader, elapsed, grad
     adapter = payload["adapter_diagnostics"]
     losses = payload["losses"]
     views = int(batch["view_valid_mask"].sum().item())
+    uid = batch.get("uid", [""])
+    uid = uid[0] if isinstance(uid, (list, tuple)) else uid
+    selected_view_ids = batch["view_ids"][batch["view_valid_mask"]].detach().cpu().tolist()
     metrics = {
         "step": step,
         "epoch": epoch,
+        "uid": uid,
+        "view_ids": selected_view_ids,
         "loss_total": float(loss.cpu()),
         "loss_cfm": float(losses["loss_cfm"].detach().float().cpu()),
         "loss_depth": float(losses["loss_depth"].detach().float().cpu()),
@@ -798,6 +812,10 @@ def build_metrics(step, epoch, loss, payload, timings, dataloader, elapsed, grad
         "adapter_norm": float(adapter["mean_adapter_norm"].detach().float().cpu()),
         "residual_base_ratio": float(adapter["residual_base_ratio"].detach().float().cpu()),
         "observed_percent": float(adapter["percentage_observed"].detach().float().cpu()),
+        "alignment_plausible_percent": float(
+            100.0 * payload["alignment_plausible_fraction"].detach().float().cpu()
+        ),
+        "alignment_scale": float(payload["alignment_scale"].detach().float().cpu()),
         "grad_norm": float(grad_norm.detach().float().cpu()),
         "learning_rate": optimizer.param_groups[0]["lr"],
         "flow_backend": payload["flow_backend"],
@@ -816,9 +834,17 @@ def append_metrics(jsonl_path: Path, csv_path: Path, metrics: Dict[str, Any]) ->
     with jsonl_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(metrics, default=json_default) + "\n")
     flat = {key: value for key, value in metrics.items() if isinstance(value, (str, int, float, bool))}
-    new_file = not csv_path.exists()
+    new_file = not csv_path.exists() or csv_path.stat().st_size == 0
+    fieldnames = list(flat)
+    if not new_file:
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            existing_header = next(csv.reader(handle), [])
+        if existing_header:
+            # Resumed runs may add JSONL diagnostics without corrupting the
+            # fixed schema of an already-created CSV metrics file.
+            fieldnames = existing_header
     with csv_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(flat))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         if new_file:
             writer.writeheader()
         writer.writerow(flat)

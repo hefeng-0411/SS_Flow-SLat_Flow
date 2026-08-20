@@ -17,12 +17,14 @@ from geoss.models.ss_flow_adapter import SSFlowAdapter
 from geoss.models.voxel_fusion_engine import (
     ConfidenceSparseVoxelFusion,
     VoxelFusionOutput,
+    _validate_alignment_retention,
     align_vggt_reference_to_dataset,
     unproject_depth_batched,
 )
 from geoss.ops.flow_matching import construct_flow_training_pair
 from geoss.samplers.fast_ss_sampler import FastGeometryConditionedSSSampler
 from geoss.utils.projection import project_points
+from scripts.train_stochastic_voxel_ss_flow import append_metrics
 
 
 def _make_meshfleet_object(root: Path, views: int = 10, missing: tuple[int, ...] = ()) -> None:
@@ -123,6 +125,31 @@ def test_alignment_reports_rays_that_no_scale_can_place_in_canonical_box():
     assert torch.isfinite(aligned).all()
     assert torch.isfinite(scale).all()
     assert alignment_inlier.flatten().tolist() == [True, False]
+
+
+def test_logged_9846_percent_alignment_is_retained_but_scene_mismatch_fails():
+    _validate_alignment_retention(torch.tensor([0.9845559597015381]))
+    with pytest.raises(RuntimeError, match="retained_fractions"):
+        _validate_alignment_retention(torch.tensor([0.899]))
+
+
+def test_resumed_metrics_csv_keeps_existing_schema(tmp_path: Path):
+    jsonl_path = tmp_path / "metrics.jsonl"
+    csv_path = tmp_path / "metrics.csv"
+    csv_path.write_text("step,loss_total\n1,2.0\n", encoding="utf-8")
+
+    append_metrics(
+        jsonl_path,
+        csv_path,
+        {"step": 2, "loss_total": 1.5, "alignment_plausible_percent": 98.5},
+    )
+
+    assert csv_path.read_text(encoding="utf-8").splitlines() == [
+        "step,loss_total",
+        "1,2.0",
+        "2,1.5",
+    ]
+    assert "alignment_plausible_percent" in jsonl_path.read_text(encoding="utf-8")
 
 
 def test_project_unproject_roundtrip():

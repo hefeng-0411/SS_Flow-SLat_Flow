@@ -25,6 +25,7 @@ class VoxelFusionOutput:
     valid_mask: torch.Tensor
     alignment_scale: torch.Tensor
     condition_dim: int
+    alignment_plausible_fraction: Optional[torch.Tensor] = None
     timings_ms: Dict[str, Optional[float]] = field(default_factory=dict)
 
 
@@ -277,6 +278,9 @@ class ConfidenceSparseVoxelFusion(nn.Module):
             normalized_points = world_to_trellis_normalized(aligned, canonical_center.float(), canonical_half_extent.float())
         geometry_ms = geometry_timer.stop()
         plausible = torch.isfinite(normalized_points).all(dim=2) & (normalized_points.abs() <= 1.25).all(dim=2)
+        # Use the exact post-normalization predicate for consensus membership;
+        # this avoids a second coordinate conversion disagreeing at box edges.
+        alignment_inlier = alignment_inlier & plausible
         # A one-patch silhouette boundary is intrinsically ambiguous after
         # resizing and VGGT upsampling. Audit the reliable foreground
         # interior; use only the top confidence tail when an object is too
@@ -285,9 +289,9 @@ class ConfidenceSparseVoxelFusion(nn.Module):
         expected_fallback = base_valid & (confidence >= 0.9)
         has_interior = expected_interior.flatten(1).any(dim=1).view(B, 1, 1, 1)
         expected = torch.where(has_interior, expected_interior, expected_fallback)
-        # Some foreground predictions are not geometrically compatible with
-        # the known camera/AABB (for example, points on an erroneous VGGT ray).
-        # They cannot be corrected by any scalar gauge and must not make an
+        # Some foreground predictions are not compatible with the shared
+        # camera/AABB gauge (for example, points on an erroneous VGGT ray).
+        # They cannot be corrected by the robust scene scale and must not make an
         # otherwise usable object fail the 99% scale audit. Keep the strict
         # audit on alignable rays and reject only catastrophic camera mismatch.
         expected_total = expected.flatten(1).sum(dim=1)
@@ -295,11 +299,7 @@ class ConfidenceSparseVoxelFusion(nn.Module):
         alignable_fraction = alignable_count.float() / expected_total.clamp_min(1)
         if bool((expected_total == 0).any()):
             raise RuntimeError("All VGGT geometry is invalid after foreground/confidence filtering")
-        if bool((alignable_fraction < 0.90).any()):
-            raise RuntimeError(
-                "VGGT-to-TRELLIS cameras are incompatible with too many reliable rays: "
-                f"alignable_fractions={alignable_fraction.detach().cpu().tolist()}"
-            )
+        _validate_alignment_retention(alignable_fraction)
         expected = expected & alignment_inlier
         expected_count = expected.flatten(1).sum(dim=1)
         plausible_fraction = (plausible & expected).flatten(1).sum(dim=1).float() / expected_count.clamp_min(1)
@@ -332,6 +332,7 @@ class ConfidenceSparseVoxelFusion(nn.Module):
         )
         return replace(
             output,
+            alignment_plausible_fraction=alignable_fraction,
             timings_ms={"voxel_unprojection_alignment": geometry_ms, **output.timings_ms},
         )
 
@@ -403,26 +404,52 @@ def align_vggt_reference_to_dataset(
         canonical_center - 1.25 * canonical_half_extent,
         canonical_center + 1.25 * canonical_half_extent,
     )
-    alignment_inlier = (
+    ray_alignable = (
         plausible_hits
         & torch.isfinite(plausible_entry)
         & torch.isfinite(plausible_exit)
         & (plausible_exit > 0)
     )
-    plausible_reliable = reliable & alignment_inlier
+    plausible_reliable = reliable & ray_alignable
     lower = torch.where(plausible_reliable, plausible_entry.clamp_min(0), torch.nan).nan_to_num(
         nan=-torch.inf
     ).flatten(1).amax(dim=1)
     upper = torch.where(plausible_reliable, plausible_exit, torch.nan).nan_to_num(
         nan=torch.inf
     ).flatten(1).amin(dim=1)
-    if bool((~torch.isfinite(lower) | ~torch.isfinite(upper) | (lower > upper)).any()):
+    positive_lower = lower.clamp_min(torch.finfo(scale.dtype).eps)
+    if bool((~torch.isfinite(positive_lower) | ~torch.isfinite(upper) | (positive_lower > upper)).any()):
         raise RuntimeError("No camera-consistent VGGT scale can satisfy the canonical safety envelope")
-    scale = torch.maximum(torch.minimum(scale, upper), lower).clamp(1e-2, 1e2)
-    if not torch.isfinite(scale).all():
+    # Preserve the feasible ray/AABB interval. A fixed clamp applied after
+    # this projection can move the scale back outside the interval and create
+    # artificial canonical-range outliers.
+    scale = torch.maximum(torch.minimum(scale, upper), positive_lower)
+    if not torch.isfinite(scale).all() or bool((scale <= 0).any()):
         raise RuntimeError("Non-finite VGGT gauge scale")
     aligned = origin[:, None, :, None, None] + scale[:, None, None, None, None] * directions
+    plausible_min = canonical_center - 1.25 * canonical_half_extent
+    plausible_max = canonical_center + 1.25 * canonical_half_extent
+    tolerance = canonical_half_extent * 1e-5 + 1e-6
+    alignment_inlier = (
+        torch.isfinite(aligned).all(dim=2)
+        & (aligned >= (plausible_min - tolerance)[:, None, :, None, None]).all(dim=2)
+        & (aligned <= (plausible_max + tolerance)[:, None, :, None, None]).all(dim=2)
+    )
     return aligned, scale, alignment_inlier
+
+
+def _validate_alignment_retention(
+    retained_fraction: torch.Tensor, minimum_fraction: float = 0.90
+) -> None:
+    """Reject scene-level camera failures while retaining robust VGGT inliers."""
+    if not torch.isfinite(retained_fraction).all() or bool(
+        (retained_fraction < minimum_fraction).any()
+    ):
+        raise RuntimeError(
+            "VGGT-to-TRELLIS cameras are incompatible with too many reliable rays: "
+            f"retained_fractions={retained_fraction.detach().cpu().tolist()}, "
+            f"required_minimum={minimum_fraction}"
+        )
 
 
 def _ray_box_scale_interval(
