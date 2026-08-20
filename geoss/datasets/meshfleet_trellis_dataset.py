@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -14,6 +15,17 @@ from torch.utils.data import Dataset
 from geoss.utils.coordinates import c2w_to_w2c, parse_objaverse_camera
 from geoss.utils.coordinates import anchor_to_occ_index
 from geoss.utils.voxelization import points_to_occupancy
+
+
+@dataclass(frozen=True)
+class ResolvedRenderFrame:
+    """One image joined to its exact transforms.json camera record by ID."""
+
+    frame_id: str
+    numeric_id: Optional[int]
+    metadata_index: int
+    frame: Dict
+    image_path: Path
 
 
 class MeshFleetTrellisDataset(Dataset):
@@ -151,7 +163,7 @@ class MeshFleetTrellisDataset(Dataset):
         frames = transforms.get("frames", [])
         if not frames:
             raise FileNotFoundError(f"No frames in {render_dir / 'transforms.json'}")
-        available = _available_render_frames(render_dir, frames)
+        available = _available_render_frame_records(render_dir, frames)
         if not available:
             raise FileNotFoundError(f"No valid render images for uid={uid} in {render_dir}; all missing frames are skipped")
         chosen = self._choose_frames(
@@ -161,7 +173,8 @@ class MeshFleetTrellisDataset(Dataset):
         )
         images, masks, K_list, c2w_list = [], [], [], []
         missing_view_count = len(frames) - len(available)
-        for frame, image_path in chosen:
+        for record in chosen:
+            frame, image_path = record.frame, record.image_path
             image = Image.open(image_path).convert("RGBA")
             rgb, mask = _rgba_to_rgb_mask(image, self.image_size, self.background_color)
             camera_data = {**{k: v for k, v in transforms.items() if k != "frames"}, **frame}
@@ -202,8 +215,10 @@ class MeshFleetTrellisDataset(Dataset):
                 "render_dir": str(render_dir),
                 "render_set": render_dir.parent.name,
                 "background_color": list(self.background_color),
-                "selected_frame_paths": [str(path) for _, path in chosen],
-                "selected_frame_ids": [str(frame.get("file_path") or frame.get("image_path") or frame.get("filename")) for frame, _ in chosen],
+                "selected_frame_paths": [str(record.image_path) for record in chosen],
+                "selected_frame_ids": [record.frame_id for record in chosen],
+                "selected_frame_metadata_indices": [record.metadata_index for record in chosen],
+                "missing_frame_ids": _missing_declared_frame_ids(frames, available),
                 "paths": {
                     key: str(value)
                     for key, value in sample["paths"].items()
@@ -228,7 +243,14 @@ class MeshFleetTrellisDataset(Dataset):
                 dtype=torch.float32,
             ),
         }
-        cond_image = _load_condition_image(sample.get("cond_render_dir"), chosen[0][1])
+        if all(record.numeric_id is not None for record in chosen):
+            pack["view_ids"] = torch.tensor(
+                [record.numeric_id for record in chosen], dtype=torch.long
+            )
+        pack["view_metadata_indices"] = torch.tensor(
+            [record.metadata_index for record in chosen], dtype=torch.long
+        )
+        cond_image = _load_condition_image(sample.get("cond_render_dir"), chosen[0].image_path)
         if cond_image is not None:
             pack["trellis_cond_image"] = cond_image
         if self.load_3d_modalities and sample.get("voxel_path"):
@@ -370,11 +392,11 @@ class MeshFleetTrellisDataset(Dataset):
 
     @staticmethod
     def _choose_frames(
-        frames: List[Tuple[Dict, Path]],
+        frames: Sequence[ResolvedRenderFrame],
         num_views: int,
         *,
         repeat_if_insufficient: bool = True,
-    ) -> List[Tuple[Dict, Path]]:
+    ) -> List[ResolvedRenderFrame]:
         if len(frames) == 0:
             raise ValueError("Cannot choose frames from an empty list")
         if num_views <= 0:
@@ -434,12 +456,14 @@ def _rgba_to_rgb_mask(
 def _load_condition_image(cond_render_dir: Optional[Path], fallback_image_path: Path) -> Optional[torch.Tensor]:
     image_path = None
     if cond_render_dir is not None and cond_render_dir.exists():
-        candidates = sorted(
-            p for p in cond_render_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        )
-        if candidates:
-            image_path = candidates[0]
+        # Never substitute a different numbered conditioning render: that
+        # would pair one camera/view ID with another image when files have
+        # gaps. Use the exact same stem, or fall back to the selected RGB.
+        for suffix in (fallback_image_path.suffix, ".png", ".jpg", ".jpeg", ".webp"):
+            candidate = cond_render_dir / f"{fallback_image_path.stem}{suffix}"
+            if candidate.is_file():
+                image_path = candidate
+                break
     if image_path is None:
         image_path = fallback_image_path
     image = Image.open(image_path).convert("RGB").resize((518, 518), Image.Resampling.BICUBIC)
@@ -553,13 +577,73 @@ def _select_render_dir(
     return _first_existing([root / name / uid for name in ordered])
 
 
-def _available_render_frames(render_dir: Path, frames: List[Dict]) -> List[Tuple[Dict, Path]]:
-    available: List[Tuple[Dict, Path]] = []
-    for frame in frames:
+def _available_render_frame_records(render_dir: Path, frames: List[Dict]) -> List[ResolvedRenderFrame]:
+    """Exact ID-keyed inner join between camera records and existing images.
+
+    Missing images remove only their own record. Metadata list positions are
+    retained separately and are never renumbered after gaps are removed.
+    """
+    available: List[ResolvedRenderFrame] = []
+    seen_ids = set()
+    for metadata_index, frame in enumerate(frames):
         image_path = _resolve_frame_image_path(render_dir, frame)
         if image_path is not None and _frame_has_valid_camera(frame):
-            available.append((frame, image_path))
+            frame_id, numeric_id = _resolved_frame_id(frame, image_path, metadata_index)
+            if frame_id in seen_ids:
+                raise ValueError(f"Duplicate render frame ID {frame_id!r} in {render_dir / 'transforms.json'}")
+            seen_ids.add(frame_id)
+            available.append(
+                ResolvedRenderFrame(
+                    frame_id=frame_id,
+                    numeric_id=numeric_id,
+                    metadata_index=metadata_index,
+                    frame=frame,
+                    image_path=image_path,
+                )
+            )
     return available
+
+
+def _available_render_frames(render_dir: Path, frames: List[Dict]) -> List[Tuple[Dict, Path]]:
+    """Backward-compatible tuple view of the exact indexed frame join."""
+    return [(record.frame, record.image_path) for record in _available_render_frame_records(render_dir, frames)]
+
+
+def _resolved_frame_id(frame: Dict, image_path: Path, metadata_index: int) -> Tuple[str, Optional[int]]:
+    raw = frame.get("file_path") or frame.get("image_path") or frame.get("filename")
+    declared_stem = Path(str(raw)).stem if raw is not None else image_path.stem
+    if declared_stem != image_path.stem:
+        raise ValueError(
+            f"Render/camera ID mismatch at metadata index {metadata_index}: "
+            f"declared={declared_stem!r}, resolved_image={image_path.name!r}"
+        )
+    numeric_id = int(declared_stem) if declared_stem.isdecimal() else None
+    for key in ("view_id", "frame_index", "index"):
+        explicit = frame.get(key)
+        if explicit is None or numeric_id is None:
+            continue
+        try:
+            explicit_id = int(explicit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid {key}={explicit!r} for render frame {declared_stem!r}") from exc
+        if explicit_id != numeric_id:
+            raise ValueError(
+                f"Render frame {declared_stem!r} conflicts with {key}={explicit_id} at metadata index {metadata_index}"
+            )
+    return declared_stem, numeric_id
+
+
+def _missing_declared_frame_ids(
+    frames: List[Dict], available: Sequence[ResolvedRenderFrame]
+) -> List[str]:
+    available_indices = {record.metadata_index for record in available}
+    missing = []
+    for metadata_index, frame in enumerate(frames):
+        if metadata_index in available_indices:
+            continue
+        raw = frame.get("file_path") or frame.get("image_path") or frame.get("filename")
+        missing.append(Path(str(raw)).stem if raw is not None else f"metadata:{metadata_index}")
+    return missing
 
 
 def _frame_has_valid_camera(frame: Dict) -> bool:
@@ -597,6 +681,7 @@ def _resolve_frame_image_path(render_dir: Path, frame: Dict) -> Optional[Path]:
     candidates: List[Path] = []
     if raw.is_absolute():
         candidates.append(raw)
+        candidates.append(render_dir / raw.name)
     else:
         candidates.append(render_dir / raw)
         candidates.append(render_dir / raw.name)

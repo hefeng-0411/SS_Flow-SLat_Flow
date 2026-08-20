@@ -30,6 +30,8 @@ class VehicleMultiViewDataset(Dataset):
             "K",
             "c2w",
             "w2c",
+            "view_ids",
+            "view_metadata_indices",
             "gt_occ",
             "gt_sparse_indices",
             "gt_sparse_xyz",

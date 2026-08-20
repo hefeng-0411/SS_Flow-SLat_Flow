@@ -260,11 +260,12 @@ class ConfidenceSparseVoxelFusion(nn.Module):
         if points_are_trellis_normalized:
             normalized_points = points
             alignment_scale = torch.ones(B, device=points.device, dtype=torch.float32)
+            alignment_inlier = torch.isfinite(points).all(dim=2)
         else:
             interior_valid = base_valid & mask_interior
             has_interior = interior_valid.flatten(1).any(dim=1).view(B, 1, 1, 1)
             alignment_valid = torch.where(has_interior, interior_valid, base_valid)
-            aligned, alignment_scale = align_vggt_reference_to_dataset(
+            aligned, alignment_scale, alignment_inlier = align_vggt_reference_to_dataset(
                 points,
                 geometry.extrinsics.float(),
                 dataset_c2w.float(),
@@ -284,10 +285,24 @@ class ConfidenceSparseVoxelFusion(nn.Module):
         expected_fallback = base_valid & (confidence >= 0.9)
         has_interior = expected_interior.flatten(1).any(dim=1).view(B, 1, 1, 1)
         expected = torch.where(has_interior, expected_interior, expected_fallback)
+        # Some foreground predictions are not geometrically compatible with
+        # the known camera/AABB (for example, points on an erroneous VGGT ray).
+        # They cannot be corrected by any scalar gauge and must not make an
+        # otherwise usable object fail the 99% scale audit. Keep the strict
+        # audit on alignable rays and reject only catastrophic camera mismatch.
+        expected_total = expected.flatten(1).sum(dim=1)
+        alignable_count = (expected & alignment_inlier).flatten(1).sum(dim=1)
+        alignable_fraction = alignable_count.float() / expected_total.clamp_min(1)
+        if bool((expected_total == 0).any()):
+            raise RuntimeError("All VGGT geometry is invalid after foreground/confidence filtering")
+        if bool((alignable_fraction < 0.90).any()):
+            raise RuntimeError(
+                "VGGT-to-TRELLIS cameras are incompatible with too many reliable rays: "
+                f"alignable_fractions={alignable_fraction.detach().cpu().tolist()}"
+            )
+        expected = expected & alignment_inlier
         expected_count = expected.flatten(1).sum(dim=1)
         plausible_fraction = (plausible & expected).flatten(1).sum(dim=1).float() / expected_count.clamp_min(1)
-        if bool((expected_count == 0).any()):
-            raise RuntimeError("All VGGT geometry is invalid after foreground/confidence filtering")
         if bool((plausible_fraction < 0.99).any()):
             raise RuntimeError(
                 "VGGT-to-TRELLIS gauge alignment failed the 99% plausible-range assertion: "
@@ -347,14 +362,15 @@ def align_vggt_reference_to_dataset(
     canonical_half_extent: torch.Tensor,
     valid: torch.Tensor,
     confidence: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Resolve VGGT's scale gauge against the known canonical AABB.
 
     Rotation and origin are fixed by the reference camera pair. The remaining
     scalar is estimated from foreground ray/AABB entry scales, then constrained
     to the interval that keeps reliable interior points inside a 25% safety
     envelope. This is camera-consistent and avoids the visible-surface bias of
-    matching a foreground median depth to the object-center depth.
+    matching a foreground median depth to the object-center depth. The returned
+    mask marks rays that can intersect that safety envelope at a positive scale.
     """
     B, V, _, H, W = points.shape
     reference_index = valid.flatten(2).any(dim=2).to(torch.int64).argmax(dim=1)
@@ -387,7 +403,13 @@ def align_vggt_reference_to_dataset(
         canonical_center - 1.25 * canonical_half_extent,
         canonical_center + 1.25 * canonical_half_extent,
     )
-    plausible_reliable = reliable & plausible_hits
+    alignment_inlier = (
+        plausible_hits
+        & torch.isfinite(plausible_entry)
+        & torch.isfinite(plausible_exit)
+        & (plausible_exit > 0)
+    )
+    plausible_reliable = reliable & alignment_inlier
     lower = torch.where(plausible_reliable, plausible_entry.clamp_min(0), torch.nan).nan_to_num(
         nan=-torch.inf
     ).flatten(1).amax(dim=1)
@@ -400,7 +422,7 @@ def align_vggt_reference_to_dataset(
     if not torch.isfinite(scale).all():
         raise RuntimeError("Non-finite VGGT gauge scale")
     aligned = origin[:, None, :, None, None] + scale[:, None, None, None, None] * directions
-    return aligned, scale
+    return aligned, scale, alignment_inlier
 
 
 def _ray_box_scale_interval(
@@ -414,8 +436,14 @@ def _ray_box_scale_interval(
     safe = torch.where(parallel, torch.ones_like(directions), directions)
     lower = (box_min[:, None, :, None, None] - origin[:, None, :, None, None]) / safe
     upper = (box_max[:, None, :, None, None] - origin[:, None, :, None, None]) / safe
-    entry = torch.minimum(lower, upper).amax(dim=2)
-    exit = torch.maximum(lower, upper).amin(dim=2)
+    axis_entry = torch.where(
+        parallel, torch.full_like(lower, -torch.inf), torch.minimum(lower, upper)
+    )
+    axis_exit = torch.where(
+        parallel, torch.full_like(upper, torch.inf), torch.maximum(lower, upper)
+    )
+    entry = axis_entry.amax(dim=2)
+    exit = axis_exit.amin(dim=2)
     origin_inside_parallel_slab = (
         (origin[:, None, :, None, None] >= box_min[:, None, :, None, None])
         & (origin[:, None, :, None, None] <= box_max[:, None, :, None, None])

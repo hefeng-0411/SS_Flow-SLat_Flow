@@ -8,16 +8,24 @@ import pytest
 import torch
 from PIL import Image
 
-from geoss.datasets.dataset_stochastic_meshfleet import StochasticMeshFleetDataset
+from geoss.datasets.dataset_stochastic_meshfleet import (
+    StochasticMeshFleetDataset,
+    stochastic_meshfleet_collate,
+)
 from geoss.integration.vggt_geometry_wrapper import VGGTGeometryBatch, VGGTGeometryWrapper
 from geoss.models.ss_flow_adapter import SSFlowAdapter
-from geoss.models.voxel_fusion_engine import ConfidenceSparseVoxelFusion, VoxelFusionOutput, unproject_depth_batched
+from geoss.models.voxel_fusion_engine import (
+    ConfidenceSparseVoxelFusion,
+    VoxelFusionOutput,
+    align_vggt_reference_to_dataset,
+    unproject_depth_batched,
+)
 from geoss.ops.flow_matching import construct_flow_training_pair
 from geoss.samplers.fast_ss_sampler import FastGeometryConditionedSSSampler
 from geoss.utils.projection import project_points
 
 
-def _make_meshfleet_object(root: Path, views: int = 10) -> None:
+def _make_meshfleet_object(root: Path, views: int = 10, missing: tuple[int, ...] = ()) -> None:
     uid = "unit_object"
     render = root / "train" / "renders" / uid
     latent = root / "train" / "ss_latents"
@@ -25,15 +33,18 @@ def _make_meshfleet_object(root: Path, views: int = 10) -> None:
     latent.mkdir(parents=True)
     frames = []
     for index in range(views):
-        rgba = np.zeros((16, 16, 4), dtype=np.uint8)
-        rgba[..., :3] = index * 10
-        rgba[..., 3] = 255
-        Image.fromarray(rgba, "RGBA").save(render / f"{index:03d}.png")
+        if index not in missing:
+            rgba = np.zeros((16, 16, 4), dtype=np.uint8)
+            rgba[..., :3] = index * 10
+            rgba[..., 3] = 255
+            Image.fromarray(rgba, "RGBA").save(render / f"{index:03d}.png")
+        transform = np.eye(4)
+        transform[0, 3] = index / 100.0
         frames.append(
             {
                 "file_path": f"{index:03d}.png",
                 "camera_angle_x": 0.7,
-                "transform_matrix": np.eye(4).tolist(),
+                "transform_matrix": transform.tolist(),
             }
         )
     (render / "transforms.json").write_text(
@@ -57,6 +68,61 @@ def test_dataset_stochastic_views_are_bounded_distinct_and_reproducible(tmp_path
         first.set_epoch(epoch)
         epoch_selections.append(tuple(first[0]["view_ids"].tolist()))
     assert len(set(epoch_selections)) > 1
+
+
+def test_dataset_gapped_render_ids_keep_image_camera_and_metadata_aligned(tmp_path: Path):
+    _make_meshfleet_object(tmp_path, views=10, missing=(1, 4))
+    dataset = StochasticMeshFleetDataset(
+        str(tmp_path),
+        min_views=8,
+        max_views=8,
+        seed=5,
+        use_stochastic_views=False,
+        image_size=16,
+        load_gt_occupancy=False,
+    )
+    sample = dataset[0]
+
+    assert sample["num_views"] == 8
+    assert set(sample["view_ids"].tolist()) == {0, 2, 3, 5, 6, 7, 8, 9}
+    assert torch.equal(sample["view_ids"], sample["view_metadata_indices"])
+    assert sample["metadata"]["missing_frame_ids"] == ["001", "004"]
+    assert sample["metadata"]["num_frames_total"] == 10
+    assert sample["metadata"]["num_frames_available"] == 8
+    for position, view_id in enumerate(sample["view_ids"].tolist()):
+        expected_rgb = view_id * 10 / 255.0
+        assert torch.allclose(
+            sample["images"][position].mean(), torch.tensor(expected_rgb), atol=1e-6
+        )
+        assert sample["c2w_dataset"][position, 0, 3].item() == pytest.approx(
+            view_id / 100.0
+        )
+        assert Path(sample["metadata"]["selected_frame_paths"][position]).stem == f"{view_id:03d}"
+    batch = stochastic_meshfleet_collate([sample])
+    assert torch.equal(batch["view_ids"][0], sample["view_ids"])
+    assert torch.equal(batch["view_metadata_indices"][0], sample["view_metadata_indices"])
+
+
+def test_alignment_reports_rays_that_no_scale_can_place_in_canonical_box():
+    points = torch.tensor(
+        [[[[[0.0, 2.0]], [[0.0, 0.0]], [[2.0, 0.0]]]]], dtype=torch.float32
+    )
+    vggt_w2c = torch.eye(4).view(1, 1, 4, 4)
+    dataset_c2w = torch.eye(4).view(1, 1, 4, 4)
+    dataset_c2w[..., 2, 3] = -2.0
+    aligned, scale, alignment_inlier = align_vggt_reference_to_dataset(
+        points,
+        vggt_w2c,
+        dataset_c2w,
+        torch.zeros(1, 3),
+        torch.full((1, 3), 0.5),
+        torch.ones(1, 1, 1, 2, dtype=torch.bool),
+        torch.ones(1, 1, 1, 2),
+    )
+
+    assert torch.isfinite(aligned).all()
+    assert torch.isfinite(scale).all()
+    assert alignment_inlier.flatten().tolist() == [True, False]
 
 
 def test_project_unproject_roundtrip():
@@ -184,4 +250,3 @@ def test_bf16_adapter_forward_backward_is_finite():
     loss.backward()
     assert torch.isfinite(loss)
     assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in adapter.parameters())
-

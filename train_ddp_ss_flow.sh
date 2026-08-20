@@ -14,7 +14,7 @@ cd "$PROJECT_ROOT"
 
 /mnt/sda/hf/miniconda3/envs/trellis/bin/torchrun \
   --standalone \
-  --nproc_per_node=8 \
+  --nproc_per_node="${NPROC_PER_NODE:-8}" \
   scripts/train_stochastic_voxel_ss_flow.py \
   --config configs/stochastic_voxel_ss_flow.yaml \
   --trellis-root /mnt/sda/hf/MVG/Base/TRELLIS \

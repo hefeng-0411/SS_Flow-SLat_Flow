@@ -20,7 +20,8 @@ from torch.utils.data import get_worker_info
 
 from geoss.datasets.meshfleet_trellis_dataset import (
     MeshFleetTrellisDataset,
-    _available_render_frames,
+    _available_render_frame_records,
+    _missing_declared_frame_ids,
     _rgba_to_rgb_mask,
 )
 from geoss.utils.coordinates import c2w_to_w2c, parse_objaverse_camera
@@ -111,7 +112,8 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         render_dir: Path = sample["render_dir"]
         transform_path = render_dir / "transforms.json"
         transforms = json.loads(transform_path.read_text(encoding="utf-8"))
-        available = _available_render_frames(render_dir, transforms.get("frames", []))
+        frames = transforms.get("frames", [])
+        available = _available_render_frame_records(render_dir, frames)
         if not available:
             raise RuntimeError(f"Empty valid view set in {transform_path}")
 
@@ -126,8 +128,9 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
         selected_positions = torch.randperm(len(available), generator=generator)[:count].tolist()
         chosen = [available[position] for position in selected_positions]
 
-        images, masks, intrinsics, c2w, view_ids = [], [], [], [], []
-        for frame, image_path in chosen:  # one bounded loop over at most eight external image files
+        images, masks, intrinsics, c2w = [], [], [], []
+        for record in chosen:  # one bounded loop over at most eight external image files
+            frame, image_path = record.frame, record.image_path
             with Image.open(image_path) as handle:
                 rgb, mask = _rgba_to_rgb_mask(
                     handle.convert("RGBA"), self.image_size, self.background_color
@@ -143,7 +146,9 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
             masks.append(mask)
             intrinsics.append(intrinsic)
             c2w.append(camera_to_world)
-            view_ids.append(_frame_index(frame, image_path))
+        if not all(record.numeric_id is not None for record in chosen):
+            invalid = [record.frame_id for record in chosen if record.numeric_id is None]
+            raise ValueError(f"MeshFleet view IDs must be decimal, got {invalid}")
 
         c2w_tensor = torch.stack(c2w)
         K_tensor = torch.stack(intrinsics)
@@ -164,7 +169,10 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
             "K": K_tensor,
             "c2w": c2w_tensor,
             "w2c": c2w_to_w2c(c2w_tensor),
-            "view_ids": torch.tensor(view_ids, dtype=torch.long),
+            "view_ids": torch.tensor([record.numeric_id for record in chosen], dtype=torch.long),
+            "view_metadata_indices": torch.tensor(
+                [record.metadata_index for record in chosen], dtype=torch.long
+            ),
             "num_views": count,
             "canonical_aabb": aabb,
             "canonical_center": center,
@@ -177,7 +185,13 @@ class StochasticMeshFleetDataset(MeshFleetTrellisDataset):
                 "canonical_aabb": aabb.tolist(),
                 "scale": transforms.get("scale"),
                 "offset": transforms.get("offset"),
-                "selected_frame_paths": [str(path) for _, path in chosen],
+                "selected_frame_paths": [str(record.image_path) for record in chosen],
+                "selected_frame_ids": [record.frame_id for record in chosen],
+                "selected_frame_metadata_indices": [record.metadata_index for record in chosen],
+                "missing_frame_ids": _missing_declared_frame_ids(frames, available),
+                "num_frames_total": len(frames),
+                "num_frames_available": len(available),
+                "missing_frames_skipped": len(frames) - len(available),
                 "epoch": self.epoch,
                 "rank": self.rank,
             },
@@ -233,6 +247,7 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
     c2w = torch.eye(4, dtype=samples[0]["c2w_dataset"].dtype).view(1, 1, 4, 4).repeat(batch_size, max_views, 1, 1)
     valid = torch.zeros(batch_size, max_views, dtype=torch.bool)
     view_ids = torch.full((batch_size, max_views), -1, dtype=torch.long)
+    view_metadata_indices = torch.full((batch_size, max_views), -1, dtype=torch.long)
     for batch_index, sample in enumerate(samples):  # bounded batch metadata loop
         count = int(sample["num_views"])
         images[batch_index, :count] = sample["images"]
@@ -241,6 +256,7 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
         c2w[batch_index, :count] = sample["c2w_dataset"]
         valid[batch_index, :count] = True
         view_ids[batch_index, :count] = sample["view_ids"]
+        view_metadata_indices[batch_index, :count] = sample["view_metadata_indices"]
     result: Dict[str, Any] = {
         "uid": [sample["uid"] for sample in samples],
         "images": images,
@@ -250,6 +266,7 @@ def stochastic_meshfleet_collate(samples: Sequence[Dict[str, Any]]) -> Dict[str,
         "w2c_dataset": torch.linalg.inv(c2w),
         "view_valid_mask": valid,
         "view_ids": view_ids,
+        "view_metadata_indices": view_metadata_indices,
         "num_views": torch.tensor([sample["num_views"] for sample in samples], dtype=torch.long),
         "canonical_aabb": torch.stack([sample["canonical_aabb"] for sample in samples]),
         "canonical_center": torch.stack([sample["canonical_center"] for sample in samples]),
@@ -277,14 +294,6 @@ def _canonical_aabb(transforms: Dict[str, Any]) -> torch.Tensor:
     if aabb.shape != (2, 3):
         raise ValueError(f"Canonical AABB must be [2,3], got {tuple(aabb.shape)}")
     return aabb
-
-
-def _frame_index(frame: Dict[str, Any], image_path: Path) -> int:
-    raw = frame.get("file_path") or frame.get("image_path") or frame.get("filename") or image_path.name
-    stem = Path(str(raw)).stem
-    if not stem.isdecimal():
-        raise ValueError(f"MeshFleet view id must be decimal, got {raw!r}")
-    return int(stem)
 
 
 def _assert_camera(c2w: torch.Tensor, K: torch.Tensor, uid: str) -> None:

@@ -77,6 +77,26 @@ def test_meshfleet_missing_view_is_skipped_without_shape_drift():
         assert sample["metadata"]["num_frames_total"] == 2
         assert sample["metadata"]["num_frames_available"] == 1
         assert sample["metadata"]["missing_frames_skipped"] == 1
+        assert sample["view_ids"].tolist() == [0, 0]
+        assert sample["view_metadata_indices"].tolist() == [0, 0]
+        assert sample["metadata"]["selected_frame_ids"] == ["000", "000"]
+        assert sample["metadata"]["missing_frame_ids"] == ["064"]
+
+
+def test_condition_render_gap_never_substitutes_a_different_view():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_flat_sample(root / "train")
+        cond_dir = root / "train" / "renders_cond" / "flat_uid"
+        cond_dir.mkdir(parents=True)
+        Image.new("RGB", (16, 16), (0, 0, 255)).save(cond_dir / "064.png")
+
+        sample = MeshFleetTrellisDataset(
+            root, split="train", num_views=1, image_size=16, occ_resolution=8
+        )[0]
+        expected = torch.tensor([128, 96, 64]) / 255.0
+        actual = sample["trellis_cond_image"][:, 0, 0]
+        assert torch.allclose(actual, expected, atol=1e-5)
 
 
 def test_meshfleet_all_split_discovers_train_and_test_without_direct_root_fallback():
